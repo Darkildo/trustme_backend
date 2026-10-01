@@ -21,6 +21,7 @@
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::{Signature, VerifyingKey};
 
+use crate::net::noise::is_small_order_x25519;
 use crate::state::registry::{DeviceId, UserId};
 use crate::wire;
 
@@ -130,6 +131,12 @@ pub fn verify(
     }
 
     let transport_key = fixed_32(&cert.transport_key, "device transport key")?;
+    // Статик малого порядка даёт DH-выход, не зависящий от секрета, — с
+    // ним хендшейк проходит любой, у кого есть сам сертификат, и
+    // сертификат превращается в предъявительский токен.
+    if is_small_order_x25519(&transport_key) {
+        bail!("device transport key has small order");
+    }
     let signing_key = fixed_32(&cert.signing_key, "device signing key")?;
     let signature: [u8; 64] = cert
         .signature
@@ -152,6 +159,13 @@ pub fn verify(
 
     let verifying = VerifyingKey::from_bytes(identity_key)
         .context("client identity key is not a valid ed25519 public key")?;
+    // Для ключа малого порядка подпись подделывается без секрета (`R = rB`,
+    // `s = r` проходит нестрогую проверку). `verify_strict` такие ключи и
+    // сейчас отвергает, но отказ здесь не должен зависеть от выбора режима
+    // проверки ниже.
+    if verifying.is_weak() {
+        bail!("client identity key has small order");
+    }
     let message = signed_bytes(
         identity_key,
         device_id,
@@ -342,6 +356,96 @@ mod tests {
             0,
         );
         assert!(result.is_err());
+    }
+
+    /// Сертификат на транспортный ключ малого порядка подписан честно, но
+    /// ничего не аутентифицирует: DH с таким статиком не зависит от секрета,
+    /// и войти по нему смог бы любой, кто видел сертификат.
+    #[test]
+    fn small_order_transport_key_is_rejected() {
+        let account = account();
+        for transport_key in [[0u8; 32], {
+            let mut one = [0u8; 32];
+            one[0] = 1;
+            one
+        }] {
+            let signing_key = [0x33; 32];
+            let message = signed_bytes(
+                &account.verifying_key().to_bytes(),
+                DEVICE,
+                &transport_key,
+                &signing_key,
+                1,
+                NOW - 10,
+                NOW + 3600,
+            );
+            let cert = wire::DeviceCertificate {
+                transport_key: transport_key.to_vec(),
+                signing_key: signing_key.to_vec(),
+                scope: 1,
+                not_before: NOW - 10,
+                not_after: NOW + 3600,
+                signature: account.sign(&message).to_bytes().to_vec(),
+                device_id: u32::from(DEVICE),
+            };
+            let err = check(&cert, Some(DEVICE)).expect_err("small-order transport key");
+            assert!(
+                err.to_string().contains("small order"),
+                "unexpected error: {err}"
+            );
+        }
+    }
+
+    /// Для ключа аккаунта малого порядка подпись подделывается без секрета:
+    /// `R = rB, s = r` проходит нестрогую проверку. Такой «аккаунт» не
+    /// должен выписывать сертификаты вне зависимости от режима проверки.
+    #[test]
+    fn weak_account_key_cannot_issue_certificates() {
+        use curve25519_dalek::{EdwardsPoint, Scalar};
+        use ed25519_dalek::Verifier;
+
+        let mut weak_identity = [0u8; 32];
+        weak_identity[0] = 1; // нейтральный элемент Ed25519
+        let transport_key = [0x22; 32];
+        let signing_key = [0x33; 32];
+        let message = signed_bytes(
+            &weak_identity,
+            DEVICE,
+            &transport_key,
+            &signing_key,
+            1,
+            NOW - 10,
+            NOW + 3600,
+        );
+
+        let r = Scalar::from(12_345u32);
+        let mut forged = [0u8; 64];
+        forged[..32].copy_from_slice(&EdwardsPoint::mul_base(&r).compress().to_bytes());
+        forged[32..].copy_from_slice(r.as_bytes());
+
+        // Подделка настоящая: нестрогая проверка её принимает.
+        let verifying = VerifyingKey::from_bytes(&weak_identity).unwrap();
+        assert!(
+            verifying
+                .verify(&message, &Signature::from_bytes(&forged))
+                .is_ok()
+        );
+
+        let cert = wire::DeviceCertificate {
+            transport_key: transport_key.to_vec(),
+            signing_key: signing_key.to_vec(),
+            scope: 1,
+            not_before: NOW - 10,
+            not_after: NOW + 3600,
+            signature: forged.to_vec(),
+            device_id: u32::from(DEVICE),
+        };
+        let err = verify(&weak_identity, Some(DEVICE), &cert, NOW, MAX_TTL)
+            .expect_err("weak account key must not issue certificates");
+        assert!(
+            err.to_string().contains("small order"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

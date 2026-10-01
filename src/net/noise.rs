@@ -264,9 +264,7 @@ impl NodeIdentity {
                 format!("failed to create node key directory {}", parent.display())
             })?;
         }
-        std::fs::write(&path, hex::encode(seed))
-            .with_context(|| format!("failed to persist node key at {}", path.display()))?;
-        restrict_permissions(&path)?;
+        write_new_secret_file(&path, hex::encode(seed).as_bytes())?;
 
         let identity = Self::from_seed(seed, NodeKeySource::Generated);
         observability::observe_node_key(identity.source.as_metric_label());
@@ -987,6 +985,14 @@ fn verify_client_identity(
         None => {
             let verifying = VerifyingKey::from_bytes(&hello.identity_key)
                 .context("client identity key is not a valid ed25519 public key")?;
+            // Ключ малого порядка конвертируется в X25519-точку малого
+            // порядка, и DH с ней даёт константу, которую посчитает кто
+            // угодно: snow нулевой DH-выход не отвергает, поэтому без этой
+            // проверки сессию от имени такого `user_id` открыл бы любой, не
+            // владея ни одним секретом.
+            if verifying.is_weak() {
+                bail!("client identity key has small order");
+            }
             let derived = verifying.to_montgomery().to_bytes();
             if derived != remote_static {
                 bail!("client identity key does not match the authenticated noise static key");
@@ -1068,6 +1074,22 @@ fn to_fixed_32(bytes: &[u8], what: &str) -> Result<[u8; 32]> {
     Ok(out)
 }
 
+/// Лежит ли X25519-ключ (u-координата) в подгруппе малого порядка — на
+/// кривой или на её twist'е, в том числе в неканонической записи (`u ≥ p`,
+/// старший бит).
+///
+/// DH с такой точкой даёт результат, не зависящий от секрета собеседника,
+/// поэтому статик малого порядка ничего не аутентифицирует. Проверка
+/// умножением на кофактор, а не по списку известных значений: список легко
+/// составить неполным, а `[8]P = O` верно ровно для точек малого порядка —
+/// порядки групп кривой и twist'а равны `8·ℓ` и `4·ℓ'`, и точка порядка 16,
+/// чей `[8]P` дал бы ту же нулевую u-координату, не существует.
+pub(crate) fn is_small_order_x25519(public: &[u8; 32]) -> bool {
+    let multiplied =
+        curve25519_dalek::MontgomeryPoint(*public) * curve25519_dalek::Scalar::from(8u8);
+    multiplied.to_bytes() == [0u8; 32]
+}
+
 /// 32 байта из системного CSPRNG под Ed25519 seed.
 fn random_seed() -> Result<[u8; 32]> {
     let mut seed = [0u8; 32];
@@ -1104,15 +1126,41 @@ fn warn_on_loose_permissions(path: &Path) {
 #[cfg(not(unix))]
 fn warn_on_loose_permissions(_path: &Path) {}
 
-#[cfg(unix)]
-fn restrict_permissions(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("failed to restrict permissions on {}", path.display()))
-}
+/// Записать секрет в НОВЫЙ файл, доступный только владельцу.
+///
+/// Права выставляются при создании, а не следующим `chmod`: между `write`
+/// с umask и `chmod` файл с ключом успевал бы полежать с 0644, и прочитать
+/// его в этот момент значило бы унести identity ноды. `create_new` не даёт
+/// перезаписать ключ, появившийся после проверки существования (второй
+/// процесс на том же томе), — такой старт падает, а не подменяет ключ, к
+/// которому уже могли запиниться клиенты.
+///
+/// Недописанный файл удаляется: следующий старт иначе упал бы на битом
+/// ключе, хотя этот ключ ещё никто не видел и потерять его не жалко.
+fn write_new_secret_file(path: &Path, contents: &[u8]) -> Result<()> {
+    use std::io::Write;
 
-#[cfg(not(unix))]
-fn restrict_permissions(_path: &Path) -> Result<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+
+    let mut file = options
+        .open(path)
+        .with_context(|| format!("failed to create node key file at {}", path.display()))?;
+    // `sync_all` до того, как ключ напечатан и роздан клиентам: ключ,
+    // потерянный при сбое питания сразу после старта, отрезал бы всех, кто
+    // успел его запинить.
+    let written = file.write_all(contents).and_then(|()| file.sync_all());
+    if let Err(err) = written {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+        return Err(err)
+            .with_context(|| format!("failed to persist node key at {}", path.display()));
+    }
     Ok(())
 }
 
@@ -1767,5 +1815,216 @@ mod tests {
             verifying.verify(payload, &signature).is_err(),
             "подпись без домена не должна проверяться — иначе её можно предъявить в другом контексте"
         );
+    }
+
+    /// Кодировки точек малого порядка — на кривой, на twist'е и в
+    /// неканонической записи. Нормальные ключи проверку проходят.
+    #[test]
+    fn small_order_x25519_points_are_detected() {
+        let low_order_hex = [
+            // u = 0 (сюда же конвертируется нейтральный элемент Ed25519)
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            // u = 1
+            "0100000000000000000000000000000000000000000000000000000000000000",
+            // точки порядка 8
+            "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+            "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+            // u = p − 1
+            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            // u = p и u = p + 1 — неканонические 0 и 1
+            "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+            // u = 0 с выставленным старшим битом: X25519 его игнорирует
+            "0000000000000000000000000000000000000000000000000000000000000080",
+        ];
+        for encoded in low_order_hex {
+            let point: [u8; 32] = hex::decode(encoded).unwrap().try_into().unwrap();
+            assert!(is_small_order_x25519(&point), "{encoded} has small order");
+        }
+
+        assert!(!is_small_order_x25519(&node().public()));
+        for seed in [1u8, 42, 200] {
+            let honest = client_key(seed).verifying_key().to_montgomery().to_bytes();
+            assert!(!is_small_order_x25519(&honest));
+        }
+    }
+
+    /// Нейтральный элемент Ed25519 (`01 00…00`) — валидная кодировка точки,
+    /// и `VerifyingKey::from_bytes` его принимает. Его X25519-образ u = 0,
+    /// DH с ним — нули при любом секрете, а snow нулевой выход не отвергает.
+    /// Поэтому «войти» таким `user_id` может кто угодно без единого секрета:
+    /// инициатор ниже не знает никакого секретного ключа своего статика.
+    #[tokio::test]
+    async fn small_order_identity_cannot_open_a_session() {
+        let node = node();
+        let node_public = node.public();
+        let mut identity_element = [0u8; 32];
+        identity_element[0] = 1;
+        assert!(
+            VerifyingKey::from_bytes(&identity_element).is_ok(),
+            "ключ малого порядка обязан проходить разбор, иначе тест ничего не проверяет"
+        );
+
+        let (server_stream, mut client_stream) = loopback().await;
+        let server =
+            tokio::spawn(
+                async move { NoiseFramed::accept(server_stream, &node, test_policy()).await },
+            );
+
+        write_client_prologue(&mut client_stream, NoisePattern::Ik)
+            .await
+            .unwrap();
+        let mut handshake = Builder::with_resolver(
+            NOISE_PARAMS_IK.parse().unwrap(),
+            Box::new(forged_static::Resolver),
+        )
+        .prologue(&build_prologue(PROTO_VERSION, NoisePattern::Ik))
+        .unwrap()
+        .local_private_key(&forged_static::MARKER)
+        .unwrap()
+        .remote_public_key(&node_public)
+        .unwrap()
+        .build_initiator()
+        .unwrap();
+        let hello = encode_client_hello(&identity_element, None, None).unwrap();
+        let mut message = vec![0u8; NOISE_MAX_MESSAGE_LEN];
+        let len = handshake.write_message(&hello, &mut message).unwrap();
+        write_handshake_message(&mut client_stream, &message[..len])
+            .await
+            .unwrap();
+
+        // Именно этот отказ, а не любой: ошибка расшифровки значила бы, что
+        // подделка статика не сработала и тест ничего не доказывает.
+        let err = server.await.unwrap().map(|_| ()).unwrap_err().to_string();
+        assert!(
+            err.contains("small order"),
+            "weak identity must be refused, got: {err}"
+        );
+    }
+
+    /// Инициатор, чей статик — точка u = 0 без секрета: DH со статиком
+    /// возвращает нули (ровно то, что получит и нода), эфемерал — честный.
+    mod forged_static {
+        use snow::params::{CipherChoice, DHChoice, HashChoice};
+        use snow::resolvers::{CryptoResolver, DefaultResolver};
+        use snow::types::{Cipher, Dh, Hash, Random};
+
+        /// «Секрет», по которому подделка узнаёт статик.
+        pub const MARKER: [u8; 32] = [0xA5; 32];
+        const LOW_ORDER_PUBLIC: [u8; 32] = [0u8; 32];
+
+        pub struct Resolver;
+
+        impl CryptoResolver for Resolver {
+            fn resolve_rng(&self) -> Option<Box<dyn Random>> {
+                DefaultResolver.resolve_rng()
+            }
+
+            fn resolve_dh(&self, choice: &DHChoice) -> Option<Box<dyn Dh>> {
+                Some(Box::new(ForgedDh {
+                    inner: DefaultResolver.resolve_dh(choice)?,
+                    forged: false,
+                }))
+            }
+
+            fn resolve_hash(&self, choice: &HashChoice) -> Option<Box<dyn Hash>> {
+                DefaultResolver.resolve_hash(choice)
+            }
+
+            fn resolve_cipher(&self, choice: &CipherChoice) -> Option<Box<dyn Cipher>> {
+                DefaultResolver.resolve_cipher(choice)
+            }
+        }
+
+        struct ForgedDh {
+            inner: Box<dyn Dh>,
+            forged: bool,
+        }
+
+        impl Dh for ForgedDh {
+            fn name(&self) -> &'static str {
+                self.inner.name()
+            }
+
+            fn pub_len(&self) -> usize {
+                self.inner.pub_len()
+            }
+
+            fn priv_len(&self) -> usize {
+                self.inner.priv_len()
+            }
+
+            fn set(&mut self, privkey: &[u8]) {
+                self.forged = privkey == MARKER;
+                if !self.forged {
+                    self.inner.set(privkey);
+                }
+            }
+
+            fn generate(&mut self, rng: &mut dyn Random) -> Result<(), snow::Error> {
+                self.forged = false;
+                self.inner.generate(rng)
+            }
+
+            fn pubkey(&self) -> &[u8] {
+                if self.forged {
+                    &LOW_ORDER_PUBLIC
+                } else {
+                    self.inner.pubkey()
+                }
+            }
+
+            fn privkey(&self) -> &[u8] {
+                if self.forged {
+                    &MARKER
+                } else {
+                    self.inner.privkey()
+                }
+            }
+
+            fn dh(&self, pubkey: &[u8], out: &mut [u8]) -> Result<(), snow::Error> {
+                if self.forged {
+                    out[..32].fill(0);
+                    Ok(())
+                } else {
+                    self.inner.dh(pubkey, out)
+                }
+            }
+        }
+    }
+
+    /// Ключ ноды создаётся сразу с 0600 и никогда не перезаписывается:
+    /// файл, появившийся после проверки существования, — отказ старта, а не
+    /// подмена ключа, к которому уже могли запиниться клиенты.
+    #[test]
+    fn secret_file_is_created_owner_only_and_never_overwritten() {
+        let dir = std::env::temp_dir().join(format!(
+            "trust_message_tcp_secret_file_{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("node_identity_key");
+
+        write_new_secret_file(&path, b"first").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600, "secret must be owner-only from creation");
+        }
+
+        let err = write_new_secret_file(&path, b"second").unwrap_err();
+        assert!(
+            err.root_cause()
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::AlreadyExists),
+            "unexpected error: {err:#}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), b"first");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
