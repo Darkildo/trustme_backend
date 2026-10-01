@@ -11,7 +11,7 @@ tokio = { version = "1.49.0", features = ["full"] }        # async runtime, TcpL
 socket2 = { version = "0.6", features = ["all"] }          # TCP keepalive принятых сокетов; TCP_KEEPCNT — только с "all"
 tokio-util = { version = "0.7.18", features = ["codec"] }  # LengthDelimitedCodec для кадров Noise
 bytes = "1"
-ed25519-dalek = { version = "2.2.0", features = ["rand_core"] } # identity клиента и ноды, конверсия в X25519
+ed25519-dalek = "3"                                        # identity клиента и ноды, конверсия в X25519
 sled = "0.34"                                              # локальное KV-хранилище
 dashmap = "6"                                              # конкурентные карты: реестр сессий, состояние push
 anyhow = "1.0.101"
