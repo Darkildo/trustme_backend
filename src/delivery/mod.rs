@@ -148,13 +148,15 @@ fn is_limit_error(err: &jetstream::Error) -> bool {
 /// подписку. Остальные подписку не завершают и проходят сами, если брокер
 /// жив: `MissingHeartbeat` (heartbeat'а не было дольше двух интервалов —
 /// брокер замолчал или пул сам не опрашивал подписку, стоя на
-/// переполненном канале сессии), `Pull` (не ушёл pull-запрос), `Other`
-/// (неожиданный служебный ответ брокера).
+/// переполненном канале сессии), `Pull` (не ушёл pull-запрос),
+/// `NoResponders` (на pull-запрос не ответил ни один сервер JetStream),
+/// `Other` (неожиданный служебный ответ брокера).
 fn pull_error_is_fatal(kind: MessagesErrorKind) -> bool {
     match kind {
         MessagesErrorKind::ConsumerDeleted | MessagesErrorKind::PushBasedConsumer => true,
         MessagesErrorKind::MissingHeartbeat
         | MessagesErrorKind::Pull
+        | MessagesErrorKind::NoResponders
         | MessagesErrorKind::Other => false,
     }
 }
@@ -2028,6 +2030,7 @@ mod tests {
         assert!(pull_error_is_fatal(MessagesErrorKind::PushBasedConsumer));
         assert!(!pull_error_is_fatal(MessagesErrorKind::MissingHeartbeat));
         assert!(!pull_error_is_fatal(MessagesErrorKind::Pull));
+        assert!(!pull_error_is_fatal(MessagesErrorKind::NoResponders));
         assert!(!pull_error_is_fatal(MessagesErrorKind::Other));
     }
 

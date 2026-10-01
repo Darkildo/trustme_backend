@@ -31,7 +31,7 @@ metrics = "0.24.3"
 metrics-exporter-prometheus = "0.18.1"                     # /metrics endpoint
 
 futures-util = { version = "0.3.31", features = ["sink"] } # Stream/Sink-комбинаторы (Noise-кадры, JetStream)
-async-nats = "0.39"                                        # клиент NATS JetStream (брокерный бэкенд доставки)
+async-nats = "0.50"                                        # клиент NATS JetStream (брокерный бэкенд доставки)
 
 # Push: FCM HTTP v1 (OAuth2 JWT) и APNs voip (ES256 JWT); http2 обязателен
 # для APNs.
@@ -55,4 +55,4 @@ tonic-prost-build = "0.14.6"
 # Тесты пула доставки публикуют в поток напрямую, минуя ноду: так
 # проверяется реакция на то, чего нода сама произвести не может —
 # например, на неразбираемый конверт.
-async-nats = "0.39"
+async-nats = "0.50"
