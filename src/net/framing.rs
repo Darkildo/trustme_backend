@@ -217,15 +217,13 @@ pub fn encode_device_id(value: Option<DeviceId>) -> Option<u32> {
     value.map(u32::from)
 }
 
-/// 32-байтовый идентификатор из wire-поля `bytes`. Поле короче 32 байт —
-/// ошибка; более длинное усекается до первых 32 байт.
+/// 32-байтовый идентификатор из wire-поля `bytes`. Длина — ровно 32 байта:
+/// более длинное поле не усекается, а отвергается, иначе разные значения
+/// на проводе адресовали бы одного и того же получателя по первым 32
+/// байтам.
 pub fn as_fixed_32(data: &[u8]) -> Result<[u8; 32]> {
-    if data.len() < 32 {
-        bail!("expected 32 bytes, got {}", data.len());
-    }
-    let mut arr = [0u8; 32];
-    arr.copy_from_slice(&data[..32]);
-    Ok(arr)
+    data.try_into()
+        .map_err(|_| anyhow::anyhow!("expected 32 bytes, got {}", data.len()))
 }
 
 fn encode_frame(payload: frame::Payload) -> Vec<u8> {
@@ -385,6 +383,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(identity.to_montgomery().to_bytes(), node.public());
+    }
+
+    /// Идентификатор — ровно 32 байта: короткий отвергается, а длинный не
+    /// усекается до первых 32, иначе 33-байтовый `recipient_id` молча
+    /// адресовал бы чужой ключ.
+    #[test]
+    fn fixed_32_requires_exact_length() {
+        let id: Vec<u8> = (0..32).collect();
+        assert_eq!(as_fixed_32(&id).unwrap().as_slice(), id.as_slice());
+
+        for len in [0usize, 1, 31, 33, 64] {
+            let data = vec![7u8; len];
+            let err = as_fixed_32(&data).expect_err("wrong length must be rejected");
+            assert!(
+                err.to_string().contains(&format!("got {len}")),
+                "unexpected error: {err}"
+            );
+        }
     }
 
     /// Правка любого байта снапшота ломает подпись — включая поля, которые

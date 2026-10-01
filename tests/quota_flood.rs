@@ -32,6 +32,8 @@ fn open_limits() -> LimitsConfig {
         // Вход не ограничиваем: тест меряет квоты сообщений, а не admission.
         handshake_max_inflight: 0,
         handshake_max_inflight_per_ip: 0,
+        max_connections: 0,
+        ..LimitsConfig::default()
     }
 }
 

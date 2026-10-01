@@ -257,6 +257,14 @@ pub fn observe_handshake_admission_rejected(reason: &'static str) {
     .increment(1);
 }
 
+/// Соединение закрыто сразу после `accept`, до хендшейка: занят весь
+/// потолок открытых соединений (`LIMIT_MAX_CONNECTIONS`). Ненулевая
+/// величина означает, что нода упёрлась в потолок: либо её заливают
+/// соединениями, либо потолок занижен для реальной нагрузки.
+pub fn observe_connection_limit_rejected() {
+    counter!("trust_message_tcp_connection_limit_rejected_total").increment(1);
+}
+
 /// Источник ключа ноды на этом старте. `source="generated"` на живой
 /// ноде — авария: прежний ключ потерян, клиенты отрезаны. Это gauge, а не
 /// счётчик: величина описывает текущий запуск.

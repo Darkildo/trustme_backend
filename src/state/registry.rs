@@ -80,17 +80,15 @@ impl ConnRegistry {
     }
 
     pub fn remove(&self, user: &UserId, connection_id: ConnectionId) {
-        let Some(mut sessions) = self.inner.get_mut(user) else {
-            return;
-        };
-
-        sessions.retain(|entry| entry.id != connection_id);
-        let should_remove_key = sessions.is_empty();
-        drop(sessions);
-
-        if should_remove_key {
-            self.inner.remove(user);
-        }
+        // Удаление сессии и решение «убрать ключ» — одна операция под
+        // блокировкой шарда. Разнесённые по двум блокировкам, они
+        // пропускали между собой `insert` того же пользователя: ключ
+        // удалялся вместе со свежей сессией, и она пропадала из
+        // маршрутизации, оставаясь живой.
+        self.inner.remove_if_mut(user, |_, sessions| {
+            sessions.retain(|entry| entry.id != connection_id);
+            sessions.is_empty()
+        });
     }
 
     pub fn route_targets(
@@ -229,6 +227,68 @@ mod tests {
 
         registry.remove(&user(1), first.connection_id);
         assert_eq!(registry.session_count(&user(1)), 1);
+    }
+
+    /// `remove` последней сессии пользователя, идущий одновременно с
+    /// `insert` новой сессии того же пользователя, не должен её терять.
+    /// Окно гонки узкое, поэтому раундов много: каждый раунд стартует оба
+    /// потока с барьера.
+    #[test]
+    fn concurrent_insert_survives_removal_of_last_session() {
+        use std::sync::{Arc, Barrier};
+
+        const ROUNDS: usize = 5_000;
+        let registry = ConnRegistry::default();
+        let barrier = Arc::new(Barrier::new(2));
+        let (tx, _rx) = mpsc::channel::<OutboundFrame>(1);
+
+        for round in 0..ROUNDS {
+            let leaving = registry.insert(user(1), Some(1), tx.clone());
+
+            let remover = {
+                let registry = registry.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    registry.remove(&user(1), leaving.connection_id);
+                })
+            };
+            barrier.wait();
+            let joining = registry.insert(user(1), Some(2), tx.clone());
+            remover.join().unwrap();
+
+            let targets = registry.route_targets(&user(1), None);
+            assert_eq!(
+                targets.iter().map(|t| t.id).collect::<Vec<_>>(),
+                vec![joining.connection_id],
+                "round {round}: the fresh session was lost or the old one stayed"
+            );
+            registry.remove(&user(1), joining.connection_id);
+            assert!(!registry.has_user(&user(1)));
+        }
+    }
+
+    /// Ключ пользователя уходит вместе с последней сессией: иначе карта
+    /// росла бы по строке на каждого, кто когда-либо подключался.
+    #[test]
+    fn removing_last_session_drops_the_user_key() {
+        let registry = ConnRegistry::default();
+        let (tx_a, _rx_a) = mpsc::channel::<OutboundFrame>(1);
+        let (tx_b, _rx_b) = mpsc::channel::<OutboundFrame>(1);
+
+        let first = registry.insert(user(1), Some(1), tx_a);
+        let second = registry.insert(user(1), Some(2), tx_b);
+
+        registry.remove(&user(1), first.connection_id);
+        assert_eq!(registry.inner.len(), 1);
+        // Неизвестный id ничего не трогает.
+        registry.remove(&user(1), u64::MAX);
+        assert_eq!(registry.session_count(&user(1)), 1);
+
+        registry.remove(&user(1), second.connection_id);
+        assert_eq!(registry.inner.len(), 0);
+        // Повторное удаление отсутствующего пользователя — не ошибка.
+        registry.remove(&user(1), second.connection_id);
     }
 
     #[test]

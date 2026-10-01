@@ -1,6 +1,7 @@
 use dashmap::DashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
@@ -24,10 +25,33 @@ struct UserCounters {
 /// флуда в моменте, а не как аудит; перезапуск ноды сбрасывает счётчики.
 /// Проверка детерминирована относительно переданного времени (`check_at`) —
 /// так тестируются окна без реальных пауз.
+///
+/// Запись заводится на каждого отправителя, а ключ пользователя ничего не
+/// стоит, поэтому записи с истёкшими окнами вычищаются: раз в
+/// [`SWEEP_INTERVAL_SECS`] это делает один из вызовов `check_at`.
 pub struct SendRateLimiter {
     msgs_per_sec: u32,
     bytes_per_day: u64,
     per_user: DashMap<UserId, UserCounters>,
+    /// Номер интервала вычистки, в котором она уже прошла.
+    last_sweep_slot: AtomicU64,
+}
+
+/// Период вычистки, сек. Вычистка — проход по всей карте, поэтому не на
+/// каждом вызове; минуты хватает, чтобы карта не росла дольше суточного
+/// окна.
+const SWEEP_INTERVAL_SECS: u64 = 60;
+
+impl UserCounters {
+    /// Запись ничего не помнит сверх свежей: оба окна, которые она
+    /// считает, уже сменились, и следующая проверка всё равно обнулила бы
+    /// оба счётчика. Удалить её — то же, что оставить. Окно выключенного
+    /// лимита не учитывается: его счётчик никто не сравнивает.
+    fn is_expired(&self, now_secs: u64, msgs_limited: bool, bytes_limited: bool) -> bool {
+        let sec_expired = !msgs_limited || self.sec_window_start != now_secs;
+        let day_expired = !bytes_limited || self.day_key != now_secs / SECS_PER_DAY;
+        sec_expired && day_expired
+    }
 }
 
 impl SendRateLimiter {
@@ -36,7 +60,39 @@ impl SendRateLimiter {
             msgs_per_sec,
             bytes_per_day,
             per_user: DashMap::new(),
+            last_sweep_slot: AtomicU64::new(0),
         }
+    }
+
+    /// Сколько пользователей сейчас помнит лимитер (для тестов и
+    /// диагностики).
+    pub fn tracked_users(&self) -> usize {
+        self.per_user.len()
+    }
+
+    /// Удалить записи с истёкшими окнами, если в текущем интервале этого
+    /// ещё никто не сделал. Право на проход достаётся одному вызову через
+    /// CAS: остальные не ждут его и не повторяют. Сам проход блокирует
+    /// шарды карты по одному, а не всю карту, так что отправители из других
+    /// шардов его не замечают.
+    ///
+    /// Интервал определяется номером, а не ростом: при прыжке часов назад
+    /// вычистка не замирает на длину прыжка — так же, как окна в `check_at`.
+    fn maybe_sweep(&self, now_secs: u64) {
+        let slot = now_secs / SWEEP_INTERVAL_SECS;
+        let last = self.last_sweep_slot.load(Ordering::Relaxed);
+        if last == slot
+            || self
+                .last_sweep_slot
+                .compare_exchange(last, slot, Ordering::Relaxed, Ordering::Relaxed)
+                .is_err()
+        {
+            return;
+        }
+        let msgs_limited = self.msgs_per_sec > 0;
+        let bytes_limited = self.bytes_per_day > 0;
+        self.per_user
+            .retain(|_, counters| !counters.is_expired(now_secs, msgs_limited, bytes_limited));
     }
 
     pub fn check(&self, user: &UserId, bytes: usize) -> bool {
@@ -49,6 +105,9 @@ impl SendRateLimiter {
         if self.msgs_per_sec == 0 && self.bytes_per_day == 0 {
             return true;
         }
+        // До захвата записи пользователя: `retain` берёт шарды на запись, и
+        // удерживаемая запись своего шарда заперла бы его навсегда.
+        self.maybe_sweep(now_secs);
         let mut counters = self.per_user.entry(*user).or_insert(UserCounters {
             sec_window_start: now_secs,
             sec_count: 0,
@@ -321,6 +380,64 @@ mod tests {
         assert!(!limiter.check(&user(42), 1));
         // Другой пользователь имеет собственный бюджет.
         assert!(limiter.check(&user(43), 1));
+    }
+
+    /// Записи с истёкшими окнами вычищаются: карта не растёт по строке на
+    /// каждого, кто когда-либо отправлял.
+    #[test]
+    fn expired_entries_are_evicted() {
+        let limiter = SendRateLimiter::new(10, 1_000);
+        let day_start = 7 * 86_400;
+        for seed in 0..100u8 {
+            assert!(limiter.check_at(&user(seed), 1, day_start + 5));
+        }
+        assert_eq!(limiter.tracked_users(), 100);
+
+        // Следующий UTC-день и следующий интервал вычистки: все прежние
+        // окна истекли, остаётся только запись текущего отправителя.
+        assert!(limiter.check_at(&user(200), 1, day_start + 86_400));
+        assert_eq!(limiter.tracked_users(), 1);
+    }
+
+    /// Вычистка не сбрасывает бюджет, который ещё действует: запись с
+    /// живым суточным окном переживает проход, и выбравший бюджет
+    /// пользователь остаётся заблокирован.
+    #[test]
+    fn sweep_keeps_entries_with_a_live_window() {
+        let limiter = SendRateLimiter::new(0, 100);
+        let day_start = 3 * 86_400;
+        assert!(limiter.check_at(&user(1), 100, day_start + 10));
+        assert!(!limiter.check_at(&user(1), 1, day_start + 10));
+
+        // Тот же день, другой интервал вычистки — проход случился.
+        assert!(limiter.check_at(&user(2), 1, day_start + 10 + 2 * 60));
+        assert_eq!(limiter.tracked_users(), 2);
+        assert!(!limiter.check_at(&user(1), 1, day_start + 10 + 2 * 60));
+    }
+
+    /// Только секундный лимит: записи истекают со своей секундой, и
+    /// вычистка сводит карту к тем, кто отправлял в текущую.
+    #[test]
+    fn msgs_only_entries_expire_with_their_second() {
+        let limiter = SendRateLimiter::new(1, 0);
+        for seed in 0..50u8 {
+            assert!(limiter.check_at(&user(seed), 1, 1_000));
+        }
+        assert!(!limiter.check_at(&user(0), 1, 1_000));
+        assert_eq!(limiter.tracked_users(), 50);
+
+        assert!(limiter.check_at(&user(0), 1, 1_000 + 60));
+        assert_eq!(limiter.tracked_users(), 1);
+    }
+
+    /// Прыжок часов назад не замораживает вычистку: интервал определяется
+    /// номером, а не ростом.
+    #[test]
+    fn sweep_runs_after_backwards_clock_jump() {
+        let limiter = SendRateLimiter::new(1, 0);
+        assert!(limiter.check_at(&user(1), 1, 100_000));
+        assert!(limiter.check_at(&user(2), 1, 100_000 - 3_600));
+        assert_eq!(limiter.tracked_users(), 1);
     }
 
     #[test]

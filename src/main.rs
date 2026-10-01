@@ -1,9 +1,11 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use tokio::net::TcpListener;
-use tracing::{info, warn};
+use tokio::task::JoinHandle;
+use tracing::{error, info, warn};
 use trust_message_tcp::delivery::DeliveryBackend;
 use trust_message_tcp::net::listener::accept_loop;
 use trust_message_tcp::net::noise::NodeIdentity;
@@ -67,9 +69,9 @@ async fn main() -> Result<()> {
     // SIGTERM сигнал игнорирует, и docker добивает его SIGKILL'ом через
     // десять секунд. Обработчик даёт сбросить sled на диск и выйти сразу.
     //
-    // Соединения при этом не дренируются: accept-цикл, сессии и планировщик
-    // пушей продолжают работать до выхода из `main` и отменяются вместе с
-    // рантаймом.
+    // Установленные соединения при этом не дренируются: сессии и
+    // планировщик пушей работают до выхода из `main` и отменяются вместе с
+    // рантаймом. Останавливается только приём новых.
     let storage_for_shutdown = storage.clone();
     let server = tokio::spawn(accept_loop(
         listener,
@@ -82,47 +84,101 @@ async fn main() -> Result<()> {
         cfg,
     ));
 
-    tokio::select! {
-        _ = server => {
-            info!("accept loop exited on its own");
-        }
-        signal = shutdown_signal() => {
-            info!(signal, "shutting down");
-        }
+    let outcome = run_until_shutdown(server, shutdown_signal()).await;
+    if let Err(err) = &outcome {
+        error!(error = %err, "accept loop failed; shutting down");
     }
 
+    // Хранилище сбрасывается и при аварии цикла: принятое до неё не должно
+    // теряться из-за того, что умер приём.
     match storage_for_shutdown.flush() {
         Ok(bytes) => info!(bytes, "storage flushed on shutdown"),
         Err(err) => warn!(error = %err, "storage flush on shutdown failed"),
     }
 
-    Ok(())
+    outcome
+}
+
+/// Работает, пока не придёт сигнал остановки, следя за accept-циклом.
+///
+/// Цикл бесконечен, поэтому его завершение — авария (паника или отмена), а
+/// не штатный выход: результат — ошибка, и процесс выходит с ненулевым
+/// кодом, который видят рестарт-политика и мониторинг.
+///
+/// По сигналу задача цикла отменяется, и её завершение дожидается: вместе
+/// с ней закрывается слушающий сокет, так что к сбросу хранилища новых
+/// сессий уже не появляется.
+async fn run_until_shutdown(
+    mut server: JoinHandle<()>,
+    shutdown: impl Future<Output = &'static str>,
+) -> Result<()> {
+    tokio::select! {
+        joined = &mut server => Err(match joined {
+            Ok(()) => anyhow!("accept loop exited unexpectedly"),
+            Err(err) if err.is_panic() => anyhow!("accept loop panicked: {err}"),
+            Err(err) => anyhow!("accept loop was cancelled: {err}"),
+        }),
+        signal = shutdown => {
+            info!(signal, "shutting down; no longer accepting connections");
+            server.abort();
+            // Отмена вступает в силу на ближайшей точке ожидания цикла;
+            // результат — заведомо `cancelled`, интересен только сам факт.
+            let _ = server.await;
+            Ok(())
+        }
+    }
 }
 
 /// Ждёт SIGTERM (docker stop, systemd) или SIGINT (Ctrl-C) и возвращает
 /// имя пришедшего — оно попадает в лог, потому что «нода остановилась»
 /// и «ноду остановили» разбираются по-разному.
+///
+/// Не удалась подписка на один сигнал — ждём другой. Вечное ожидание на
+/// месте неудавшейся подписки лишило бы ноду и второго способа остановки.
 async fn shutdown_signal() -> &'static str {
+    let interrupt = async {
+        if let Err(err) = tokio::signal::ctrl_c().await {
+            // Ошибка подписки — не сигнал: принять её за Ctrl-C значило бы
+            // остановить ноду сразу после старта.
+            warn!(error = %err, "cannot listen for SIGINT");
+            std::future::pending::<()>().await;
+        }
+    };
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};
-        let mut term = match signal(SignalKind::terminate()) {
-            Ok(stream) => stream,
+        let term = match signal(SignalKind::terminate()) {
+            Ok(mut stream) => Some(async move {
+                stream.recv().await;
+            }),
             Err(err) => {
-                warn!(error = %err, "cannot listen for SIGTERM");
-                std::future::pending::<()>().await;
-                unreachable!()
+                warn!(error = %err, "cannot listen for SIGTERM; only SIGINT stops the node");
+                None
             }
         };
-        tokio::select! {
-            _ = term.recv() => "SIGTERM",
-            _ = tokio::signal::ctrl_c() => "SIGINT",
-        }
+        first_signal(term, interrupt).await
     }
     #[cfg(not(unix))]
     {
-        let _ = tokio::signal::ctrl_c().await;
-        "SIGINT"
+        first_signal(None::<std::future::Pending<()>>, interrupt).await
+    }
+}
+
+/// Первый из пришедших сигналов. `term = None` — SIGTERM недоступен, и
+/// остановить ноду может только SIGINT.
+async fn first_signal(
+    term: Option<impl Future<Output = ()>>,
+    interrupt: impl Future<Output = ()>,
+) -> &'static str {
+    match term {
+        Some(term) => tokio::select! {
+            _ = term => "SIGTERM",
+            _ = interrupt => "SIGINT",
+        },
+        None => {
+            interrupt.await;
+            "SIGINT"
+        }
     }
 }
 
@@ -322,4 +378,79 @@ fn split_bind_addr(addr: &str) -> Result<(String, u16)> {
     Err(anyhow!(
         "bind address `{addr}` is missing a port; provide `host:port`"
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{first_signal, run_until_shutdown};
+    use std::future::{pending, ready};
+    use std::time::Duration;
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio::time::timeout;
+
+    const GUARD: Duration = Duration::from_secs(5);
+
+    /// Паника accept-цикла — ошибка процесса, а не штатный выход с кодом 0.
+    #[tokio::test]
+    async fn accept_loop_panic_is_an_error() {
+        let server = tokio::spawn(async { panic!("accept loop blew up") });
+        let err = timeout(GUARD, run_until_shutdown(server, pending()))
+            .await
+            .expect("must not wait for a signal once the loop is gone")
+            .expect_err("a panicked accept loop must fail the process");
+        assert!(err.to_string().contains("panicked"), "unexpected: {err}");
+    }
+
+    /// Цикл, вернувшийся сам, — тоже авария: штатно он не завершается.
+    #[tokio::test]
+    async fn accept_loop_returning_is_an_error() {
+        let server = tokio::spawn(async {});
+        let err = timeout(GUARD, run_until_shutdown(server, pending()))
+            .await
+            .expect("must not wait for a signal once the loop is gone")
+            .expect_err("an exited accept loop must fail the process");
+        assert!(err.to_string().contains("exited"), "unexpected: {err}");
+    }
+
+    /// По сигналу приём прекращается до возврата: к сбросу хранилища
+    /// слушающий сокет уже закрыт, и новое подключение получает отказ.
+    #[tokio::test]
+    async fn signal_closes_the_listener_before_returning() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            loop {
+                let _ = listener.accept().await;
+            }
+        });
+
+        timeout(GUARD, run_until_shutdown(server, ready("SIGTERM")))
+            .await
+            .unwrap()
+            .expect("a signal is a clean shutdown");
+
+        assert!(
+            TcpStream::connect(addr).await.is_err(),
+            "listener must be closed once shutdown returns"
+        );
+    }
+
+    /// Без подписки на SIGTERM нода всё ещё останавливается по SIGINT, а
+    /// не ждёт вечно.
+    #[tokio::test]
+    async fn sigint_works_without_sigterm() {
+        let signal = timeout(
+            GUARD,
+            first_signal(None::<std::future::Pending<()>>, ready(())),
+        )
+        .await
+        .expect("SIGINT must stop the node when SIGTERM is unavailable");
+        assert_eq!(signal, "SIGINT");
+    }
+
+    #[tokio::test]
+    async fn first_signal_names_the_one_that_arrived() {
+        assert_eq!(first_signal(Some(ready(())), pending()).await, "SIGTERM");
+        assert_eq!(first_signal(Some(pending()), ready(())).await, "SIGINT");
+    }
 }

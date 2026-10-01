@@ -109,6 +109,35 @@ pub struct LimitsConfig {
     /// входа. За общим NAT значение нужно поднимать под фактическое число
     /// устройств — см. docs/deployment.md.
     pub handshake_max_inflight_per_ip: usize,
+    /// Потолок одновременно открытых клиентских TCP-соединений на ноду, в
+    /// том числе ещё не прошедших хендшейк (`LIMIT_MAX_CONNECTIONS`).
+    /// Default: 4096, `0` = без ограничения.
+    ///
+    /// Сверх потолка соединение закрывается сразу после `accept`, до
+    /// хендшейка. Это потолок памяти: простаивающая сессия держит буфер
+    /// Noise (64 КиБ) и буферы кадров — порядка 80 КиБ, 4096 сессий — около
+    /// 320 МиБ. Значение должно быть ниже `ulimit -n` процесса с запасом под
+    /// файлы sled и исходящие соединения: упёршись в лимит дескрипторов
+    /// раньше, нода перестаёт принимать вовсе, и соединения копятся в
+    /// backlog вместо быстрого отказа.
+    pub max_connections: usize,
+    /// Простой соединения до первой TCP keepalive-пробы
+    /// (`TCP_KEEPALIVE_SECS`), сек. Default: 60. `0` выключает keepalive.
+    ///
+    /// Без keepalive полуоткрытое соединение (телефон сменил сеть, не
+    /// послав FIN) живёт, пока нода ему не пишет, то есть вечно: занимает
+    /// место в лимите сессий пользователя и держит его «в сети» для
+    /// маршрутизации. Проба уходит только после простоя, поэтому клиент,
+    /// который пингует чаще, её не получает и радио лишний раз не будит.
+    pub tcp_keepalive_secs: u64,
+    /// Интервал между неотвеченными keepalive-пробами
+    /// (`TCP_KEEPALIVE_INTERVAL_SECS`), сек. Default: 15.
+    pub tcp_keepalive_interval_secs: u64,
+    /// Сколько неотвеченных проб подряд рвут соединение
+    /// (`TCP_KEEPALIVE_RETRIES`). Default: 4 — мёртвый пир обнаруживается
+    /// примерно через `60 + 4 × 15 = 120` с простоя. На платформах без
+    /// `TCP_KEEPCNT` действует системное значение.
+    pub tcp_keepalive_retries: u32,
 }
 
 impl Default for LimitsConfig {
@@ -125,6 +154,10 @@ impl Default for LimitsConfig {
             max_queues_per_user: 1024,
             handshake_max_inflight: 256,
             handshake_max_inflight_per_ip: 32,
+            max_connections: 4096,
+            tcp_keepalive_secs: 60,
+            tcp_keepalive_interval_secs: 15,
+            tcp_keepalive_retries: 4,
         }
     }
 }
@@ -563,6 +596,14 @@ struct RawConfig {
     limit_handshake_inflight: Option<usize>,
     #[serde(default)]
     limit_handshake_inflight_per_ip: Option<usize>,
+    #[serde(default)]
+    limit_max_connections: Option<usize>,
+    #[serde(default)]
+    tcp_keepalive_secs: Option<u64>,
+    #[serde(default)]
+    tcp_keepalive_interval_secs: Option<u64>,
+    #[serde(default)]
+    tcp_keepalive_retries: Option<u32>,
 }
 
 pub fn load() -> anyhow::Result<Config> {
@@ -642,6 +683,10 @@ pub fn load() -> anyhow::Result<Config> {
         device_cert_max_ttl_seconds,
         limit_handshake_inflight,
         limit_handshake_inflight_per_ip,
+        limit_max_connections,
+        tcp_keepalive_secs,
+        tcp_keepalive_interval_secs,
+        tcp_keepalive_retries,
     } = raw;
 
     let bind_addr = resolve_bind_addr(bind_addr, bind_host, bind_port)?;
@@ -726,7 +771,13 @@ pub fn load() -> anyhow::Result<Config> {
         handshake_max_inflight: limit_handshake_inflight.unwrap_or(defaults.handshake_max_inflight),
         handshake_max_inflight_per_ip: limit_handshake_inflight_per_ip
             .unwrap_or(defaults.handshake_max_inflight_per_ip),
+        max_connections: limit_max_connections.unwrap_or(defaults.max_connections),
+        tcp_keepalive_secs: tcp_keepalive_secs.unwrap_or(defaults.tcp_keepalive_secs),
+        tcp_keepalive_interval_secs: tcp_keepalive_interval_secs
+            .unwrap_or(defaults.tcp_keepalive_interval_secs),
+        tcp_keepalive_retries: tcp_keepalive_retries.unwrap_or(defaults.tcp_keepalive_retries),
     };
+    check_tcp_keepalive(&limits)?;
 
     Ok(Config {
         queue_addressing_enabled: queue_addressing_enabled.unwrap_or(false),
@@ -1118,10 +1169,33 @@ fn retention_days(days: u64, field_name: &str) -> anyhow::Result<RetentionPolicy
     Ok(RetentionPolicy::KeepFor(Duration::from_secs(secs)))
 }
 
+/// Границы keepalive — те, что принимает Linux (`TCP_KEEPIDLE` и
+/// `TCP_KEEPINTVL` до 32 767 с, `TCP_KEEPCNT` до 127). Значение вне них
+/// ядро отвергает на каждом принятом сокете, и нода работала бы без
+/// keepalive, сообщая об этом только предупреждениями в логе.
+fn check_tcp_keepalive(limits: &LimitsConfig) -> anyhow::Result<()> {
+    const MAX_SECS: u64 = 32_767;
+    const MAX_RETRIES: u32 = 127;
+    if limits.tcp_keepalive_secs == 0 {
+        return Ok(());
+    }
+    if limits.tcp_keepalive_secs > MAX_SECS {
+        bail!("TCP_KEEPALIVE_SECS must be at most {MAX_SECS} (0 disables keepalive)");
+    }
+    if !(1..=MAX_SECS).contains(&limits.tcp_keepalive_interval_secs) {
+        bail!("TCP_KEEPALIVE_INTERVAL_SECS must be between 1 and {MAX_SECS}");
+    }
+    if !(1..=MAX_RETRIES).contains(&limits.tcp_keepalive_retries) {
+        bail!("TCP_KEEPALIVE_RETRIES must be between 1 and {MAX_RETRIES}");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        PushRawConfig, RetentionPolicy, parse_retention_policy, resolve_delivery, resolve_push,
+        LimitsConfig, PushRawConfig, RetentionPolicy, check_tcp_keepalive, parse_retention_policy,
+        resolve_delivery, resolve_push,
     };
     use std::time::Duration;
 
@@ -1325,5 +1399,42 @@ mod tests {
             parse_retention_policy(Some("15".to_string()), 30, "TEST_RETENTION").unwrap(),
             RetentionPolicy::KeepFor(Duration::from_secs(15 * 24 * 60 * 60))
         );
+    }
+
+    /// Дефолт keepalive проходит проверку, `0` выключает её целиком, а
+    /// значения, которые ядро отвергло бы на каждом сокете, ловятся на
+    /// старте.
+    #[test]
+    fn tcp_keepalive_bounds_are_checked_at_startup() {
+        let defaults = LimitsConfig::default();
+        assert!(check_tcp_keepalive(&defaults).is_ok());
+
+        let disabled = LimitsConfig {
+            tcp_keepalive_secs: 0,
+            tcp_keepalive_interval_secs: 0,
+            tcp_keepalive_retries: 0,
+            ..defaults
+        };
+        assert!(check_tcp_keepalive(&disabled).is_ok());
+
+        for (secs, interval, retries, field) in [
+            (32_768, 15, 4, "TCP_KEEPALIVE_SECS"),
+            (60, 0, 4, "TCP_KEEPALIVE_INTERVAL_SECS"),
+            (60, 32_768, 4, "TCP_KEEPALIVE_INTERVAL_SECS"),
+            (60, 15, 0, "TCP_KEEPALIVE_RETRIES"),
+            (60, 15, 128, "TCP_KEEPALIVE_RETRIES"),
+        ] {
+            let limits = LimitsConfig {
+                tcp_keepalive_secs: secs,
+                tcp_keepalive_interval_secs: interval,
+                tcp_keepalive_retries: retries,
+                ..defaults
+            };
+            let err = check_tcp_keepalive(&limits).unwrap_err().to_string();
+            assert!(
+                err.contains(field),
+                "expected {field} complaint, got: {err}"
+            );
+        }
     }
 }
