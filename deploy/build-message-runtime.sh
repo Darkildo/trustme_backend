@@ -13,7 +13,10 @@ set -euo pipefail
 # rustls, который собирается из исходников.
 
 BUILDER_IMAGE=${BUILDER_IMAGE:-trust-message-builder:1.97-bookworm}
-SRC_DIR=${SRC_DIR:-/root/trust/Trust_me_deploy/tcp_message_server}
+# Исходники — дерево, в котором лежит сам скрипт: run-deploy.sh кладёт его
+# в $DEPLOY_DIR/tcp_message_server, и захардкоженный путь собирал бы не то
+# дерево при нестандартном DEPLOY_DIR.
+SRC_DIR=${SRC_DIR:-$(cd "$(dirname "$0")/.." && pwd)}
 CARGO_CACHE=${CARGO_CACHE:-/root/.cargo-deploy}
 
 # Сборочный образ строится один раз. Пересобрать принудительно —

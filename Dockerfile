@@ -1,6 +1,20 @@
 # syntax=docker/dockerfile:1.6
 
-FROM rustlang/rust:nightly-bullseye AS builder
+# Тот же тулчейн и та же дистрибуция, что у сборки прода
+# (deploy/builder.Dockerfile): образ собирается тем компилятором, которым
+# собран выкаченный бинарь, а не плавающим nightly. Версия меняется вместе
+# с builder.Dockerfile и тегом BUILDER_IMAGE в build-message-runtime.sh.
+FROM rust:1.97-slim-bookworm AS builder
+
+# build-essential/cmake/perl нужны не Rust'у, а aws-lc-sys — C-бэкенду
+# rustls, который собирается из исходников. В slim-образе их нет.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        perl \
+        pkg-config \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
 
@@ -12,13 +26,15 @@ COPY Cargo.toml Cargo.lock build.rs ./
 COPY schemas ./schemas
 RUN mkdir src \
     && echo 'fn main() {}' > src/main.rs \
-    && cargo fetch
+    && cargo fetch --locked
 
 # Build the real binary.
 COPY . ./
-RUN cargo build --release
+RUN cargo build --release --locked
 
 
+# Рантайм на той же дистрибуции, что и сборка (bookworm): бинарь
+# слинкован с glibc сборочного образа и на более старой не запустится.
 FROM debian:bookworm-slim AS runtime
 
 RUN apt-get update \

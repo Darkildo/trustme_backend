@@ -15,10 +15,11 @@ use ed25519_dalek::SigningKey;
 use prost::Message;
 use trust_message_tcp::config::{RetentionPolicy, ServerConfigSnapshot};
 use trust_message_tcp::net::framing::{
-    encode_auth_error, encode_incoming, encode_pong, encode_push_token_ack, encode_send_ack,
-    encode_signed_server_config,
+    encode_auth_error, encode_incoming, encode_pong, encode_push_token_ack, encode_queue_ack,
+    encode_queue_list, encode_send_ack, encode_signed_server_config,
 };
 use trust_message_tcp::net::noise::{NodeIdentity, NodeKeySource};
+use trust_message_tcp::state::queues::QueueRecord;
 use trust_message_tcp::wire::{self, Frame, frame};
 
 const PROTO_VERSION: u32 = 1;
@@ -129,6 +130,57 @@ fn main() -> Result<()> {
     write(&dir, "push_token_ack.bin", &encode_push_token_ack(true, ""))?;
     write(
         &dir,
+        "unregister_push_token.bin",
+        &wrap(frame::Payload::UnregisterPushToken(
+            wire::UnregisterPushToken {},
+        )),
+    )?;
+    // Очереди: запросы клиента и ответы ноды, включая отказ и список из
+    // нескольких записей — повторяющееся поле разбирается иначе, чем
+    // одиночное.
+    write(
+        &dir,
+        "allocate_queue.bin",
+        &wrap(frame::Payload::AllocateQueue(wire::AllocateQueue {})),
+    )?;
+    write(
+        &dir,
+        "revoke_queue.bin",
+        &wrap(frame::Payload::RevokeQueue(wire::RevokeQueue {
+            queue_id: vec![5u8; 32],
+        })),
+    )?;
+    write(
+        &dir,
+        "list_queues.bin",
+        &wrap(frame::Payload::ListQueues(wire::ListQueues {})),
+    )?;
+    write(
+        &dir,
+        "queue_ack.bin",
+        &encode_queue_ack(true, Some([6u8; 32]), wire::QueueRejectReason::Unspecified),
+    )?;
+    write(
+        &dir,
+        "queue_ack_rejected.bin",
+        &encode_queue_ack(false, None, wire::QueueRejectReason::Forbidden),
+    )?;
+    write(
+        &dir,
+        "queue_list.bin",
+        &encode_queue_list(&[
+            QueueRecord {
+                queue_id: [6u8; 32],
+                created_at_secs: 1_700_000_000,
+            },
+            QueueRecord {
+                queue_id: [8u8; 32],
+                created_at_secs: 1_700_086_400,
+            },
+        ]),
+    )?;
+    write(
+        &dir,
         "empty_frame.bin",
         &Frame {
             proto_version: PROTO_VERSION,
@@ -154,6 +206,13 @@ fn main() -> Result<()> {
         advertised_address: Some("node.example:5000".to_string()),
     };
     let signed_frame = encode_signed_server_config(&snapshot, &node, 1_700_000_000);
+    // Тот же снапшот целым кадром — вариант oneof `SignedServerConfig` для
+    // frame_decode.
+    write(
+        &root.join("frame_decode"),
+        "signed_server_config.bin",
+        &signed_frame,
+    )?;
     // Таргет ждёт голый SignedServerConfig, а не кадр — достаём payload.
     let payload = Frame::decode(signed_frame.as_slice())?
         .payload
@@ -192,7 +251,9 @@ fn main() -> Result<()> {
         )?;
     }
     // Делегированный вход: настоящий сертификат, чтобы фаззер стартовал с
-    // формы, которая проходит разбор, а не только с мусора.
+    // формы, которая проходит разбор, а не только с мусора. Окно действия
+    // согласовано с `NOW` и `MAX_TTL` в fuzz/fuzz_targets/client_hello.rs:
+    // там этот сид проходит и проверку подписи.
     {
         use ed25519_dalek::Signer;
         use trust_message_tcp::net::device_cert::signed_bytes;

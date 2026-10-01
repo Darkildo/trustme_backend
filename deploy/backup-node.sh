@@ -27,6 +27,12 @@ set -euo pipefail
 # момент» — приемлемо, но проверяется только разворачиванием, а не
 # рассуждением. Репетиция описана в docs/deployment.md.
 
+# Архив несёт NODE_IDENTITY_KEY и креды push, поэтому он рождается
+# закрытым: один chmod после tar оставил бы окно, в которое файл с umask
+# по умолчанию (0644) может прочитать любой пользователь хоста. Каталог
+# бэкапов, если его создаёт этот запуск, тоже получается 0700.
+umask 077
+
 DEPLOY_DIR=${DEPLOY_DIR:-/root/trust/Trust_me_deploy}
 BACKUP_DIR=${BACKUP_DIR:-/root/trust/backups}
 SECRETS_DIR=${SECRETS_DIR:-/root/trust/secrets}
@@ -50,6 +56,8 @@ tar czf "$target" \
   -C "$DEPLOY_DIR" .env \
   -C "$(dirname "$SECRETS_DIR")" "$(basename "$SECRETS_DIR")"
 
+# Страховка на случай, если файл с таким именем уже существовал: umask
+# действует только на вновь созданные.
 chmod 600 "$target"
 
 # Ротация: держим последние $KEEP. Без неё бэкапы и есть та самая течь,

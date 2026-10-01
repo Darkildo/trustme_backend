@@ -13,6 +13,7 @@
     python3 scripts/coverage-gate.py coverage.json <base-ref> [--min 70]
 """
 
+import argparse
 import json
 import re
 import subprocess
@@ -26,13 +27,36 @@ EXEMPT_SUFFIXES = ("src/main.rs", "build.rs")
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 
-def added_lines(base_ref: str) -> dict[str, set[int]]:
-    """Номера добавленных строк по файлам, из унифицированного диффа."""
+def repo_root() -> Path:
+    """Корень рабочего дерева: от него считаются пути и в диффе, и в отчёте.
+
+    Без git (распакованный архив исходников) корнем считается текущий
+    каталог — гейт запускают из корня репозитория.
+    """
+    try:
+        top = subprocess.run(
+            ["git", "rev-parse", "--show-toplevel"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return Path.cwd().resolve()
+    return Path(top).resolve()
+
+
+def added_lines(root: Path, base_ref: str) -> dict[str, set[int]]:
+    """Номера добавленных строк по файлам, из унифицированного диффа.
+
+    Пути в диффе git всегда даёт от корня репозитория; `cwd=root` нужен
+    ради pathspec `src`, который иначе считался бы от текущего каталога.
+    """
     diff = subprocess.run(
         ["git", "diff", "-U0", "--diff-filter=d", f"{base_ref}...HEAD", "--", "src"],
         capture_output=True,
         text=True,
         check=True,
+        cwd=root,
     )
 
     result: dict[str, set[int]] = {}
@@ -55,7 +79,27 @@ def added_lines(base_ref: str) -> dict[str, set[int]]:
     return result
 
 
-def covered_and_executable(report_path: str) -> dict[str, tuple[set[int], set[int]]]:
+def relative_to_root(filename: str, root: Path) -> str:
+    """Путь из отчёта llvm-cov (абсолютный) — в путь от корня репозитория.
+
+    Путь считается от корня, а не по имени каталога внутри него: клон
+    может называться как угодно, а имя проекта может встретиться в пути
+    дважды (в CI это `.../work/<repo>/<repo>/src/...`). Файлы вне
+    репозитория (зависимости, стандартная библиотека) остаются как есть и
+    с диффом не совпадут.
+    """
+    path = Path(filename)
+    if not path.is_absolute():
+        return path.as_posix()
+    try:
+        return path.resolve().relative_to(root).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
+def covered_and_executable(
+    report_path: str, root: Path
+) -> dict[str, tuple[set[int], set[int]]]:
     """По файлу: множества исполняемых и реально исполненных строк.
 
     Сегмент llvm-cov — это [line, col, count, has_count, entry, gap]. Строка
@@ -67,7 +111,7 @@ def covered_and_executable(report_path: str) -> dict[str, tuple[set[int], set[in
     files: dict[str, tuple[set[int], set[int]]] = {}
     for export in report.get("data", []):
         for entry in export.get("files", []):
-            repo_relative = entry["filename"].split("/trust_message_tcp/", 1)[-1]
+            repo_relative = relative_to_root(entry["filename"], root)
             executable: set[int] = set()
             covered: set[int] = set()
             for line, _col, count, has_count, _entry, is_gap in entry.get("segments", []):
@@ -80,22 +124,33 @@ def covered_and_executable(report_path: str) -> dict[str, tuple[set[int], set[in
     return files
 
 
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Порог покрытия на строках, добавленных относительно base-ref.",
+    )
+    parser.add_argument("report", help="JSON-отчёт cargo llvm-cov")
+    parser.add_argument("base_ref", help="с чем сравнивать, например origin/master")
+    parser.add_argument(
+        "--min",
+        type=float,
+        default=DEFAULT_MIN,
+        metavar="PERCENT",
+        help=f"порог в процентах добавленных исполняемых строк (по умолчанию {DEFAULT_MIN:g})",
+    )
+    return parser.parse_args()
+
+
 def main() -> int:
-    if len(sys.argv) < 3:
-        print(__doc__, file=sys.stderr)
-        return 2
+    args = parse_args()
+    minimum = args.min
+    root = repo_root()
 
-    report_path, base_ref = sys.argv[1], sys.argv[2]
-    minimum = DEFAULT_MIN
-    if "--min" in sys.argv:
-        minimum = float(sys.argv[sys.argv.index("--min") + 1])
-
-    added = added_lines(base_ref)
+    added = added_lines(root, args.base_ref)
     if not added:
         print("под src/ ничего не добавлено — гейт покрытия пропущен")
         return 0
 
-    coverage = covered_and_executable(report_path)
+    coverage = covered_and_executable(args.report, root)
 
     total_executable = 0
     total_covered = 0

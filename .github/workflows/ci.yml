@@ -3,6 +3,10 @@
 # покрытие изменённого кода и smoke-фаззинг разборщиков.
 #
 # Сборка образа живёт в docker-image.yml и здесь не дублируется.
+#
+# Сторонние actions здесь и в соседних workflow закреплены SHA коммита
+# (комментарий — версия): тег можно перевесить, коммит — нет. Обновляет их
+# dependabot, см. .github/dependabot.yml.
 name: CI
 
 on:
@@ -25,13 +29,17 @@ jobs:
     name: fmt / clippy / tests
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Версии rust-toolchain — не теги, а ветки-каналы (`stable`,
+      # `nightly`), и они двигаются: пин — коммит master, а канал задаётся
+      # входом `toolchain`.
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Formatting
         run: cargo fmt --all --check
@@ -51,11 +59,13 @@ jobs:
     # и терминация неразбираемого конверта существуют только в связке с
     # живым потоком.
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
+        with:
+          toolchain: stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # Бинарь, а не контейнер: один из тестов поднимает и убивает
       # собственный брокер, и ему нужен исполняемый файл под рукой.
@@ -95,12 +105,12 @@ jobs:
     name: buf lint / breaking
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           # buf breaking сравнивает с master — нужна история, а не срез.
           fetch-depth: 0
 
-      - uses: bufbuild/buf-setup-action@v1
+      - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
@@ -120,19 +130,20 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
+          toolchain: stable
           components: llvm-tools-preview
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-llvm-cov
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       # Брокерные тесты помечены `#[ignore]`, и без них замер врёт: код
       # пула доставки выглядит непокрытым ровно потому, что проверяющие
@@ -179,21 +190,22 @@ jobs:
     name: smoke fuzz
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
 
       # Таргет задаётся явно: санитайзер несовместим со статически
       # слинкованным libc, а cargo-fuzz на этом раннере по умолчанию
       # берёт musl и падает на `sanitizer is incompatible with statically
       # linked libc`.
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@02cb101ec7c40f2c49e1d9714d64511d8e1b74de # master
         with:
+          toolchain: nightly
           targets: x86_64-unknown-linux-gnu
 
-      - uses: taiki-e/install-action@v2
+      - uses: taiki-e/install-action@83ac0ad63c0167e6f06796fab0fce28db1bf3db0 # v2.87.22
         with:
           tool: cargo-fuzz
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           workspaces: |
             .
@@ -223,7 +235,7 @@ jobs:
 
       - name: Upload crash artifacts
         if: failure()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: fuzz-artifacts
           path: fuzz/artifacts

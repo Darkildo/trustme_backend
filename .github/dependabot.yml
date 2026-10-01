@@ -1,0 +1,28 @@
+# Обновления зависимостей.
+#
+# Actions в workflow закреплены SHA коммита: тег можно перевесить на другой
+# коммит, SHA — нет. Цена закрепления — ручные обновления, и их берёт на
+# себя dependabot: он двигает SHA вместе с комментарием-версией.
+#
+# Cargo — два workspace: сам сервер и фазз-крейт (у него свой Cargo.lock).
+# Минорные и патч-обновления идут одним PR на экосистему: по PR на крейт
+# неделя превращалась бы в десяток однотипных ревью.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]
+
+  - package-ecosystem: cargo
+    directories:
+      - /
+      - /fuzz
+    schedule:
+      interval: weekly
+    groups:
+      cargo-minor-and-patch:
+        update-types: [minor, patch]

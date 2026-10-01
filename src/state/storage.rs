@@ -14,19 +14,21 @@
 //!   `removed_at_secs(u64) || исходная запись`, живёт по
 //!   `deleted_messages_retention`.
 //! - `system` — `storage_version` → номер формата записей (сейчас 5).
+//!   При старте база переводится в v5 с v3 и v4; более старые форматы не
+//!   поддерживаются (см. `migrate_legacy_inbox`).
 
 use crate::config::RetentionPolicy;
 use crate::domain::priority::MessagePriority;
 use crate::observability;
 use crate::state::registry::DeviceId;
-use anyhow::{Result, bail};
-use sled::{Db, IVec, Tree};
+use anyhow::{Context, Result, bail};
+use sled::transaction::TransactionError;
+use sled::{Db, IVec, Transactional, Tree};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::{task::JoinHandle, time::sleep};
 use tracing::{info, warn};
 
 const STORAGE_VERSION_KEY: &[u8] = b"storage_version";
-const STORAGE_VERSION_V2: u8 = 2;
 const STORAGE_VERSION_V3: u8 = 3;
 const STORAGE_VERSION_V4: u8 = 4;
 const STORAGE_VERSION_V5: u8 = 5;
@@ -34,6 +36,13 @@ const MESSAGE_HEADER_LEN_V3: usize = 8 + 32 + 1 + 2;
 const MESSAGE_HEADER_LEN: usize = MESSAGE_HEADER_LEN_V3 + 1; // + priority byte
 /// v5 = v4 + ttl_seconds (u64 be) между header и body.
 const MESSAGE_HEADER_LEN_V5: usize = MESSAGE_HEADER_LEN + 8;
+
+/// Что делать оператору с базой в снятом с поддержки формате. Сами
+/// очереди — единственное, что в таком формате не читается: push-токены
+/// и реестр очередей лежат в других деревьях той же базы.
+const UNSUPPORTED_LEGACY_HINT: &str = "this build migrates only v3 and newer. \
+     Drop the `inbox` and `device_inbox` trees of the sled database \
+     (undelivered offline messages are lost) or start with an empty STORAGE_PATH";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredMessage {
@@ -681,19 +690,25 @@ impl Storage {
             // Disabled-политике. При Immediate в очередях всё равно пусто.
             let now_secs = unix_timestamp_secs()?;
             let apply_retention = !self.offline_messages_retention.is_disabled();
-            let account_removed = self.cleanup_tree_messages(
-                &self.inbox,
-                USER_PREFIX_LEN,
-                now_secs,
-                apply_retention,
-            )?;
-            let device_removed = self.cleanup_tree_messages(
+            // Деревья чистятся независимо: сбой в одном не повод оставлять
+            // протухшее в другом до следующего прохода через сутки.
+            let account =
+                self.cleanup_tree_messages(&self.inbox, USER_PREFIX_LEN, now_secs, apply_retention);
+            let device = self.cleanup_tree_messages(
                 &self.device_inbox,
                 DEVICE_PREFIX_LEN,
                 now_secs,
                 apply_retention,
-            )?;
-            Ok(account_removed + device_removed)
+            );
+            let (account, device) = (account?, device?);
+            let undecodable = account.undecodable + device.undecodable;
+            if undecodable > 0 {
+                warn!(
+                    undecodable,
+                    "offline queues hold undecodable records; cleanup skipped them"
+                );
+            }
+            Ok(account.removed + device.removed)
         })();
 
         match result {
@@ -733,8 +748,12 @@ impl Storage {
     }
 
     fn run_cleanup_pass(&self) -> Result<()> {
-        let removed_meta = self.cleanup_expired_meta()?;
-        let removed_messages = self.cleanup_expired_messages()?;
+        // Обе чистки выполняются, даже если первая упала: архив удалённых и
+        // очереди — разные деревья, и сбой одного не должен консервировать
+        // мусор в другом.
+        let removed_meta = self.cleanup_expired_meta();
+        let removed_messages = self.cleanup_expired_messages();
+        let (removed_meta, removed_messages) = (removed_meta?, removed_messages?);
         info!(
             removed_meta,
             removed_messages, "periodic storage cleanup completed"
@@ -742,130 +761,82 @@ impl Storage {
         Ok(())
     }
 
+    /// Привести очереди к формату v5.
+    ///
+    /// Переписанные записи и новый маркер ложатся одной sled-транзакцией,
+    /// поэтому маркер всегда описывает формат записей на диске: падение
+    /// посреди миграции оставляет базу в исходном формате с исходным
+    /// маркером, и следующий старт начинает переписывание с нуля, а не
+    /// переписывает уже переписанное второй раз.
+    ///
+    /// Поддерживаются переходы с v3 и v4: формат записи у них однозначно
+    /// задан маркером, и миграция — вставка полей по известному смещению.
+    /// Форматы v1 (база без маркера) и v2 не поддерживаются: они вышли из
+    /// употребления в марте 2026 года, а их записи отличимы от v3 только по
+    /// длине, и эта эвристика неоднозначна — v2-запись с телом от восьми
+    /// байт (любая с шифротекстом) выглядит как v3, и переписывание по ней
+    /// портит данные. Нода на такой базе не стартует и ничего в ней не
+    /// трогает.
     fn migrate_legacy_inbox(&self) -> Result<()> {
         let current_version = self.system.get(STORAGE_VERSION_KEY)?;
         match current_version.as_deref() {
-            Some([STORAGE_VERSION_V5]) => return Ok(()),
+            Some([STORAGE_VERSION_V5]) => Ok(()),
             Some([STORAGE_VERSION_V4]) => {
-                self.migrate_tree_v4_to_v5(&self.inbox)?;
-                self.migrate_tree_v4_to_v5(&self.device_inbox)?;
+                self.migrate_queues_to_v5(STORAGE_VERSION_V4, v4_record_to_v5)
             }
             Some([STORAGE_VERSION_V3]) => {
-                self.migrate_tree_v3_to_v5(&self.inbox)?;
-                self.migrate_tree_v3_to_v5(&self.device_inbox)?;
+                self.migrate_queues_to_v5(STORAGE_VERSION_V3, v3_record_to_v5)
             }
-            Some([STORAGE_VERSION_V2]) => {
-                let migrated_at_secs = unix_timestamp_secs()?;
-                self.migrate_tree_v2_to_v5(&self.inbox, migrated_at_secs)?;
-                self.migrate_tree_v2_to_v5(&self.device_inbox, migrated_at_secs)?;
+            // Свежая база: очереди пусты, переписывать нечего.
+            None if self.inbox.is_empty() && self.device_inbox.is_empty() => {
+                self.system
+                    .insert(STORAGE_VERSION_KEY, &[STORAGE_VERSION_V5])?;
+                self.system.flush()?;
+                Ok(())
             }
-            None => {
-                let migrated_at_secs = unix_timestamp_secs()?;
-                self.migrate_tree_v1_to_v5(&self.inbox, migrated_at_secs)?;
-                self.migrate_tree_v2_to_v5(&self.device_inbox, migrated_at_secs)?;
-            }
-            Some(version) => {
-                bail!("unsupported storage version marker: {:?}", version);
-            }
+            None => bail!(
+                "offline queues have no storage version marker (format v1); {}",
+                UNSUPPORTED_LEGACY_HINT
+            ),
+            Some([version]) if *version < STORAGE_VERSION_V3 => bail!(
+                "offline queues use storage format v{version}; {}",
+                UNSUPPORTED_LEGACY_HINT
+            ),
+            Some(version) => bail!(
+                "unsupported storage version marker {version:?}: this build reads formats v3..v{STORAGE_VERSION_V5}"
+            ),
         }
-
-        self.system
-            .insert(STORAGE_VERSION_KEY, &[STORAGE_VERSION_V5])?;
-        self.system.flush()?;
-        Ok(())
     }
 
-    fn migrate_tree_v1_to_v5(&self, tree: &Tree, migrated_at_secs: u64) -> Result<()> {
-        let entries = tree.iter().collect::<std::result::Result<Vec<_>, _>>()?;
-        for (key, value) in entries {
-            if value.len() < 32 {
-                bail!(
-                    "legacy inbox value for key {:?} is shorter than 32 bytes",
-                    key
-                );
-            }
+    /// Переписать обе очереди из формата `from` в v5 и поставить маркер —
+    /// одной транзакцией. Записи читаются и конвертируются до неё: внутри
+    /// транзакции sled не умеет итерировать, а миграция идёт на старте,
+    /// когда в базу больше никто не пишет.
+    fn migrate_queues_to_v5(&self, from: u8, convert: fn(&[u8]) -> Option<Vec<u8>>) -> Result<()> {
+        let started = Instant::now();
+        let inbox = convert_tree_records(&self.inbox, from, convert)?;
+        let device_inbox = convert_tree_records(&self.device_inbox, from, convert)?;
 
-            let sender_id: [u8; 32] = value[..32].try_into().unwrap();
-            let body = &value[32..];
-            let migrated = encode_message_value(migrated_at_secs, &sender_id, None, None, 0, body);
-            tree.insert(key, migrated)?;
-        }
-        Ok(())
-    }
+        let outcome: Result<(), TransactionError> = (&self.inbox, &self.device_inbox, &self.system)
+            .transaction(|(inbox_tx, device_inbox_tx, system_tx)| {
+                for (key, value) in &inbox {
+                    inbox_tx.insert(&key[..], value.as_slice())?;
+                }
+                for (key, value) in &device_inbox {
+                    device_inbox_tx.insert(&key[..], value.as_slice())?;
+                }
+                system_tx.insert(STORAGE_VERSION_KEY, &[STORAGE_VERSION_V5])?;
+                Ok(())
+            });
+        outcome.with_context(|| format!("failed to migrate offline queues from v{from} to v5"))?;
+        self.db.flush()?;
 
-    fn migrate_tree_v2_to_v5(&self, tree: &Tree, migrated_at_secs: u64) -> Result<()> {
-        let entries = tree.iter().collect::<std::result::Result<Vec<_>, _>>()?;
-        for (key, value) in entries {
-            // The record layout is inferred from its length alone.
-            // Long enough for a v5 header: left as is.
-            if value.len() >= MESSAGE_HEADER_LEN_V5 {
-                continue;
-            }
-
-            // Long enough for a v3 header: extend with priority=None, ttl=0.
-            if value.len() >= MESSAGE_HEADER_LEN_V3 {
-                let mut migrated = Vec::with_capacity(value.len() + 1 + 8);
-                migrated.extend_from_slice(&value[..MESSAGE_HEADER_LEN_V3]);
-                migrated.push(MessagePriority::as_storage_byte(None));
-                migrated.extend_from_slice(&0u64.to_be_bytes());
-                migrated.extend_from_slice(&value[MESSAGE_HEADER_LEN_V3..]);
-                tree.insert(key, migrated)?;
-                continue;
-            }
-
-            // Otherwise a v2 record: 32 (sender) + 1 (has_dev) + 2 (dev) + body.
-            if value.len() < 35 {
-                bail!("v2 inbox value for key {:?} is shorter than 35 bytes", key);
-            }
-
-            let sender_id: [u8; 32] = value[..32].try_into().unwrap();
-            let has_sender_device_id = value[32] != 0;
-            let sender_device_raw: [u8; 2] = value[33..35].try_into().unwrap();
-            let sender_device_id =
-                has_sender_device_id.then_some(u16::from_be_bytes(sender_device_raw));
-            let body = &value[35..];
-            let migrated = encode_message_value(
-                migrated_at_secs,
-                &sender_id,
-                sender_device_id,
-                None,
-                0,
-                body,
-            );
-            tree.insert(key, migrated)?;
-        }
-        Ok(())
-    }
-
-    fn migrate_tree_v3_to_v5(&self, tree: &Tree) -> Result<()> {
-        let entries = tree.iter().collect::<std::result::Result<Vec<_>, _>>()?;
-        for (key, value) in entries {
-            if value.len() < MESSAGE_HEADER_LEN_V3 {
-                bail!("v3 inbox value for key {:?} is shorter than v3 header", key);
-            }
-            let mut migrated = Vec::with_capacity(value.len() + 1 + 8);
-            migrated.extend_from_slice(&value[..MESSAGE_HEADER_LEN_V3]);
-            migrated.push(MessagePriority::as_storage_byte(None));
-            migrated.extend_from_slice(&0u64.to_be_bytes());
-            migrated.extend_from_slice(&value[MESSAGE_HEADER_LEN_V3..]);
-            tree.insert(key, migrated)?;
-        }
-        Ok(())
-    }
-
-    /// v4 → v5: вставляем `ttl_seconds = 0` сразу после 44-байтового header.
-    fn migrate_tree_v4_to_v5(&self, tree: &Tree) -> Result<()> {
-        let entries = tree.iter().collect::<std::result::Result<Vec<_>, _>>()?;
-        for (key, value) in entries {
-            if value.len() < MESSAGE_HEADER_LEN {
-                bail!("v4 inbox value for key {:?} is shorter than v4 header", key);
-            }
-            let mut migrated = Vec::with_capacity(value.len() + 8);
-            migrated.extend_from_slice(&value[..MESSAGE_HEADER_LEN]);
-            migrated.extend_from_slice(&0u64.to_be_bytes());
-            migrated.extend_from_slice(&value[MESSAGE_HEADER_LEN..]);
-            tree.insert(key, migrated)?;
-        }
+        info!(
+            from,
+            records = inbox.len() + device_inbox.len(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "offline queues migrated to storage format v5"
+        );
         Ok(())
     }
 
@@ -1068,12 +1039,29 @@ impl Storage {
         prefix_len: usize,
         now_secs: u64,
         apply_retention: bool,
-    ) -> Result<usize> {
+    ) -> Result<TreeCleanup> {
         let mut to_remove = Vec::new();
+        let mut undecodable = 0usize;
 
         for entry in tree.iter() {
             let (key, value) = entry?;
-            let decoded = decode_message_value(&value)?;
+            // Битая запись пропускается, а не обрывает проход: иначе одна
+            // такая запись навсегда выключает чистку всей ноды, и протухшее
+            // копится во всех очередях. Сама запись остаётся на месте:
+            // удалив её, не по чему было бы разобраться, откуда она взялась.
+            let decoded = match decode_message_value(&value) {
+                Ok(decoded) => decoded,
+                Err(err) => {
+                    undecodable += 1;
+                    warn!(
+                        key = %hex::encode(&key),
+                        len = value.len(),
+                        error = %err,
+                        "cleanup skipped an undecodable offline message"
+                    );
+                    continue;
+                }
+            };
             if (apply_retention
                 && self
                     .offline_messages_retention
@@ -1084,11 +1072,14 @@ impl Storage {
             }
         }
 
-        let removed_count = to_remove.len();
+        let removed = to_remove.len();
         for key in to_remove {
             self.remove_and_note(tree, &key, prefix_len)?;
         }
-        Ok(removed_count)
+        Ok(TreeCleanup {
+            removed,
+            undecodable,
+        })
     }
 
     fn remove_message(
@@ -1201,6 +1192,58 @@ fn decode_message_value(value: &[u8]) -> Result<DecodedMessage> {
         ttl_seconds,
         body,
     })
+}
+
+/// Итог чистки одного дерева очередей.
+struct TreeCleanup {
+    removed: usize,
+    /// Записи, которые не удалось разобрать: пропущены и оставлены на месте.
+    undecodable: usize,
+}
+
+/// Все записи дерева, переведённые конвертером в v5. Запись, которую
+/// конвертер не принял, останавливает миграцию целиком: дописывать
+/// заголовок к обрубку значит выдать мусор за сообщение.
+fn convert_tree_records(
+    tree: &Tree,
+    from: u8,
+    convert: fn(&[u8]) -> Option<Vec<u8>>,
+) -> Result<Vec<(IVec, Vec<u8>)>> {
+    let mut converted = Vec::new();
+    for entry in tree.iter() {
+        let (key, value) = entry?;
+        let Some(migrated) = convert(&value) else {
+            bail!(
+                "v{from} offline message {} is shorter than the v{from} header ({} bytes)",
+                hex::encode(&key),
+                value.len()
+            );
+        };
+        converted.push((key, migrated));
+    }
+    Ok(converted)
+}
+
+/// v3 → v5: `priority = None` и `ttl_seconds = 0` сразу после 43-байтового
+/// заголовка.
+fn v3_record_to_v5(value: &[u8]) -> Option<Vec<u8>> {
+    let (header, body) = value.split_at_checked(MESSAGE_HEADER_LEN_V3)?;
+    let mut migrated = Vec::with_capacity(value.len() + 1 + 8);
+    migrated.extend_from_slice(header);
+    migrated.push(MessagePriority::as_storage_byte(None));
+    migrated.extend_from_slice(&0u64.to_be_bytes());
+    migrated.extend_from_slice(body);
+    Some(migrated)
+}
+
+/// v4 → v5: `ttl_seconds = 0` сразу после 44-байтового заголовка.
+fn v4_record_to_v5(value: &[u8]) -> Option<Vec<u8>> {
+    let (header, body) = value.split_at_checked(MESSAGE_HEADER_LEN)?;
+    let mut migrated = Vec::with_capacity(value.len() + 8);
+    migrated.extend_from_slice(header);
+    migrated.extend_from_slice(&0u64.to_be_bytes());
+    migrated.extend_from_slice(body);
+    Some(migrated)
 }
 
 fn unix_timestamp_secs() -> Result<u64> {
@@ -1331,46 +1374,79 @@ mod tests {
         cleanup(&path);
     }
 
-    #[test]
-    fn open_migrates_legacy_v1_account_messages() {
-        let path = temp_path("legacy_migration_v1");
-        let db = sled::open(&path).unwrap();
-        let inbox = db.open_tree("inbox").unwrap();
+    /// Ключ и значения сырых деревьев — для сверки «миграция ничего не
+    /// тронула» байт в байт.
+    fn dump_tree(db: &sled::Db, name: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
+        db.open_tree(name)
+            .unwrap()
+            .iter()
+            .map(|entry| {
+                let (key, value) = entry.unwrap();
+                (key.to_vec(), value.to_vec())
+            })
+            .collect()
+    }
 
-        let mut legacy_value = Vec::new();
-        legacy_value.extend_from_slice(&user(2));
-        legacy_value.extend_from_slice(b"legacy");
-        inbox
-            .insert(
-                {
-                    let mut key = Vec::new();
-                    key.extend_from_slice(&user(1));
-                    key.extend_from_slice(&1u64.to_be_bytes());
-                    key
-                },
-                legacy_value,
-            )
-            .unwrap();
-        db.flush().unwrap();
-        drop(inbox);
-        drop(db);
-
-        let storage = Storage::open(&path, keep_for_days(30), keep_for_days(30)).unwrap();
-        let drained = storage.drain_inbox(&user(1), 10).unwrap();
-
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].sender_id, user(2));
-        assert_eq!(drained[0].sender_device_id, None);
-        assert_eq!(drained[0].body, b"legacy");
-        assert_eq!(drained[0].priority, None);
-
-        drop(storage);
-        cleanup(&path);
+    fn storage_version(db: &sled::Db) -> Option<Vec<u8>> {
+        db.open_tree("system")
+            .unwrap()
+            .get(b"storage_version")
+            .unwrap()
+            .map(|raw| raw.to_vec())
     }
 
     #[test]
-    fn open_migrates_v2_messages_to_v5() {
-        let path = temp_path("migration_v2");
+    fn fresh_database_is_marked_as_current_format() {
+        let path = temp_path("fresh_marker");
+        drop(Storage::open(&path, keep_for_days(30), keep_for_days(30)).unwrap());
+
+        let db = sled::open(&path).unwrap();
+        assert_eq!(storage_version(&db), Some(vec![5u8]));
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    /// База без маркера с непустой очередью — формат v1. Его записи
+    /// неотличимы от прочих по содержимому, поэтому нода отказывается
+    /// стартовать и оставляет данные как были, а не переписывает их наугад.
+    #[test]
+    fn open_refuses_legacy_v1_queues_and_leaves_them_intact() {
+        let path = temp_path("legacy_v1_refused");
+        let db = sled::open(&path).unwrap();
+        let mut legacy_value = Vec::new();
+        legacy_value.extend_from_slice(&user(2));
+        legacy_value.extend_from_slice(b"legacy");
+        db.open_tree("inbox")
+            .unwrap()
+            .insert(build_user_key(&user(1), 1), legacy_value)
+            .unwrap();
+        db.flush().unwrap();
+        let before = dump_tree(&db, "inbox");
+        drop(db);
+
+        let err = Storage::open(&path, keep_for_days(30), keep_for_days(30))
+            .err()
+            .expect("база v1 обязана остановить старт");
+        assert!(
+            err.to_string().contains("v1"),
+            "ошибка обязана назвать формат: {err}"
+        );
+
+        let db = sled::open(&path).unwrap();
+        assert_eq!(dump_tree(&db, "inbox"), before);
+        assert_eq!(storage_version(&db), None);
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    /// v2-запись с телом от восьми байт по длине неотличима от v3, и
+    /// переписывание по такой догадке испортило бы её. Поэтому база v2 —
+    /// отказ старта без единой записи на диск.
+    #[test]
+    fn open_refuses_v2_queues_and_leaves_them_intact() {
+        let path = temp_path("v2_refused");
         let db = sled::open(&path).unwrap();
         db.open_tree("system")
             .unwrap()
@@ -1383,37 +1459,92 @@ mod tests {
                 value.extend_from_slice(&user(2));
                 value.push(1);
                 value.extend_from_slice(&7u16.to_be_bytes());
-                value.extend_from_slice(b"hello");
-                value
-            })
-            .unwrap();
-        db.open_tree("device_inbox")
-            .unwrap()
-            .insert(build_device_key(&user(1), 9, 2), {
-                let mut value = Vec::new();
-                value.extend_from_slice(&user(3));
-                value.push(0);
-                value.extend_from_slice(&0u16.to_be_bytes());
-                value.extend_from_slice(b"world");
+                value.extend_from_slice(b"ciphertext longer than eight bytes");
                 value
             })
             .unwrap();
         db.flush().unwrap();
+        let before = dump_tree(&db, "inbox");
+        drop(db);
+
+        let err = Storage::open(&path, keep_for_days(30), keep_for_days(30))
+            .err()
+            .expect("база v2 обязана остановить старт");
+        assert!(
+            err.to_string().contains("v2"),
+            "ошибка обязана назвать формат: {err}"
+        );
+
+        let db = sled::open(&path).unwrap();
+        assert_eq!(dump_tree(&db, "inbox"), before);
+        assert_eq!(storage_version(&db), Some(vec![2u8]));
+
+        drop(db);
+        cleanup(&path);
+    }
+
+    /// Миграция, прерванная посреди, не оставляет базу наполовину
+    /// переписанной. Прерывание здесь — запись, которую конвертер не
+    /// принимает, во втором дереве. Пиши миграция дерево за деревом, первое
+    /// к этому моменту было бы уже переписано при старом маркере, и
+    /// следующий старт переписал бы его второй раз — тело сообщения
+    /// получило бы лишние восемь нулевых байт.
+    #[test]
+    fn interrupted_migration_leaves_data_in_the_source_format() {
+        let path = temp_path("migration_atomic");
+        let now_secs = unix_timestamp_secs().unwrap();
+        let mut v4_value = Vec::new();
+        v4_value.extend_from_slice(&now_secs.to_be_bytes());
+        v4_value.extend_from_slice(&user(2));
+        v4_value.push(1);
+        v4_value.extend_from_slice(&5u16.to_be_bytes());
+        v4_value.push(MessagePriority::as_storage_byte(Some(
+            MessagePriority::High,
+        )));
+        v4_value.extend_from_slice(b"v4 body longer than eight bytes");
+
+        let db = sled::open(&path).unwrap();
+        db.open_tree("system")
+            .unwrap()
+            .insert(b"storage_version", &[4u8])
+            .unwrap();
+        db.open_tree("inbox")
+            .unwrap()
+            .insert(build_user_key(&user(1), 1), v4_value.clone())
+            .unwrap();
+        // Обрубок короче заголовка v4: на нём миграция останавливается.
+        db.open_tree("device_inbox")
+            .unwrap()
+            .insert(build_device_key(&user(1), 9, 2), vec![0u8; 10])
+            .unwrap();
+        db.flush().unwrap();
+        drop(db);
+
+        assert!(Storage::open(&path, keep_for_days(30), keep_for_days(30)).is_err());
+
+        let db = sled::open(&path).unwrap();
+        assert_eq!(
+            dump_tree(&db, "inbox"),
+            vec![(build_user_key(&user(1), 1), v4_value)],
+            "первое дерево обязано остаться в исходном формате"
+        );
+        assert_eq!(storage_version(&db), Some(vec![4u8]));
+        // Оператор убирает обрубок — повторный старт мигрирует ровно один раз.
+        db.open_tree("device_inbox").unwrap().clear().unwrap();
+        db.flush().unwrap();
         drop(db);
 
         let storage = Storage::open(&path, keep_for_days(30), keep_for_days(30)).unwrap();
+        let drained = storage.drain_inbox(&user(1), 10).unwrap();
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].body, b"v4 body longer than eight bytes");
+        assert_eq!(drained[0].priority, Some(MessagePriority::High));
+        drop(storage);
 
-        let account = storage.drain_inbox(&user(1), 10).unwrap();
-        let device = storage.drain_device_inbox(&user(1), 9, 10).unwrap();
-
-        assert_eq!(account.len(), 1);
-        assert_eq!(account[0].sender_device_id, Some(7));
-        assert_eq!(account[0].body, b"hello");
-        assert_eq!(account[0].priority, None);
-        assert_eq!(device.len(), 1);
-        assert_eq!(device[0].sender_device_id, None);
-        assert_eq!(device[0].body, b"world");
-        assert_eq!(device[0].priority, None);
+        // И повторное открытие уже мигрированной базы ничего не меняет.
+        let storage = Storage::open(&path, keep_for_days(30), keep_for_days(30)).unwrap();
+        let drained = storage.drain_inbox(&user(1), 10).unwrap();
+        assert_eq!(drained[0].body, b"v4 body longer than eight bytes");
 
         drop(storage);
         cleanup(&path);
@@ -1589,6 +1720,60 @@ mod tests {
         assert_eq!(storage.cleanup_expired_messages().unwrap(), 1);
         assert_eq!(storage.inbox.len(), 0);
         assert_eq!(storage.device_inbox.len(), 1);
+
+        drop(storage);
+        cleanup(&path);
+    }
+
+    /// Битая запись не выключает фоновую чистку: протухшие записи до и
+    /// после неё и в соседнем дереве удаляются, а сама она остаётся на
+    /// месте для разбора. Иначе одна такая запись навсегда оставляла бы
+    /// протухшее во всех очередях ноды.
+    #[test]
+    fn cleanup_skips_undecodable_record_and_removes_expired_around_it() {
+        let path = temp_path("cleanup_corrupt");
+        let storage = Storage::open(&path, keep_for_days(30), keep_for_days(30)).unwrap();
+        let now = unix_timestamp_secs().unwrap();
+        let stale = encode_message_value(now - 7_200, &user(2), None, None, 60, b"stale");
+        let fresh = encode_message_value(now, &user(2), None, None, 3_600, b"fresh");
+        // Запись короче заголовка: разобрать её нечем.
+        let broken = vec![0u8; 4];
+
+        let account = [
+            (1u64, stale.clone()),
+            (2, broken.clone()),
+            (3, stale.clone()),
+            (4, fresh.clone()),
+        ];
+        for (id, value) in account {
+            storage
+                .inbox
+                .insert(build_user_key(&user(1), id), value)
+                .unwrap();
+        }
+        // Битая запись в начале дерева: проход не должен на ней кончиться.
+        let device = [(5u64, broken.clone()), (6, stale.clone())];
+        for (id, value) in device {
+            storage
+                .device_inbox
+                .insert(build_device_key(&user(1), 9, id), value)
+                .unwrap();
+        }
+
+        assert_eq!(storage.cleanup_expired_messages().unwrap(), 3);
+
+        let left: Vec<Vec<u8>> = storage
+            .inbox
+            .iter()
+            .map(|entry| entry.unwrap().1.to_vec())
+            .collect();
+        assert_eq!(left, vec![broken.clone(), fresh]);
+        let left_device: Vec<Vec<u8>> = storage
+            .device_inbox
+            .iter()
+            .map(|entry| entry.unwrap().1.to_vec())
+            .collect();
+        assert_eq!(left_device, vec![broken]);
 
         drop(storage);
         cleanup(&path);

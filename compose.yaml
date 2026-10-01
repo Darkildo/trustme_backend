@@ -1,7 +1,15 @@
 services:
   nats:
-    image: nats:2.10-alpine
+    # Та же версия, что в CI и на проде (deploy/nats/Dockerfile): локальный
+    # стек не должен вести себя иначе, чем брокер, на котором проверяется
+    # и работает доставка.
+    image: nats:2.12.6-alpine
     command:
+      # Конфиг прода ради max_payload: дефолтный 1 MiB уже потолка кадра
+      # ноды, и крупный кадр локально рвал бы соединение с брокером —
+      # поломка, которой на проде нет. Разбор значения — в самом nats.conf.
+      - "-c"
+      - "/etc/nats/nats.conf"
       - "--jetstream"
       - "--store_dir=/data"
       - "--http_port=8222"
@@ -9,6 +17,7 @@ services:
       - "127.0.0.1:8222:8222"
     volumes:
       - nats-data:/data
+      - ./deploy/nats/nats.conf:/etc/nats/nats.conf:ro
 
   message-service:
     build:
@@ -31,7 +40,9 @@ services:
       NATS_PUBLISH_TIMEOUT_MS: 2000
     ports:
       - "5000:5000"
-      - "9000:9000"
+      # Метрики — только с этой машины: аутентификации у экспортера нет, а
+      # отдаёт он нагрузку и внутреннее состояние ноды.
+      - "127.0.0.1:9000:9000"
     volumes:
       - message-data:/srv/trust-message/data
 

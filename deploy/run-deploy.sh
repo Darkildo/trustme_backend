@@ -83,12 +83,23 @@ if [[ "$SKIP_AUTH_REBUILD" -eq 0 ]]; then
 fi
 
 log "1/6 Syncing message source -> $DEPLOY_DIR/tcp_message_server"
+# Из рабочей копии уезжает только то, что нужно сборке. Локальные данные
+# ноды, ключи и креды (см. .gitignore) на сервер не копируются: в дереве
+# деплоя их никто не ждёт, а лишняя копия секрета — лишнее место утечки.
+# Под `--delete` исключённое на сервере не удаляется.
 rsync -av --delete \
   --exclude='.git/' \
   --exclude='target/' \
   --exclude='.env' \
   --exclude='.env.*' \
   --exclude='secret/' \
+  --exclude='/secrets/' \
+  --exclude='/data/' \
+  --exclude='*.p8' \
+  --exclude='*firebase-adminsdk*.json' \
+  --exclude='node_identity_key' \
+  --exclude='.claude/' \
+  --exclude='coverage.json' \
   --exclude='deploy/message-runtime/trust_message_tcp' \
   -e "ssh -p $SSH_PORT" \
   "$MESSAGE_REPO_LOCAL/" "$SSH_HOST:$DEPLOY_DIR/tcp_message_server/"
@@ -124,9 +135,14 @@ rsync -av -e "ssh -p $SSH_PORT" \
 
 # Канал доставки алертов. Пусто — приёмник остаётся пустым, и алерты видны
 # только в UI. Это состояние объявляется вслух, а не прячется в конфиге.
-ssh_run "$(cat <<'REMOTE'
+#
+# Тело скрипта — heredoc в кавычках (в нём свой python и свои `$`), поэтому
+# DEPLOY_DIR приезжает отдельной строкой-присваиванием перед ним, в
+# экранированном для шелла виде.
+ssh_run "$(printf 'DEPLOY_DIR=%q' "$DEPLOY_DIR")
+$(cat <<'REMOTE'
 set -euo pipefail
-cd /root/trust/Trust_me_deploy
+cd "$DEPLOY_DIR"
 url=$(grep -E '^ALERT_WEBHOOK_URL=' .env 2>/dev/null | cut -d= -f2- || true)
 if [ -n "${url:-}" ]; then
   python3 - "$url" <<'PY'
@@ -235,7 +251,9 @@ REMOTE
 # не «есть ли хоть какие-то правила» (они были и до этого), а совпадает ли
 # их число с тем, что лежит в репозитории: расхождение означает, что
 # перезагрузка не сработала и в памяти осталась прежняя конфигурация.
-expected_rules=$(grep -c '^      - alert:' "$MESSAGE_REPO_LOCAL/deploy/prometheus-alerts.yml")
+# `grep -c` при нуле совпадений печатает 0, но выходит с кодом 1, и
+# `set -e` оборвал бы деплой на шаге проверки, когда всё уже выкачено.
+expected_rules=$(grep -c '^      - alert:' "$MESSAGE_REPO_LOCAL/deploy/prometheus-alerts.yml" || true)
 ssh_run "$(cat <<REMOTE
 sleep 5
 loaded=\$(docker exec prometheus wget -qO- http://127.0.0.1:9090/api/v1/rules 2>/dev/null \
