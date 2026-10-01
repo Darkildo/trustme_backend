@@ -916,7 +916,10 @@ fn resolve_push(raw: PushRawConfig) -> anyhow::Result<PushConfig> {
     // наверняка незавершённая миграция, и молча выбрать за оператора один
     // из режимов хуже, чем упасть: «половина пушей идёт мимо шлюза» иначе
     // ничем не диагностируется.
-    if enabled && gateway_url.is_some() {
+    if enabled && let Some(url) = gateway_url.as_deref() {
+        // Схема проверяется при разборе конфига, а не при сборке клиента:
+        // нода с http-шлюзом в сети не должна стартовать вовсе.
+        crate::push::gateway::parse_gateway_url(url)?;
         if !fcm_project_id.is_empty() || !fcm_service_account_path.is_empty() {
             bail!(
                 "PUSH_GATEWAY_URL is set, so FCM credentials must not be: unset FCM_PROJECT_ID and FCM_SERVICE_ACCOUNT_PATH"
@@ -1268,6 +1271,20 @@ mod tests {
         raw.apns_enabled = Some(true);
         let err = resolve_push(raw).unwrap_err().to_string();
         assert!(err.contains("APNS_ENABLED"), "unexpected error: {err}");
+    }
+
+    /// Шлюз по http в сети отвергается уже при разборе конфига: по нему
+    /// открытым текстом уезжали бы push-токены устройств.
+    #[test]
+    fn plaintext_gateway_outside_loopback_is_rejected() {
+        let mut raw = push_raw(true);
+        raw.gateway_url = Some("http://push.example.org".into());
+        let err = resolve_push(raw).unwrap_err().to_string();
+        assert!(err.contains("must use https"), "unexpected error: {err}");
+
+        let mut raw = push_raw(true);
+        raw.gateway_url = Some("http://127.0.0.1:50051".into());
+        assert!(resolve_push(raw).is_ok());
     }
 
     /// Выключенные пуши не обязаны иметь ни кредов, ни шлюза — dev и CI
