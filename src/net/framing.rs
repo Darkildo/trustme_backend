@@ -57,6 +57,7 @@ pub fn encode_signed_server_config(
         deleted_messages_retention: Some(retention_config(config.deleted_messages_retention)),
         supports_delivery_ack: config.supports_delivery_ack,
         supports_queue_addressing: config.supports_queue_addressing,
+        device_cert_max_ttl_secs: config.device_cert_max_ttl.as_secs(),
         // Статик ноды попадает под подпись: клиент сверяет его с тем,
         // которым прошёл хендшейк, и снапшот нельзя пересадить на другую
         // ноду.
@@ -278,6 +279,7 @@ mod tests {
             offline_messages_retention: RetentionPolicy::KeepFor(Duration::from_secs(3600)),
             supports_delivery_ack: true,
             supports_queue_addressing: false,
+            device_cert_max_ttl: Duration::from_secs(30 * 24 * 3600),
             config_ttl: Duration::from_secs(3600),
             advertised_address: Some("node.example:5000".to_string()),
         }

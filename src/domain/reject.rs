@@ -24,6 +24,8 @@ pub enum SendRejectReason {
     InvalidTtl,
     /// Ноде плохо: диск, брокер, внутренняя ошибка.
     Internal,
+    /// Сессия открыта сертификатом устройства без права на отправку.
+    Forbidden,
 }
 
 impl SendRejectReason {
@@ -36,6 +38,7 @@ impl SendRejectReason {
             Self::RateLimited => WireSendRejectReason::RateLimited,
             Self::InvalidTtl => WireSendRejectReason::InvalidTtl,
             Self::Internal => WireSendRejectReason::Internal,
+            Self::Forbidden => WireSendRejectReason::Forbidden,
         };
         wire as i32
     }
@@ -50,6 +53,7 @@ impl SendRejectReason {
             Ok(WireSendRejectReason::RateLimited) => Self::RateLimited,
             Ok(WireSendRejectReason::InvalidTtl) => Self::InvalidTtl,
             Ok(WireSendRejectReason::Internal) => Self::Internal,
+            Ok(WireSendRejectReason::Forbidden) => Self::Forbidden,
             Ok(WireSendRejectReason::Unspecified) | Err(_) => Self::Unspecified,
         }
     }
@@ -64,6 +68,7 @@ impl SendRejectReason {
             Self::RateLimited => "rate_limited",
             Self::InvalidTtl => "invalid_ttl",
             Self::Internal => "internal",
+            Self::Forbidden => "forbidden",
         }
     }
 }
@@ -83,6 +88,7 @@ mod tests {
             SendRejectReason::RateLimited,
             SendRejectReason::InvalidTtl,
             SendRejectReason::Internal,
+            SendRejectReason::Forbidden,
         ] {
             assert_eq!(SendRejectReason::from_wire(domain.to_wire()), domain);
         }
@@ -108,6 +114,7 @@ mod tests {
             "invalid_ttl"
         );
         assert_eq!(SendRejectReason::Internal.as_metric_label(), "internal");
+        assert_eq!(SendRejectReason::Forbidden.as_metric_label(), "forbidden");
     }
 
     #[test]

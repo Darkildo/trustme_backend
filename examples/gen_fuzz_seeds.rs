@@ -142,6 +142,7 @@ fn main() -> Result<()> {
     let node = NodeIdentity::from_seed([7u8; 32], NodeKeySource::Configured);
     let snapshot = ServerConfigSnapshot {
         supports_queue_addressing: false,
+        device_cert_max_ttl: std::time::Duration::from_secs(30 * 24 * 3600),
         max_frame_len: 8 * 1024 * 1024,
         supports_device_addressing: true,
         deleted_messages_retention: RetentionPolicy::Disabled,
@@ -185,6 +186,43 @@ fn main() -> Result<()> {
             &wire::NoiseClientHello {
                 identity_key: client.verifying_key().to_bytes().to_vec(),
                 device_id,
+                device_cert: None,
+            }
+            .encode_to_vec(),
+        )?;
+    }
+    // Делегированный вход: настоящий сертификат, чтобы фаззер стартовал с
+    // формы, которая проходит разбор, а не только с мусора.
+    {
+        use ed25519_dalek::Signer;
+        use trust_message_tcp::net::device_cert::signed_bytes;
+        let identity_key = client.verifying_key().to_bytes();
+        let (transport_key, signing_key) = ([21u8; 32], [22u8; 32]);
+        let (scope, not_before, not_after) = (1u32, 1_700_000_000u64, 1_701_209_600u64);
+        let message = signed_bytes(
+            &identity_key,
+            7,
+            &transport_key,
+            &signing_key,
+            scope,
+            not_before,
+            not_after,
+        );
+        write(
+            &root.join("client_hello"),
+            "with_device_cert.bin",
+            &wire::NoiseClientHello {
+                identity_key: identity_key.to_vec(),
+                device_id: Some(7),
+                device_cert: Some(wire::DeviceCertificate {
+                    transport_key: transport_key.to_vec(),
+                    signing_key: signing_key.to_vec(),
+                    scope,
+                    not_before,
+                    not_after,
+                    signature: client.sign(&message).to_bytes().to_vec(),
+                    device_id: 7,
+                }),
             }
             .encode_to_vec(),
         )?;

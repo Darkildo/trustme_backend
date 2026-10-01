@@ -13,6 +13,9 @@
 //! - One worker task with per-key coalescing timers and one in-flight send at
 //!   a time: a slow transport delays every recipient, not just one.
 //! - The decision logic is pure (`state::decide`) and unit-tested.
+//! - The incoming-call marker (`WakeHint::IncomingCall`) survives the decision
+//!   machine via `Worker::call_hints` and reaches the transport in
+//!   `PushPayload::wake_hint`; see `CALL_HINT_TTL_SECS`.
 
 pub mod apns;
 pub mod fcm;
@@ -70,6 +73,16 @@ impl PushStatePersistence for NoopStatePersistence {
 }
 
 type RecipientKey = (UserId, DeviceId);
+
+/// Сколько живёт «ожидающий call-hint» — промежуток между решением разбудить
+/// под звонок и фактической отправкой wake-пуша (отправку может отложить
+/// активный backoff, вплоть до TimerTick'а).
+///
+/// Минута: dial-таймаут звонящего — 45 с, так что hint, переживший это окно,
+/// относится к уже отменённому звонку. Прилипнув к следующему, ни разу не
+/// звонковому wake'у, он заставил бы получателя показать ринг на обычное
+/// сообщение — хуже, чем не показать ринг вовсе.
+const CALL_HINT_TTL_SECS: u64 = 60;
 
 /// Handle held by the rest of the server. Cheap to clone (just an `Arc` inside).
 #[derive(Clone)]
@@ -185,6 +198,7 @@ impl PushScheduler {
             states,
             timers: DashMap::new(),
             last_ring: DashMap::new(),
+            call_hints: DashMap::new(),
         };
 
         tokio::spawn(worker.run());
@@ -265,6 +279,13 @@ struct Worker<T: PushTransport, S: TokenStore, V: VoipRingTransport> {
     states: DashMap<RecipientKey, PushState>,
     timers: DashMap<RecipientKey, JoinHandle<()>>,
     last_ring: DashMap<RecipientKey, u64>,
+    /// Устройства, чей ближайший FCM-wake будит получателя под звонок, и
+    /// момент (unix-секунды) выставления признака. Заводится, когда
+    /// voip-ring не состоялся и звонковый конверт ушёл в decision-машину:
+    /// та оперирует одним приоритетом и «это звонок» до транспорта не несёт.
+    /// Снимается первой же отправкой; протухшее по [`CALL_HINT_TTL_SECS`]
+    /// отбрасывается.
+    call_hints: DashMap<RecipientKey, u64>,
 }
 
 impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
@@ -288,8 +309,15 @@ impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
                 // Неудача ring'а (нет voip-слота / invalid token / сеть)
                 // проваливается в обычный FCM-wake ниже — Android и
                 // legacy-iOS пути не меняются.
-                if wake_hint == Some(WakeHint::IncomingCall) && self.try_dispatch_ring(key).await {
-                    return;
+                if wake_hint == Some(WakeHint::IncomingCall) {
+                    if self.try_dispatch_ring(key).await {
+                        return;
+                    }
+                    // FCM-путь звонок не различает: decision-машина видит
+                    // только приоритет. Без маркера на конверте получатель
+                    // покажет баннер «новые сообщения» вместо ринга, поэтому
+                    // «это звонок» едет рядом с решением — до отправки.
+                    self.remember_call_hint(key);
                 }
                 (key, DecisionInput::NewMessage(priority))
             }
@@ -342,6 +370,10 @@ impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
         max_priority: Option<MessagePriority>,
         now: u64,
     ) {
+        // Снимается до резолва токена: устройство без токена не должно
+        // оставлять «звонковый» маркер следующему, уже обычному сообщению.
+        let call_hint_at = self.take_call_hint(key, now);
+
         let Some(token) = self.tokens.resolve(&key.0, key.1) else {
             // No push token for this device — record and move on. The state
             // has already been advanced by `decide` (counters reset), so an
@@ -359,6 +391,7 @@ impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
             max_priority,
             server_ts_secs: now,
             kind: PushKind::Wake,
+            wake_hint: call_hint_at.map(|_| WakeHint::IncomingCall),
         };
 
         let started = std::time::Instant::now();
@@ -382,14 +415,53 @@ impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
             }
             SendOutcome::Backoff(reason) => {
                 observability::observe_push_sent(priority_label(max_priority), "backoff");
+                self.restore_call_hint(key, call_hint_at);
                 self.rollback_and_suppress(key, pending, max_priority, now);
                 debug!(?key, ?reason, "push backoff");
             }
             SendOutcome::TransientError => {
                 observability::observe_push_sent(priority_label(max_priority), "transient_error");
+                self.restore_call_hint(key, call_hint_at);
                 self.rollback_and_suppress(key, pending, max_priority, now);
             }
         }
+    }
+
+    /// Пометить `key`: ближайший wake этому устройству будит его под звонок.
+    ///
+    /// Попутно подметает протухшее. Подметание нужно потому, что hint
+    /// ставится и тогда, когда `decide` решит не будить вовсе (конверт без
+    /// приоритета на ноде с `wake_on_unspecified = false`): такой записи
+    /// иначе некому истечь, и карта росла бы на каждый несостоявшийся вызов.
+    fn remember_call_hint(&self, key: RecipientKey) {
+        let now = now_secs();
+        self.call_hints
+            .retain(|_, at| now.saturating_sub(*at) <= CALL_HINT_TTL_SECS);
+        self.call_hints.insert(key, now);
+    }
+
+    /// Снять hint устройства. Возвращает момент выставления, если он ещё
+    /// свежий; протухший так же снимается, но отбрасывается — «прицепить
+    /// позже» для звонка означает «прицепить не к тому».
+    fn take_call_hint(&self, key: RecipientKey, now: u64) -> Option<u64> {
+        let (_, at) = self.call_hints.remove(&key)?;
+        (now.saturating_sub(at) <= CALL_HINT_TTL_SECS).then_some(at)
+    }
+
+    /// Вернуть hint на место: wake не доехал (backoff / сетевая ошибка), и
+    /// ретрай на TimerTick'е обязан унести звонковый маркер с собой — ровно
+    /// как `rollback_and_suppress` возвращает накопленные счётчики.
+    ///
+    /// Момент выставления сохраняется исходный: TTL отсчитывается от звонка,
+    /// а не от неудачной попытки, иначе цепочка ретраев продлевала бы жизнь
+    /// маркера бесконечно.
+    fn restore_call_hint(&self, key: RecipientKey, at: Option<u64>) {
+        let Some(at) = at else {
+            return;
+        };
+        // `or_insert`, а не `insert`: если за время отправки приехал новый
+        // звонок, его отметка свежее и затирать её нечем.
+        self.call_hints.entry(key).or_insert(at);
     }
 
     /// Voip-ring (APNs PushKit напрямую или через шлюз) для звонкового
@@ -470,6 +542,8 @@ impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
             max_priority: None,
             server_ts_secs: now_secs(),
             kind: PushKind::Welcome,
+            // Приветствие звонком не бывает by construction.
+            wake_hint: None,
         };
 
         let started = std::time::Instant::now();
@@ -657,6 +731,10 @@ mod integration_tests {
         assert_eq!(sent[0].pending, 1);
         assert_eq!(sent[0].max_priority, Some(MessagePriority::High));
         assert_eq!(sent[0].token, "test-token");
+        assert!(
+            sent[0].wake_hint.is_none(),
+            "обычное сообщение не должно выглядеть звонком"
+        );
     }
 
     #[tokio::test]
@@ -1014,5 +1092,184 @@ mod integration_tests {
         wait_for(|| !transport.sent_payloads().is_empty()).await;
         assert!(ring.sent_rings().is_empty());
         assert_eq!(transport.sent_payloads().len(), 1);
+    }
+
+    /// Android-путь звонка: voip-слота у устройства нет, ring не состоялся,
+    /// и разбудить получателя может только FCM-wake — но помеченный. Без
+    /// маркера клиент покажет баннер «новые сообщения» вместо ринга.
+    #[tokio::test]
+    async fn call_wake_without_voip_token_carries_the_hint() {
+        let transport = Arc::new(MockTransport::always_ok());
+        let ring = Arc::new(MockRingTransport::always_ok());
+        let tokens = Arc::new(InMemoryTokenStore::default());
+        tokens.insert(user(21), 4, "fcm-token");
+
+        let scheduler = start_with_ring(transport.clone(), tokens, ring.clone());
+        scheduler.on_undelivered(
+            user(21),
+            4,
+            Some(MessagePriority::High),
+            Some(WakeHint::IncomingCall),
+        );
+
+        wait_for(|| !transport.sent_payloads().is_empty()).await;
+        let sent = transport.sent_payloads();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].wake_hint, Some(WakeHint::IncomingCall));
+        assert!(ring.sent_rings().is_empty());
+    }
+
+    /// Тот же путь, но конверт обычный: маркер не должен появляться сам по
+    /// себе — ни от High-приоритета, ни от наличия voip-токена.
+    #[tokio::test]
+    async fn ordinary_wake_carries_no_hint_even_at_high_priority() {
+        let transport = Arc::new(MockTransport::always_ok());
+        let ring = Arc::new(MockRingTransport::always_ok());
+        let tokens = Arc::new(InMemoryTokenStore::default());
+        tokens.insert(user(22), 1, "fcm-token");
+
+        let scheduler = start_with_ring(transport.clone(), tokens, ring.clone());
+        scheduler.on_undelivered(user(22), 1, Some(MessagePriority::High), None);
+
+        wait_for(|| !transport.sent_payloads().is_empty()).await;
+        assert_eq!(transport.sent_payloads()[0].wake_hint, None);
+    }
+
+    /// Worker напрямую, без `spawn`: TTL звонкового hint'а меряется
+    /// системными часами, подменить которые в этом модуле нечем, — зато
+    /// тест может выставить отметку времени задним числом сам.
+    fn bare_worker(
+        transport: Arc<MockTransport>,
+        tokens: Arc<InMemoryTokenStore>,
+    ) -> Worker<MockTransport, InMemoryTokenStore, NoVoipRingTransport> {
+        let cfg = fast_cfg();
+        let (tx, rx) = mpsc::channel(8);
+        Worker {
+            rx,
+            tx,
+            transport,
+            tokens,
+            voip: None,
+            persistence: Arc::new(NoopStatePersistence),
+            decision_cfg: cfg.decision_config(),
+            ring_cooldown: cfg.ring_cooldown,
+            states: DashMap::new(),
+            timers: DashMap::new(),
+            last_ring: DashMap::new(),
+            call_hints: DashMap::new(),
+        }
+    }
+
+    /// Hint старше TTL относится к звонку, который у звонящего давно
+    /// оборвался по dial-таймауту. Прицепить его к подвернувшемуся wake'у —
+    /// это ринг на постороннее сообщение, поэтому он снимается и гибнет.
+    #[tokio::test]
+    async fn stale_call_hint_is_dropped_rather_than_attached() {
+        let transport = Arc::new(MockTransport::always_ok());
+        let tokens = Arc::new(InMemoryTokenStore::default());
+        tokens.insert(user(23), 3, "tok");
+        let worker = bare_worker(transport.clone(), tokens);
+
+        let now = now_secs();
+        let key = (user(23), 3);
+        worker
+            .call_hints
+            .insert(key, now.saturating_sub(CALL_HINT_TTL_SECS + 1));
+
+        worker
+            .dispatch_send(key, 1, Some(MessagePriority::High), now)
+            .await;
+
+        let sent = transport.sent_payloads();
+        assert_eq!(sent.len(), 1);
+        assert!(sent[0].wake_hint.is_none());
+        assert!(
+            worker.call_hints.is_empty(),
+            "протухший hint снимается, а не ждёт следующего wake'а"
+        );
+    }
+
+    /// Свежий hint доезжает с отправкой ровно один раз: следующее сообщение
+    /// тому же устройству звонком уже не притворяется.
+    #[tokio::test]
+    async fn fresh_call_hint_attaches_exactly_once() {
+        let transport = Arc::new(MockTransport::always_ok());
+        let tokens = Arc::new(InMemoryTokenStore::default());
+        tokens.insert(user(24), 8, "tok");
+        let worker = bare_worker(transport.clone(), tokens);
+
+        let now = now_secs();
+        let key = (user(24), 8);
+        worker
+            .call_hints
+            .insert(key, now.saturating_sub(CALL_HINT_TTL_SECS - 1));
+
+        worker
+            .dispatch_send(key, 1, Some(MessagePriority::High), now)
+            .await;
+        worker
+            .dispatch_send(key, 1, Some(MessagePriority::Medium), now)
+            .await;
+
+        let sent = transport.sent_payloads();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].wake_hint, Some(WakeHint::IncomingCall));
+        assert_eq!(sent[1].wake_hint, None, "hint одноразовый");
+    }
+
+    /// Неудачная отправка возвращает hint на место — ровно как
+    /// `rollback_and_suppress` возвращает накопленные счётчики. Иначе
+    /// звонок, попавший в backoff-окно, доезжал бы ретраем уже «обычным».
+    #[tokio::test]
+    async fn failed_send_keeps_the_call_hint_for_the_retry() {
+        let transport = Arc::new(MockTransport::scripted([
+            SendOutcome::Backoff(BackoffReason::Quota),
+            SendOutcome::Ok,
+        ]));
+        let tokens = Arc::new(InMemoryTokenStore::default());
+        tokens.insert(user(25), 2, "tok");
+        let worker = bare_worker(transport.clone(), tokens);
+
+        let now = now_secs();
+        let key = (user(25), 2);
+        worker.call_hints.insert(key, now);
+
+        // Первая попытка упирается в квоту FCM.
+        worker
+            .dispatch_send(key, 1, Some(MessagePriority::High), now)
+            .await;
+        // Ретрай: в работе его приносит TimerTick по истечении backoff'а.
+        worker
+            .dispatch_send(key, 1, Some(MessagePriority::High), now)
+            .await;
+
+        let sent = transport.sent_payloads();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].wake_hint, Some(WakeHint::IncomingCall));
+        assert_eq!(
+            sent[1].wake_hint,
+            Some(WakeHint::IncomingCall),
+            "ретрай обязан унести звонковый маркер с собой"
+        );
+    }
+
+    /// Устройство без FCM-токена: пуша нет, но и hint не остаётся висеть —
+    /// иначе он прилипнет к первому же сообщению после перерегистрации.
+    #[tokio::test]
+    async fn dispatch_without_token_still_consumes_the_hint() {
+        let transport = Arc::new(MockTransport::always_ok());
+        let tokens = Arc::new(InMemoryTokenStore::default());
+        let worker = bare_worker(transport.clone(), tokens);
+
+        let now = now_secs();
+        let key = (user(26), 5);
+        worker.call_hints.insert(key, now);
+
+        worker
+            .dispatch_send(key, 1, Some(MessagePriority::High), now)
+            .await;
+
+        assert!(transport.sent_payloads().is_empty());
+        assert!(worker.call_hints.is_empty());
     }
 }

@@ -51,7 +51,9 @@ use tokio::time::timeout;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{debug, info, warn};
 
+use crate::net::device_cert::{self, SessionScope};
 use crate::net::framing::PROTO_VERSION;
+use crate::net::rate_limit::unix_now_secs;
 use crate::observability;
 use crate::state::registry::{DeviceId, UserId};
 use crate::wire::NoiseClientHello;
@@ -128,6 +130,9 @@ pub struct HandshakePolicy {
     /// возможен ценой того, что новый клиент не может подключиться, не
     /// получив ключ вне полосы.
     pub allow_tofu: bool,
+    /// Потолок срока жизни сертификата устройства в секундах. Ноль —
+    /// делегированный вход выключен, хендшейк с сертификатом отвергается.
+    pub device_cert_max_ttl_secs: u64,
 }
 
 /// Потолок одного Noise-сообщения, зафиксированный спецификацией.
@@ -359,6 +364,13 @@ pub struct NoiseSessionIdentity {
     /// доля XX — это доля подключений, доверие в которых установлено на
     /// первом контакте, а не проверено пином.
     pub pattern: NoisePattern,
+    /// Права сессии. `FULL` — вход ключом аккаунта; иначе — биты
+    /// сертификата устройства.
+    pub scope: SessionScope,
+    /// Когда истекает сертификат, которым открыта сессия (unix-секунды).
+    /// Сессия не должна пережить своё основание: отзыва у сертификатов
+    /// нет, и срок — единственное, что ограничивает украденный.
+    pub cert_not_after: Option<u64>,
 }
 
 /// Кадровый транспорт поверх установленной Noise-сессии: «прочитать кадр /
@@ -566,7 +578,14 @@ where
             }
         };
 
-        let identity = verify_client_identity(&handshake, hello, protocol_version, pattern)?;
+        let identity = verify_client_identity(
+            &handshake,
+            hello,
+            protocol_version,
+            pattern,
+            unix_now_secs(),
+            policy.device_cert_max_ttl_secs,
+        )?;
         let transport = handshake
             .into_transport_mode()
             .map_err(|err| anyhow::anyhow!("noise handshake did not complete: {err}"))?;
@@ -576,6 +595,7 @@ where
             device_id = ?identity.device_id,
             protocol_version,
             pattern = pattern.as_metric_label(),
+            delegated = identity.scope.is_delegated(),
             "noise handshake completed"
         );
 
@@ -595,6 +615,46 @@ where
         let transport = timeout(
             handshake_timeout,
             Self::connect_inner(&mut stream, node_public, identity, device_id),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("noise handshake timed out"))??;
+
+        Ok(Self {
+            inner: framed_codec(stream),
+            transport,
+            assembler: FrameAssembler::new(max_frame_len),
+            scratch: vec![0u8; NOISE_MAX_MESSAGE_LEN],
+        })
+    }
+
+    /// Делегированный вход: статик — ключ устройства, право говорить от
+    /// имени `identity_key` доказывает сертификат. Секрет ключа аккаунта
+    /// здесь не нужен.
+    ///
+    /// Инициатор использует только IK: сертификат выписывается устройству,
+    /// которое ноду уже знает, а первый контакт (XX) — дело
+    /// разблокированного клиента. Респондер сертификат в XX не запрещает.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_delegated(
+        mut stream: S,
+        node_public: &[u8; 32],
+        device_static_secret: &[u8; 32],
+        identity_key: &[u8; 32],
+        device_id: DeviceId,
+        device_cert: crate::wire::DeviceCertificate,
+        handshake_timeout: Duration,
+        max_frame_len: usize,
+    ) -> Result<Self> {
+        let transport = timeout(
+            handshake_timeout,
+            Self::connect_ik(
+                &mut stream,
+                node_public,
+                device_static_secret,
+                identity_key,
+                Some(device_id),
+                Some(device_cert),
+            ),
         )
         .await
         .map_err(|_| anyhow::anyhow!("noise handshake timed out"))??;
@@ -651,20 +711,41 @@ where
         identity: &SigningKey,
         device_id: Option<DeviceId>,
     ) -> Result<TransportState> {
+        Self::connect_ik(
+            stream,
+            node_public,
+            &identity.to_scalar_bytes(),
+            &identity.verifying_key().to_bytes(),
+            device_id,
+            None,
+        )
+        .await
+    }
+
+    /// IK-хендшейк с явным статиком: либо выведенным из ключа аккаунта
+    /// (`device_cert = None`), либо ключом устройства с сертификатом.
+    async fn connect_ik(
+        stream: &mut S,
+        node_public: &[u8; 32],
+        static_secret: &[u8; 32],
+        identity_key: &[u8; 32],
+        device_id: Option<DeviceId>,
+        device_cert: Option<crate::wire::DeviceCertificate>,
+    ) -> Result<TransportState> {
         write_client_prologue(stream, NoisePattern::Ik).await?;
 
         let prologue = build_prologue(PROTO_VERSION, NoisePattern::Ik);
         let mut handshake = Builder::new(NOISE_PARAMS_IK.parse()?)
             .prologue(&prologue)
             .map_err(|err| anyhow::anyhow!("failed to set noise prologue: {err}"))?
-            .local_private_key(&identity.to_scalar_bytes())
+            .local_private_key(static_secret)
             .map_err(|err| anyhow::anyhow!("failed to load client static key: {err}"))?
             .remote_public_key(node_public)
             .map_err(|err| anyhow::anyhow!("failed to load node public key: {err}"))?
             .build_initiator()
             .map_err(|err| anyhow::anyhow!("failed to build noise initiator: {err}"))?;
 
-        let hello = encode_client_hello(&identity.verifying_key().to_bytes(), device_id)?;
+        let hello = encode_client_hello(identity_key, device_id, device_cert)?;
         let mut message = vec![0u8; NOISE_MAX_MESSAGE_LEN];
         let len = handshake
             .write_message(&hello, &mut message)
@@ -723,7 +804,7 @@ where
             bail!("node key {} was not accepted", fingerprint(&node_public));
         }
 
-        let hello = encode_client_hello(&identity.verifying_key().to_bytes(), device_id)?;
+        let hello = encode_client_hello(&identity.verifying_key().to_bytes(), device_id, None)?;
         let len = handshake
             .write_message(&hello, &mut message)
             .map_err(|err| anyhow::anyhow!("failed to build noise handshake message 3: {err}"))?;
@@ -883,46 +964,81 @@ where
 /// Именно здесь identity перестаёт быть заявкой: `remote_static` доказан
 /// DH-операцией хендшейка, а конверсия Ed25519 → Montgomery детерминирована,
 /// поэтому подставить чужой `user_id` можно только владея его секретом.
+///
+/// Делегированный вход меняет одно звено цепочки: статик сверяется с ключом
+/// из сертификата, а связь сертификата с `user_id` доказывает подпись
+/// аккаунта. Пути не комбинируются: если сертификат есть, он проверяется
+/// целиком, и отката к прямой сверке при неудаче нет — иначе это был бы
+/// оракул.
 fn verify_client_identity(
     handshake: &HandshakeState,
     hello: ClientHello,
     protocol_version: u16,
     pattern: NoisePattern,
+    now_secs: u64,
+    device_cert_max_ttl_secs: u64,
 ) -> Result<NoiseSessionIdentity> {
     let remote_static = handshake
         .get_remote_static()
         .ok_or_else(|| anyhow::anyhow!("noise handshake produced no remote static key"))?;
     let remote_static = to_fixed_32(remote_static, "remote static key")?;
 
-    let verifying = VerifyingKey::from_bytes(&hello.identity_key)
-        .context("client identity key is not a valid ed25519 public key")?;
-    let derived = verifying.to_montgomery().to_bytes();
-
-    if derived != remote_static {
-        bail!("client identity key does not match the authenticated noise static key");
-    }
+    let (scope, cert_not_after) = match &hello.device_cert {
+        None => {
+            let verifying = VerifyingKey::from_bytes(&hello.identity_key)
+                .context("client identity key is not a valid ed25519 public key")?;
+            let derived = verifying.to_montgomery().to_bytes();
+            if derived != remote_static {
+                bail!("client identity key does not match the authenticated noise static key");
+            }
+            (SessionScope::FULL, None)
+        }
+        Some(cert) => {
+            let verified = device_cert::verify(
+                &hello.identity_key,
+                hello.device_id,
+                cert,
+                now_secs,
+                device_cert_max_ttl_secs,
+            )?;
+            if verified.transport_key != remote_static {
+                bail!("device certificate does not match the authenticated noise static key");
+            }
+            (verified.scope, Some(verified.not_after))
+        }
+    };
 
     Ok(NoiseSessionIdentity {
         user_id: hello.identity_key,
         device_id: hello.device_id,
         protocol_version,
         pattern,
+        scope,
+        cert_not_after,
     })
 }
 
 /// Разобранный payload хендшейка с identity клиента (msg1 в IK, msg3 в XX).
 /// Публичен ради фаззера: это второй (после сборки кадров) самописный разбор
 /// недоверенных байт в транспорте.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct ClientHello {
     pub identity_key: [u8; 32],
     pub device_id: Option<DeviceId>,
+    /// Сертификат устройства как приехал: длины полей и подпись проверяет
+    /// `device_cert::verify`, а не разбор.
+    pub device_cert: Option<crate::wire::DeviceCertificate>,
 }
 
-fn encode_client_hello(identity_key: &[u8; 32], device_id: Option<DeviceId>) -> Result<Vec<u8>> {
+fn encode_client_hello(
+    identity_key: &[u8; 32],
+    device_id: Option<DeviceId>,
+    device_cert: Option<crate::wire::DeviceCertificate>,
+) -> Result<Vec<u8>> {
     Ok(NoiseClientHello {
         identity_key: identity_key.to_vec(),
         device_id: crate::net::framing::encode_device_id(device_id),
+        device_cert,
     }
     .encode_to_vec())
 }
@@ -934,6 +1050,7 @@ pub fn decode_client_hello(bytes: &[u8]) -> Result<ClientHello> {
     Ok(ClientHello {
         identity_key,
         device_id,
+        device_cert: hello.device_cert,
     })
 }
 
@@ -1020,6 +1137,7 @@ mod tests {
             timeout: TEST_TIMEOUT,
             max_frame_len: TEST_FRAME_MAX,
             allow_tofu: true,
+            device_cert_max_ttl_secs: 30 * 24 * 3600,
         }
     }
 
@@ -1120,6 +1238,7 @@ mod tests {
                 &node,
                 HandshakePolicy {
                     allow_tofu: false,
+                    device_cert_max_ttl_secs: 30 * 24 * 3600,
                     ..test_policy()
                 },
             )
@@ -1180,7 +1299,7 @@ mod tests {
             .unwrap()
             .build_initiator()
             .unwrap();
-        let hello = encode_client_hello(&client.verifying_key().to_bytes(), None).unwrap();
+        let hello = encode_client_hello(&client.verifying_key().to_bytes(), None, None).unwrap();
         let mut message = vec![0u8; NOISE_MAX_MESSAGE_LEN];
         let len = handshake.write_message(&hello, &mut message).unwrap();
         write_handshake_message(&mut client_stream, &message[..len])
@@ -1432,7 +1551,7 @@ mod tests {
             .unwrap()
             .build_initiator()
             .unwrap();
-        let hello = encode_client_hello(&client.verifying_key().to_bytes(), None).unwrap();
+        let hello = encode_client_hello(&client.verifying_key().to_bytes(), None, None).unwrap();
         let mut message = vec![0u8; NOISE_MAX_MESSAGE_LEN];
         let len = handshake.write_message(&hello, &mut message).unwrap();
         write_handshake_message(&mut client_stream, &message[..len])
@@ -1485,7 +1604,7 @@ mod tests {
             .unwrap()
             .build_initiator()
             .unwrap();
-        let hello = encode_client_hello(&client.verifying_key().to_bytes(), None).unwrap();
+        let hello = encode_client_hello(&client.verifying_key().to_bytes(), None, None).unwrap();
         let mut buffer = vec![0u8; NOISE_MAX_MESSAGE_LEN];
         let len = handshake.write_message(&hello, &mut buffer).unwrap();
         let recorded_msg1 = buffer[..len].to_vec();

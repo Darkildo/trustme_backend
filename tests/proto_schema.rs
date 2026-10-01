@@ -101,6 +101,7 @@ fn every_payload_variant_roundtrips() {
         frame::Payload::SignedServerConfig(SignedServerConfig {
             config: ServerConfig {
                 supports_queue_addressing: false,
+                device_cert_max_ttl_secs: 2_592_000,
                 proto_version: PROTO_VERSION,
                 max_frame_len: 8 * 1024 * 1024,
                 supports_device_addressing: true,

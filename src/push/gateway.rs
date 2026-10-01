@@ -141,6 +141,11 @@ fn nonce() -> Vec<u8> {
 
 impl PushTransport for PushGatewayClient {
     async fn send(&self, payload: PushPayload) -> SendOutcome {
+        // `payload.wake_hint` тут теряется: в `push.proto` соответствующего
+        // поля нет, а схема — контракт с внешним шлюзом и односторонне не
+        // меняется. Следствие: нода за шлюзом будит Android под звонок
+        // обычным wake'ом, и клиент покажет баннер вместо ринга. iOS с
+        // voip-слотом не затронут — там звонок уходит методом `Ring`.
         let wake = pb::Wake {
             token: payload.token,
             kind: kind_of(payload.kind) as i32,
@@ -309,6 +314,7 @@ mod tests {
                 max_priority: Some(MessagePriority::High),
                 server_ts_secs: 100,
                 kind: PushKind::Wake,
+                wake_hint: None,
             })
             .await;
         assert_eq!(outcome, SendOutcome::TransientError);

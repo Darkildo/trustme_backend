@@ -27,6 +27,7 @@ pub async fn accept_loop(
         timeout: cfg.handshake_timeout,
         max_frame_len: cfg.max_frame_len,
         allow_tofu: cfg.noise_allow_tofu,
+        device_cert_max_ttl_secs: cfg.device_cert_max_ttl.as_secs(),
     };
     // Один на процесс: rate-limiter отправки считает бюджет пользователя, а
     // не соединения — на сессию его дробить нельзя.

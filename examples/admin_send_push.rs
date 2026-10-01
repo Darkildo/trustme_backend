@@ -121,6 +121,9 @@ fn run() -> Result<()> {
             },
             server_ts_secs: now,
             kind: args.kind,
+            // Ручной пуш звонком не бывает: маркер ставит только
+            // звонковый конверт, проехавший через планировщик.
+            wake_hint: None,
         };
 
         let outcome = runtime.block_on(transport.send(payload));

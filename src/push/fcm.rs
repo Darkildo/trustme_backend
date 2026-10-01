@@ -28,11 +28,17 @@ use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
 use crate::domain::priority::MessagePriority;
+use crate::domain::wake::WakeHint;
 use crate::push::transport::{BackoffReason, PushKind, PushPayload, PushTransport, SendOutcome};
 
 /// Greeting shown when a brand-new user registers their first push token.
 const WELCOME_TITLE: &str = "Welcome!";
 const WELCOME_BODY: &str = "From doctor with love";
+
+/// Значение `data.wake_hint` для звонкового wake'а. Совпадает со значением
+/// `wake` в APNs voip-payload'е (`push::apns`) намеренно: клиент читает один
+/// и тот же словарь, каким бы путём его ни разбудили.
+const WAKE_HINT_CALL: &str = "call";
 
 const GOOGLE_TOKEN_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
 const ACCESS_TOKEN_SKEW: Duration = Duration::from_secs(60);
@@ -207,6 +213,22 @@ fn build_envelope(payload: &PushPayload) -> Value {
     }
 }
 
+/// Wake-конверт: data-only, без единого байта переписки. Контракт `data`
+/// (все значения — строки, как того требует FCM):
+///
+/// | ключ | значение |
+/// |---|---|
+/// | `kind` | `"wake"` |
+/// | `pending` | сколько недоставленных накопилось с прошлого пуша |
+/// | `max_priority` | `"high"` / `"medium"` / `"low"` / `"none"` |
+/// | `user` | hex получателя (64 символа) |
+/// | `device` | `device_id` строкой (пустая строка, если 0) |
+/// | `ts` | серверное unix-время принятия решения |
+/// | `wake_hint` | `"call"` — **только** у звонкового wake'а |
+///
+/// `wake_hint` именно отсутствует, а не равен какому-нибудь `"none"`:
+/// контракт клиента — «ключ есть ⇒ это звонок», и нейтральное значение
+/// пришлось бы отличать от звонка на каждой стороне.
 fn build_wake_envelope(payload: &PushPayload) -> Value {
     let max_priority = priority_label(payload.max_priority);
     // A wake push is a silent, data-only message whose entire purpose is to
@@ -223,17 +245,27 @@ fn build_wake_envelope(payload: &PushPayload) -> Value {
         payload.device_id.to_string()
     };
 
+    let mut data = json!({
+        "kind": "wake",
+        "pending": payload.pending.to_string(),
+        "max_priority": max_priority,
+        "user": hex::encode(payload.user_id),
+        "device": device,
+        "ts": payload.server_ts_secs.to_string(),
+    });
+
+    // Звонок доезжает до Android'а только этим ключом: voip-путь у него
+    // отсутствует, а обычный wake неотличим от «пришли сообщения» — и
+    // получатель увидит баннер вместо входящего звонка.
+    if let (Some(WakeHint::IncomingCall), Some(fields)) = (payload.wake_hint, data.as_object_mut())
+    {
+        fields.insert("wake_hint".to_string(), Value::from(WAKE_HINT_CALL));
+    }
+
     json!({
         "message": {
             "token": payload.token,
-            "data": {
-                "kind": "wake",
-                "pending": payload.pending.to_string(),
-                "max_priority": max_priority,
-                "user": hex::encode(payload.user_id),
-                "device": device,
-                "ts": payload.server_ts_secs.to_string(),
-            },
+            "data": data,
             "android": { "priority": android_priority },
             "apns": { "headers": { "apns-priority": apns_priority } }
         }
@@ -462,6 +494,14 @@ mod tests {
             max_priority: priority,
             server_ts_secs: 1_700_000_000,
             kind: PushKind::Wake,
+            wake_hint: None,
+        }
+    }
+
+    fn call_payload() -> PushPayload {
+        PushPayload {
+            wake_hint: Some(WakeHint::IncomingCall),
+            ..payload(Some(MessagePriority::High))
         }
     }
 
@@ -474,6 +514,7 @@ mod tests {
             max_priority: None,
             server_ts_secs: 1_700_000_000,
             kind: PushKind::Welcome,
+            wake_hint: None,
         }
     }
 
@@ -494,6 +535,35 @@ mod tests {
         // Neither sender id nor message body is leaked into the payload.
         assert!(data.get("body").is_none());
         assert!(data.get("sender").is_none());
+        // Не звонок — ключа нет вовсе (а не «есть со значением none»):
+        // клиент читает его как «ключ есть ⇒ показать ринг».
+        assert!(data.get("wake_hint").is_none());
+    }
+
+    /// Звонковый wake несёт маркер, по которому Android-клиент показывает
+    /// ринг вместо баннера «новые сообщения». Остальной конверт — тот же.
+    #[test]
+    fn wake_envelope_marks_incoming_call() {
+        let env = build_envelope(&call_payload());
+        let data = env["message"].get("data").unwrap();
+
+        assert_eq!(data["wake_hint"], "call");
+        assert_eq!(data["kind"], "wake");
+        assert_eq!(data["max_priority"], "high");
+        // Маркер не заменяет собой содержимое: его по-прежнему нет.
+        assert!(data.get("body").is_none());
+        assert_eq!(env["message"]["android"]["priority"], "high");
+    }
+
+    /// Welcome-конверт звонковым не бывает: у него собственный `kind` и
+    /// свой набор ключей, и `wake_hint` туда не протекает.
+    #[test]
+    fn welcome_envelope_never_carries_wake_hint() {
+        let env = build_envelope(&welcome_payload());
+        let data = env["message"].get("data").unwrap();
+
+        assert_eq!(data["kind"], "welcome");
+        assert!(data.get("wake_hint").is_none());
     }
 
     #[test]

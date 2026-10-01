@@ -73,6 +73,9 @@ pub async fn handle_conn(
     // Сессия начинается с Noise-хендшейка; после него identity клиента
     // доказана статиком соединения. Pre-auth plaintext-фазы нет.
     let handshake_started = std::time::Instant::now();
+    // Адрес снимается до хендшейка: `accept` забирает сокет, а отказ
+    // логируется здесь же.
+    let peer = stream.peer_addr().ok();
     let (mut framed, identity) = match NoiseFramed::accept(stream, &node, handshake_policy).await {
         Ok(established) => {
             observability::observe_handshake(
@@ -83,14 +86,25 @@ pub async fn handle_conn(
             established
         }
         Err(err) => {
+            let class = classify_handshake_error(&err.to_string());
             observability::observe_handshake(
-                classify_handshake_error(&err.to_string()),
+                class,
                 // Паттерн неизвестен: отказ мог случиться до его чтения.
                 "unknown",
                 handshake_started.elapsed(),
             );
-            warn!(error = %err, "noise handshake failed; closing connection");
-            return Err(err);
+            // Отказ до сессии — не сбой ноды, а чужой трафик на порту. Он
+            // посчитан метрикой и залогирован здесь, поэтому наверх уходит
+            // `Ok`: `error!` листенера остаётся за сбоями установленной
+            // сессии. `bad_magic` (сканеры портов, чужие протоколы) не
+            // стоит и warn'а.
+            let peer = peer.map(tracing::field::display);
+            if class == "bad_magic" {
+                debug!(peer, error = %err, "noise handshake refused: not a noise peer");
+            } else {
+                warn!(peer, error = %err, "noise handshake failed; closing connection");
+            }
+            return Ok(());
         }
     };
 
@@ -101,6 +115,8 @@ pub async fn handle_conn(
     let user_id = identity.user_id;
     let device_id = identity.device_id;
     let protocol_version = identity.protocol_version;
+    let scope = identity.scope;
+    let cert_not_after = identity.cert_not_after;
 
     observability::observe_connection_auth("ok");
     info!(
@@ -108,6 +124,7 @@ pub async fn handle_conn(
         ?device_id,
         protocol_version,
         pattern = identity.pattern.as_metric_label(),
+        delegated = scope.is_delegated(),
         "noise session established"
     );
 
@@ -376,6 +393,53 @@ pub async fn handle_conn(
                   Some(frame::Payload::ListQueues(_)) => ClientFrame::ListQueues,
                   _ => ClientFrame::Ignore,
               };
+
+              // Сессия не должна пережить сертификат, которым открыта:
+              // отзыва у сертификатов нет, и срок — единственный предел
+              // украденному. Проверяется на каждом входящем кадре.
+              if cert_not_after.is_some_and(|not_after| unix_now_secs() >= not_after) {
+                  info!(
+                      user = %hex::encode(user_id),
+                      ?device_id,
+                      "device certificate expired; closing delegated session"
+                  );
+                  break;
+              }
+
+              // Права делегированной сессии. Отказ едет ack'ом того же вида,
+              // что и у самой операции: клиент ждёт ответа на кадр, и
+              // молчание выглядело бы зависшей нодой.
+              let forbidden = match &parsed {
+                  ClientFrame::Send { .. } if !scope.can_send() => {
+                      observability::observe_reject(SendRejectReason::Forbidden.as_metric_label());
+                      Some(encode_send_ack(false, false, 0, SendRejectReason::Forbidden))
+                  }
+                  ClientFrame::RegisterPushToken { .. } | ClientFrame::UnregisterPushToken
+                      if !scope.can_manage_push_tokens() =>
+                  {
+                      Some(encode_push_token_ack(
+                          false,
+                          "device certificate does not permit push token changes",
+                      ))
+                  }
+                  ClientFrame::AllocateQueue
+                  | ClientFrame::RevokeQueue { .. }
+                  | ClientFrame::ListQueues
+                      if !scope.can_manage_queues() =>
+                  {
+                      Some(encode_queue_ack(false, None, WireQueueRejectReason::Forbidden))
+                  }
+                  _ => None,
+              };
+              if let Some(ack) = forbidden {
+                  warn!(
+                      user = %hex::encode(user_id),
+                      ?device_id,
+                      "delegated session attempted an operation outside its scope"
+                  );
+                  framed.send_frame(&ack).await?;
+                  continue;
+              }
 
               match parsed {
                   ClientFrame::Send {

@@ -65,6 +65,7 @@ pub fn disabled_push_config() -> PushConfig {
 pub fn test_config(storage_path: &str, limits: LimitsConfig) -> Config {
     Config {
         queue_addressing_enabled: false,
+        device_cert_max_ttl: Duration::from_secs(30 * 24 * 3600),
         bind_addr: "127.0.0.1:0".to_string(),
         storage_path: storage_path.to_string(),
         node_identity_key: None,
@@ -97,6 +98,7 @@ pub fn test_config(storage_path: &str, limits: LimitsConfig) -> Config {
 pub fn snapshot() -> ServerConfigSnapshot {
     ServerConfigSnapshot {
         supports_queue_addressing: false,
+        device_cert_max_ttl: Duration::from_secs(30 * 24 * 3600),
         max_frame_len: FRAME_MAX,
         supports_device_addressing: true,
         deleted_messages_retention: RetentionPolicy::KeepFor(Duration::from_secs(30 * 86_400)),

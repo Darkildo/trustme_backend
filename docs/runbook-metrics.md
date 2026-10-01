@@ -62,7 +62,7 @@ rate(handshake_admission_rejected_total[5m]) > 0
 | `identity_mismatch` | Заявленный `identityKey` не совпал со статиком | Сломанный или враждебный клиент |
 | `tofu_disabled` | Клиент пришёл по XX, а нода его не принимает | Ожидаемо при `NOISE_ALLOW_TOFU=false` |
 | `unknown_pattern` | Байт паттерна не 1 и не 2 | Мусор или чужой протокол |
-| `rejected` | Всё остальное: чаще всего чужой пин, также обрыв посреди хендшейка | Всплеск = клиенты не знают ключа |
+| `rejected` | Всё остальное: чаще всего чужой пин, также невалидный сертификат устройства, обрыв посреди хендшейка | Всплеск = клиенты не знают ключа |
 
 Отказ во входе по лимиту одновременных хендшейков сюда не попадает — он
 считается в `handshake_admission_rejected_total`.
@@ -99,6 +99,7 @@ rate(handshake_admission_rejected_total[5m]) > 0
 | `rate_limited` | `SendAck` c `RATE_LIMITED` | Лимит msg/s или байт/сутки |
 | `invalid_ttl` | `SendAck` c `INVALID_TTL` | ttl ниже пола ноды |
 | `no_permit` | `SendAck` c `NO_PERMIT` | Депозит в неизвестную или отозванную очередь (только при `QUEUE_ADDRESSING_ENABLED=true`) |
+| `forbidden` | `SendAck` c `FORBIDDEN` | Сессия по сертификату устройства без права отправки |
 | `internal` | `SendAck` c `INTERNAL` | Ошибка хранилища или брокера. **Ненулевое значение — всегда авария**, смотреть `storage_operation_total{result="error"}`, `broker_publish_timeout_total` и логи |
 | `unspecified` / `expired` | одноимённые | Зарезервированы, сейчас не выдаются |
 | `retention_policy` | `SendAck` c `UNSPECIFIED` | Дроп по политике `immediate` |

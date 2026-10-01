@@ -50,6 +50,11 @@ pub struct Config {
     /// Управляет ли `ClientSend.queueId` доставкой (`QUEUE_ADDRESSING_ENABLED`).
     /// Default: false.
     pub queue_addressing_enabled: bool,
+    /// Потолок срока жизни сертификата устройства
+    /// (`DEVICE_CERT_MAX_TTL_SECONDS`). Default: 30 суток. `0` выключает
+    /// делегированный вход целиком: хендшейк с сертификатом отвергается, а
+    /// в подписанном снапшоте возможность не объявляется.
+    pub device_cert_max_ttl: Duration,
 }
 
 /// Лимиты и квоты. Все значения `0` означают «не ограничено», кроме
@@ -147,6 +152,9 @@ pub struct ServerConfigSnapshot {
     /// врозь, и включать маршрутизацию по очередям осмысленно только после
     /// того, как клиенты их завели и разложили по контактам.
     pub supports_queue_addressing: bool,
+    /// Потолок срока жизни сертификата устройства; ноль — делегированный
+    /// вход выключен.
+    pub device_cert_max_ttl: Duration,
     /// Срок жизни подписанного снапшота. Подписанный конфиг без срока —
     /// вечно предъявляемая запись, которую нечем отозвать, поэтому срок
     /// всегда ненулевой.
@@ -416,6 +424,7 @@ impl Config {
             offline_messages_retention: self.offline_messages_retention,
             supports_delivery_ack: matches!(self.delivery.backend, DeliveryBackendKind::JetStream),
             supports_queue_addressing: self.queue_addressing_enabled,
+            device_cert_max_ttl: self.device_cert_max_ttl,
             config_ttl: self.server_config_ttl,
             advertised_address: self.advertised_address.clone(),
         }
@@ -549,6 +558,8 @@ struct RawConfig {
     #[serde(default)]
     queue_addressing_enabled: Option<bool>,
     #[serde(default)]
+    device_cert_max_ttl_seconds: Option<u64>,
+    #[serde(default)]
     limit_handshake_inflight: Option<usize>,
     #[serde(default)]
     limit_handshake_inflight_per_ip: Option<usize>,
@@ -628,6 +639,7 @@ pub fn load() -> anyhow::Result<Config> {
         limit_ping_per_sec,
         max_queues_per_user,
         queue_addressing_enabled,
+        device_cert_max_ttl_seconds,
         limit_handshake_inflight,
         limit_handshake_inflight_per_ip,
     } = raw;
@@ -718,6 +730,9 @@ pub fn load() -> anyhow::Result<Config> {
 
     Ok(Config {
         queue_addressing_enabled: queue_addressing_enabled.unwrap_or(false),
+        device_cert_max_ttl: Duration::from_secs(
+            device_cert_max_ttl_seconds.unwrap_or(30 * 24 * 3600),
+        ),
         bind_addr,
         storage_path,
         node_identity_key,

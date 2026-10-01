@@ -4,6 +4,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 use crate::domain::priority::MessagePriority;
+use crate::domain::wake::WakeHint;
 use crate::state::registry::{DeviceId, UserId};
 
 /// Outcome of a single push send (FCM, APNs or the push gateway), used by the
@@ -61,6 +62,17 @@ pub struct PushPayload {
     pub server_ts_secs: u64,
     /// Distinguishes the wake fan-out from special one-shots (e.g. welcome).
     pub kind: PushKind,
+    /// `Some(IncomingCall)` — этот wake будит получателя под звонок: конверт,
+    /// вызвавший отправку, нёс `wakeHint = incomingCall`, а voip-путь был
+    /// недоступен (Android, либо iOS без PushKit-слота). Транспорт обязан
+    /// донести признак до клиента (FCM: `data.wake_hint = "call"`), иначе
+    /// получатель покажет баннер «новые сообщения» вместо ринга. Транспорт
+    /// шлюза (`push::gateway`) признак не передаёт: в `push.proto` для него
+    /// нет поля.
+    ///
+    /// Живёт только в конверте пуша: в inbox `WakeHint` не персистится, а
+    /// значит и повторно взяться ему неоткуда.
+    pub wake_hint: Option<WakeHint>,
 }
 
 /// Pluggable wake transport: FCM HTTP v1, the push gateway, or a mock in

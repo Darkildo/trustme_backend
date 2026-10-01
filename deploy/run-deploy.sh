@@ -23,6 +23,11 @@ SSH_PORT=${SSH_PORT:-22}
 DEPLOY_DIR=${DEPLOY_DIR:-/root/trust/Trust_me_deploy}
 AUTH_IMAGE=${AUTH_IMAGE:-}
 SKIP_AUTH_REBUILD=${SKIP_AUTH_REBUILD:-1}
+# Одна команда очистки на cron и на сам деплой. `image prune` трогает только
+# dangling-образы, `builder prune` держит кэш сборки в разумных рамках — оба
+# безопасны для запущенных контейнеров; тома и остановленные контейнеры
+# (на хосте живут и посторонние сервисы) не затрагиваются.
+PRUNE_CMD='docker image prune -f && docker builder prune -f --keep-storage 2GB'
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -139,10 +144,10 @@ REMOTE
 # Строка бэкапа в cron здесь вычищается, чтобы её не оставил прежний деплой.
 ssh_run "$(cat <<REMOTE
 set -euo pipefail
-# Слои docker и кэш сборки растут незаметно. `image prune` трогает только
-# dangling-образы, `builder prune` держит кэш в разумных рамках — оба
-# безопасны для запущенных контейнеров.
-prune_line='41 4 * * 0 docker image prune -f && docker builder prune -f --keep-storage 2GB'
+# Слои docker и кэш сборки растут незаметно. Деплой чистит их и сам
+# (шаг 6.5), расписание — страховка на случай, когда мусор копят
+# посторонние сервисы, а деплоев нет.
+prune_line='41 4 * * 0 $PRUNE_CMD'
 (
   crontab -l 2>/dev/null | grep -v -e trust-backup-node -e 'docker image prune' || true
   echo "\$prune_line"
@@ -165,10 +170,45 @@ log "5/6 Building local images and restarting stack"
 # the single source of truth for compose config (no manual drift between local
 # and prod-only copies).
 ssh_run "cp '$DEPLOY_DIR/tcp_message_server/deploy/docker-compose.override.jetstream.yml' '$DEPLOY_DIR/docker-compose.override.yml'"
+# Id контейнера и его образа до `up`: compose пересоздаёт ноду только при
+# изменившемся образе, и по выводу сборки этого не видно — `CACHED` легко
+# пролистать. На первом деплое контейнера ещё нет, обе переменные пусты.
+read -r msg_container_before msg_image_before \
+  < <(ssh_run "docker inspect -f '{{.Id}} {{.Image}}' message-service 2>/dev/null || true") || true
 ssh_run "cd '$DEPLOY_DIR' && docker compose build && docker compose up -d"
+read -r msg_container_after msg_image_after \
+  < <(ssh_run "docker inspect -f '{{.Id}} {{.Image}}' message-service 2>/dev/null || true") || true
+
+# Смена образа оставляет прежний без тега, и очистка ниже снесла бы его в
+# ту самую минуту, когда откат вероятнее всего. Тег `previous` держит ровно
+# один образ назад: откат — перевесить его на `jetstream` и `compose up -d`.
+# Образ, вытесненный из-под `previous`, теряет тег и уходит с очисткой.
+if [[ -n "$msg_image_before" && "$msg_image_before" != "$msg_image_after" ]]; then
+  ssh_run "docker tag '$msg_image_before' trust-message-service:previous"
+  echo "прежний образ ноды сохранён как trust-message-service:previous"
+fi
 
 log "6/6 Verifying"
 ssh_run "docker ps --format 'table {{.Names}}\t{{.Image}}\t{{.Status}}'"
+# «Все контейнеры Up» не отвечает на главный вопрос деплоя — какой код
+# теперь работает. Сверяем бинарь в контейнере со свежесобранным и говорим
+# вслух, если нода не пересоздавалась: сборка совпала с работающим образом,
+# и деплой ничего не выкатил.
+if [[ -n "$msg_container_before" && "$msg_container_before" == "$msg_container_after" ]]; then
+  echo "message-service НЕ пересоздан: собранный образ совпал с работающим, новый код не выкатывался"
+else
+  echo "message-service пересоздан из нового образа"
+fi
+ssh_run "$(cat <<REMOTE
+built=\$(sha256sum '$DEPLOY_DIR/tcp_message_server/deploy/message-runtime/trust_message_tcp' | cut -d' ' -f1)
+running=\$(docker exec message-service sha256sum /usr/local/bin/trust_message_tcp 2>/dev/null | cut -d' ' -f1)
+if [ -n "\$running" ] && [ "\$built" = "\$running" ]; then
+  echo "binary sha256: \${running:0:16}… (в контейнере — свежесобранный)"
+else
+  echo "WARNING: бинарь в контейнере (\${running:-нет}) не совпадает со свежесобранным (\$built)" >&2
+fi
+REMOTE
+)"
 # Правило, которого Prometheus не загрузил, — это текст на диске. Проверяем
 # не «есть ли хоть какие-то правила» (они были и до этого), а совпадает ли
 # их число с тем, что лежит в репозитории: расхождение означает, что
@@ -185,6 +225,33 @@ else
 fi
 REMOTE
 )"
-ssh_run "for c in nats message-service; do echo; echo === \$c ===; docker logs --tail 40 \$c 2>&1 | sed 's/^/  /'; done"
+# Порт ноды смотрит в интернет, и сканеры сервисов забивают хвост лога
+# пачками чужих протоколов. Окно берётся шире, а строки об отказе «не наш
+# протокол» и о принятом сокете выкидываются — иначе в 40 строк не
+# попадает ничего о самой ноде.
+ssh_run "$(cat <<'REMOTE'
+for c in nats message-service; do
+  echo; echo "=== $c ==="
+  docker logs --tail 400 "$c" 2>&1 \
+    | grep -v -e 'this node speaks noise only' -e 'failed to read noise magic' \
+              -e 'incoming tcp connection accepted' \
+    | tail -n 40 | sed 's/^/  /'
+done
+REMOTE
+)"
+
+log "6.5/6 Cleaning up docker storage"
+# После `up`, а не до сборки: вытесненный образ становится dangling только
+# когда контейнер с него снят. Данные ноды (тома JetStream и sled) и
+# cargo-кэш сборки здесь не трогаются — только слои docker.
+ssh_run "$(cat <<REMOTE
+root=\$(docker info -f '{{.DockerRootDir}}')
+usage() { df -h --output=used,avail,pcent "\$root" | tail -n 1; }
+echo "диск до:    \$(usage)"
+# Списки удалённых слоёв — сотни строк; в выводе остаются только итоги.
+{ $PRUNE_CMD; } | grep -e 'reclaimed' -e '^Total' || true
+echo "диск после: \$(usage)"
+REMOTE
+)"
 
 log "DONE"

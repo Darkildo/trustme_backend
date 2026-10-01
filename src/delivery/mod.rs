@@ -1061,6 +1061,7 @@ mod tests {
         let (storage, path) = temp_storage("jetstream_down");
         let cfg = Config {
             queue_addressing_enabled: false,
+            device_cert_max_ttl: Duration::from_secs(30 * 24 * 3600),
             bind_addr: "127.0.0.1:0".to_string(),
             storage_path: path.clone(),
             node_identity_key: None,
