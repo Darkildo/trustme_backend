@@ -17,11 +17,23 @@ set -euo pipefail
 # SSH_HOST is required. Other env overrides: SSH_PORT, DEPLOY_DIR,
 # MESSAGE_REPO_LOCAL, AUTH_REPO_LOCAL; AUTH_IMAGE is required with
 # --rebuild-auth. SKIP_AUTH_REBUILD=0 works instead of the CLI flag.
+# Unset variables are also read from the repo's local .env (not in git).
 
-SSH_HOST=${SSH_HOST:-}
+# Локальный .env репозитория (в git и на сервер не попадает): цель деплоя
+# и значения push, которые override подставляет через ${VAR:?}.
+# Переменные окружения имеют приоритет над файлом.
+LOCAL_ENV="$(cd "$(dirname "$0")/.." && pwd)/.env"
+from_local_env() {
+  [[ -f "$LOCAL_ENV" ]] || return 0
+  grep -E "^$1=" "$LOCAL_ENV" | tail -n 1 | cut -d= -f2- || true
+}
+
+SSH_HOST=${SSH_HOST:-$(from_local_env SSH_HOST)}
+SSH_PORT=${SSH_PORT:-$(from_local_env SSH_PORT)}
 SSH_PORT=${SSH_PORT:-22}
+DEPLOY_DIR=${DEPLOY_DIR:-$(from_local_env DEPLOY_DIR)}
 DEPLOY_DIR=${DEPLOY_DIR:-/root/trust/Trust_me_deploy}
-AUTH_IMAGE=${AUTH_IMAGE:-}
+AUTH_IMAGE=${AUTH_IMAGE:-$(from_local_env AUTH_IMAGE)}
 SKIP_AUTH_REBUILD=${SKIP_AUTH_REBUILD:-1}
 # Одна команда очистки на cron и на сам деплой. `image prune` трогает только
 # dangling-образы, `builder prune` держит кэш сборки в разумных рамках — оба
@@ -33,7 +45,7 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --rebuild-auth) SKIP_AUTH_REBUILD=0; shift ;;
     --skip-auth-rebuild) SKIP_AUTH_REBUILD=1; shift ;;  # оставлен для совместимости вызовов
-    -h|--help) sed -n '4,19p' "$0"; exit 0 ;;
+    -h|--help) sed -n '4,20p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -175,7 +187,17 @@ ssh_run "cp '$DEPLOY_DIR/tcp_message_server/deploy/docker-compose.override.jetst
 # пролистать. На первом деплое контейнера ещё нет, обе переменные пусты.
 read -r msg_container_before msg_image_before \
   < <(ssh_run "docker inspect -f '{{.Id}} {{.Image}}' message-service 2>/dev/null || true") || true
-ssh_run "cd '$DEPLOY_DIR' && docker compose build && docker compose up -d"
+# Значения push из окружения или локального .env уходят в compose на хосте
+# переменными команды: они перекрывают .env хоста, а без них compose берёт
+# значения оттуда.
+compose_env=""
+for var in FCM_PROJECT_ID APNS_KEY_PATH APNS_KEY_ID APNS_TEAM_ID APNS_BUNDLE_ID; do
+  val=${!var:-$(from_local_env "$var")}
+  if [[ -n "$val" ]]; then
+    compose_env+="$var=$(printf '%q' "$val") "
+  fi
+done
+ssh_run "cd '$DEPLOY_DIR' && ${compose_env}docker compose build && ${compose_env}docker compose up -d"
 read -r msg_container_after msg_image_after \
   < <(ssh_run "docker inspect -f '{{.Id}} {{.Image}}' message-service 2>/dev/null || true") || true
 
