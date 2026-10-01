@@ -1,13 +1,95 @@
 # trust_message_tcp
 
-Нода (сервер) мессенджера с end-to-end шифрованием. Принимает клиентов по
-TCP, аутентифицирует их Noise-хендшейком (`Noise_IK_25519_ChaChaPoly_BLAKE2s`
-для клиента с пином ключа ноды, `Noise_XX_25519_ChaChaPoly_BLAKE2s` для
-первого контакта), маршрутизирует непрозрачные E2E-конверты между
-пользователями и их устройствами, хранит недоставленное (локально в `sled`
-или в NATS JetStream) и будит офлайн-устройства push-уведомлениями (FCM,
-APNs VoIP, либо внешний push-шлюз). Протокол внутри шифрованного канала —
-protobuf.
+[![CI](https://github.com/Darkildo/trustme_backend/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Darkildo/trustme_backend/actions/workflows/ci.yml)
+[![Audit](https://github.com/Darkildo/trustme_backend/actions/workflows/audit.yml/badge.svg?branch=master)](https://github.com/Darkildo/trustme_backend/actions/workflows/audit.yml)
+[![License: PolyForm Strict 1.0.0](https://img.shields.io/badge/license-PolyForm%20Strict%201.0.0-blue)](LICENSING.md)
+
+Серверная нода мессенджера с end-to-end шифрованием, на Rust.
+
+- **Канал.** Клиенты подключаются по TCP, канал шифрует Noise:
+  `Noise_IK_25519_ChaChaPoly_BLAKE2s` для клиента с пином ключа ноды,
+  `Noise_XX_25519_ChaChaPoly_BLAKE2s` для первого контакта. TLS, паролей
+  и токенов нет: identity клиента — его Ed25519-ключ.
+- **Маршрутизация.** Нода пересылает непрозрачные E2E-конверты между
+  пользователями и их устройствами. Тело сообщения она не расшифровывает.
+- **Хранение.** Недоставленное лежит локально в `sled` или в NATS
+  JetStream с подтверждением доставки.
+- **Пробуждение.** Офлайн-устройства будятся push-уведомлениями без
+  содержимого: FCM, APNs VoIP для звонков или внешний push-шлюз.
+- **Протокол.** Кадры внутри канала — protobuf. Схемы в
+  [`schemas/`](schemas/) — единственный источник правды для кода.
+
+## Как это работает
+
+```mermaid
+flowchart TB
+    op(["Оператор ноды"])
+    subgraph clients["Клиенты: iOS, Android"]
+        A["Устройство A"]
+        B["Устройство B"]
+    end
+    subgraph host["Хост ноды"]
+        N["Нода<br/>trust_message_tcp"]
+        S[("sled на диске")]
+        J[("NATS JetStream<br/>опционально")]
+    end
+    subgraph wake["Пробуждение офлайн-устройств"]
+        GW["Push-шлюз<br/>опционально"]
+        FCM["FCM HTTP v1"]
+        APNS["APNs VoIP"]
+    end
+
+    op -. "ключ ноды вне полосы" .-> clients
+    clients <-->|"Noise IK/XX поверх TCP,<br/>protobuf-кадры"| N
+    N --- S
+    N <-->|"конверты, ack"| J
+    N -->|"wake и ring:<br/>напрямую или через шлюз"| wake
+    GW --> FCM
+    GW --> APNS
+```
+
+Путь сообщения от A к B:
+
+```mermaid
+sequenceDiagram
+    participant A as Отправитель
+    participant N as Нода
+    participant P as FCM или APNs
+    participant B as Получатель
+
+    A->>N: Noise-хендшейк, AuthOk, Ping
+    A->>N: ClientSend: E2E-шифротекст для B
+    alt B онлайн
+        N->>B: IncomingMessage
+        N->>A: SendAck
+    else B офлайн
+        N->>N: сохранить в sled или JetStream
+        N->>A: SendAck: принято на хранение
+        N-)P: wake без содержимого
+        P-)B: пробуждение
+        B->>N: Noise-хендшейк, AuthOk, Ping
+        N->>B: IncomingMessage
+    end
+```
+
+1. Клиент заранее знает ключ ноды (IK) или узнаёт его на первом контакте
+   (XX). Хендшейк доказывает ноде, что клиент владеет ключом аккаунта
+   или сертификатом устройства, подписанным этим ключом.
+2. Сессию открывает первый кадр клиента после `AuthOk`, обычно `Ping`.
+   До него нода ничего не доставляет.
+3. Отправитель шлёт E2E-шифротекст. Нода видит отправителя, получателя
+   и метаданные, но не тело.
+4. Онлайн-получатель получает сообщение сразу. Для офлайн-получателя оно
+   сохраняется, а его устройства будятся пушем без содержимого и
+   забирают сообщение при подключении.
+
+Подробные схемы — [docs/architecture.md](docs/architecture.md):
+- компоненты ноды;
+- жизненный цикл соединения и хендшейк IK/XX;
+- доставка на `sled` и на JetStream;
+- конвейер пушей;
+- развёртывание;
+- кто что видит.
 
 ## Модель безопасности
 
@@ -62,6 +144,7 @@ IK (identity клиента, `deviceId`, сертификат устройств
 - [server-contract.md](server-contract.md) — контракт ноды на проводе:
   хендшейк, кадрирование, словарь кадров, семантика отправки и доставки,
   push, лимиты, ограничения.
+- [docs/architecture.md](docs/architecture.md) — устройство ноды в схемах.
 - [docs/protocol-schema.md](docs/protocol-schema.md) — правила эволюции
   схемы, версионирование, сертификат устройства.
 - [docs/push-gateway.md](docs/push-gateway.md) — контракт ноды с внешним
