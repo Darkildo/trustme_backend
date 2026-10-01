@@ -14,7 +14,7 @@ additional permissions below allow.
 
 In addition to the PolyForm Strict License 1.0.0, the licensor grants the
 following permissions for every version of the software published in the
-official repository, <https://github.com/Darkildo/trust_message_tcp-public>.
+official repository, <https://github.com/Darkildo/trustme_backend>.
 
 1. **Contributions.** You may make changes to the software solely to prepare
    a contribution to the official repository, and you may share those changes

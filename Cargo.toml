@@ -3,7 +3,7 @@ name = "trust_message_tcp"
 version = "0.1.0"
 edition = "2024"
 license-file = "LICENSE"
-repository = "https://github.com/Darkildo/trust_message_tcp-public"
+repository = "https://github.com/Darkildo/trustme_backend"
 publish = false
 
 [dependencies]

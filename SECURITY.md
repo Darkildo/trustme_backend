@@ -7,7 +7,7 @@ vulnerability. Do not open public issues for security problems.*
 
 Сообщайте приватно через GitHub: вкладка **Security** → **Report a
 vulnerability** в официальном репозитории
-<https://github.com/Darkildo/trust_message_tcp-public>. Отчёт увидят только
+<https://github.com/Darkildo/trustme_backend>. Отчёт увидят только
 сопровождающие.
 
 Не открывайте публичные issues, pull request'ы или обсуждения с деталями
