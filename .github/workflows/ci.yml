@@ -107,12 +107,13 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
-          # buf breaking сравнивает с master — нужна история, а не срез.
+          # buf breaking сравнивает с целевой веткой PR — нужна история,
+          # а не срез.
           fetch-depth: 0
 
-      - uses: bufbuild/buf-setup-action@a47c93e0b1648d5651a065437926377d060baa99 # v1.50.0
+      - uses: bufbuild/buf-action@85aebf73123b5c15fd5528aaecbf9129cddf7fa7 # v1.6.0
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
+          setup_only: true
 
       - name: Lint
         working-directory: schemas
@@ -120,10 +121,17 @@ jobs:
 
       # Переиспользованный номер поля ломает клиентов молча — единственное
       # место, где это ловится автоматически.
+      #
+      # buf клонирует .git и ищет локальную ветку, а checkout держит
+      # целевую ветку только как origin/<ветка> — локальную создаём сами.
       - name: Breaking changes
         if: github.event_name == 'pull_request'
         working-directory: schemas
-        run: buf breaking --against '../.git#branch=master,subdir=schemas'
+        env:
+          BASE_REF: ${{ github.base_ref }}
+        run: |
+          git branch --force "$BASE_REF" "origin/$BASE_REF"
+          buf breaking --against "../.git#branch=$BASE_REF,subdir=schemas"
 
   coverage:
     name: coverage of changed files
