@@ -502,4 +502,55 @@ mod tests {
         );
         assert_eq!(cache.fresh(minted + PROVIDER_TOKEN_TTL), None);
     }
+
+    /// Provider token — ES256 JWT, подписанный ключом `.p8`, с `kid` ключа
+    /// и `iss` команды. Ловит и jsonwebtoken без бэкенда подписи: он
+    /// собирается, но паникует на первой подписи.
+    #[tokio::test]
+    async fn provider_token_is_es256_jwt_signed_by_the_p8_key() {
+        use aws_lc_rs::signature::{ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair};
+        use jsonwebtoken::{DecodingKey, Validation, decode, decode_header};
+
+        let pair = EcdsaKeyPair::generate(&ECDSA_P256_SHA256_FIXED_SIGNING).unwrap();
+        let pkcs8 = pair.to_pkcs8v1().unwrap();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("trust_message_tcp_apns_{nanos}.p8"));
+        fs::write(
+            &path,
+            pem::encode(&pem::Pem::new("PRIVATE KEY", pkcs8.as_ref())),
+        )
+        .unwrap();
+        let client = ApnsVoipClient::new(
+            path.to_str().unwrap(),
+            "KEYID12345",
+            "TEAMID1234",
+            "com.example.app",
+            ApnsEnvironment::Sandbox,
+            Duration::from_secs(5),
+        );
+        fs::remove_file(&path).unwrap();
+        let client = client.unwrap();
+
+        let jwt = client.provider_token().await.unwrap();
+
+        let header = decode_header(&jwt).unwrap();
+        assert_eq!(header.alg, Algorithm::ES256);
+        assert_eq!(header.kid.as_deref(), Some("KEYID12345"));
+
+        // У provider token нет `exp`: срок жизни задаёт APNs по `iat`.
+        let mut validation = Validation::new(Algorithm::ES256);
+        validation.required_spec_claims.clear();
+        validation.validate_exp = false;
+        let claims = decode::<Value>(
+            &jwt,
+            &DecodingKey::from_ec_der(pair.public_key().as_ref()),
+            &validation,
+        )
+        .unwrap()
+        .claims;
+        assert_eq!(claims["iss"], "TEAMID1234");
+    }
 }

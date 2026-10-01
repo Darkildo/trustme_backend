@@ -13,11 +13,11 @@ tokio-util = { version = "0.7.18", features = ["codec"] }  # LengthDelimitedCode
 bytes = "1"
 ed25519-dalek = { version = "2.2.0", features = ["rand_core"] } # identity клиента и ноды, конверсия в X25519
 sled = "0.34"                                              # локальное KV-хранилище
-dashmap = "5"                                              # конкурентные карты: реестр сессий, состояние push
+dashmap = "6"                                              # конкурентные карты: реестр сессий, состояние push
 anyhow = "1.0.101"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features=["fmt","env-filter"] }
-config = "0.14"                                            # конфиг из .env и переменных окружения
+config = "0.15"                                            # конфиг из .env и переменных окружения
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
@@ -34,9 +34,12 @@ futures-util = { version = "0.3.31", features = ["sink"] } # Stream/Sink-ком�
 async-nats = "0.50"                                        # клиент NATS JetStream (брокерный бэкенд доставки)
 
 # Push: FCM HTTP v1 (OAuth2 JWT) и APNs voip (ES256 JWT); http2 обязателен
-# для APNs.
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "http2"] }
-jsonwebtoken = "9"
+# для APNs. TLS reqwest — rustls на aws-lc-rs с системными корнями
+# (rustls-platform-verifier): в образе нужен ca-certificates.
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "json", "form", "http2"] }
+# Бэкенд подписи выбирается фичей; без неё jsonwebtoken собирается, но
+# паникует на первой подписи. aws-lc уже в сборке через rustls.
+jsonwebtoken = { version = "11", features = ["aws_lc_rs"] }
 
 # Noise-транспорт, protobuf-схемы, gRPC-клиент push-шлюза
 snow = "0.10.0"
@@ -56,3 +59,8 @@ tonic-prost-build = "0.14.6"
 # проверяется реакция на то, чего нода сама произвести не может —
 # например, на неразбираемый конверт.
 async-nats = "0.50"
+# Тесты подписи JWT генерируют ключи на лету: PEM-заглушка в репозитории
+# выглядела бы для сканеров секретов настоящим ключом. Оба крейта уже в
+# дереве зависимостей (rustls, jsonwebtoken).
+aws-lc-rs = "1"
+pem = "3"
