@@ -26,6 +26,11 @@ updates:
     target-branch: dev
     schedule:
       interval: weekly
+    # Мажорные версии ломают API и обновляются вручную, вместе с правкой
+    # кода; dependabot для них только шумит красными PR.
+    ignore:
+      - dependency-name: "*"
+        update-types: ["version-update:semver-major"]
     groups:
       cargo-minor-and-patch:
         update-types: [minor, patch]
