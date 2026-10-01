@@ -41,12 +41,13 @@ rate(handshake_admission_rejected_total[5m]) > 0
 
 | Метрика | Метки | О чём |
 |---|---|---|
-| `listener_accept_total` | `result` | TCP-соединения, принятые слушателем |
+| `listener_accept_total` | `result` = `ok` / `error` | Исход `accept` слушателя |
+| `connection_limit_rejected_total` | — | Соединение закрыто сразу после `accept`, до хендшейка: занят весь потолок `LIMIT_MAX_CONNECTIONS` |
 | `handshake_admission_rejected_total` | `reason` = `global` / `per_ip` | Отказ во входе **до** крипты |
 | `noise_handshake_total` | `result`, `pattern` | Исход хендшейка |
 | `noise_handshake_seconds` | `result`, `pattern` | Его длительность |
-| `connections_opened_total` / `connections_closed_total` / `connections_active` | — | Жизненный цикл сессий |
-| `connection_auth_total` | `result` = `ok` / `limit` / `unavailable` | Хендшейк пройден; отбит лимитом сессий; закрыт `AuthError 503` |
+| `connections_opened_total` / `connections_closed_total` / `connections_active` | — | Жизненный цикл соединений |
+| `connection_auth_total` | `result` = `ok` / `unconfirmed` / `limit` / `unavailable` | Сессия подтверждена первым кадром клиента; не подтверждена и закрыта; отбита лимитом сессий; закрыта `AuthError 503` |
 | `connection_lifetime_seconds` | — | Сколько живут сессии |
 | `connection_reset_by_peer_total` | — | Клиент оборвал соединение |
 
@@ -65,7 +66,26 @@ rate(handshake_admission_rejected_total[5m]) > 0
 | `rejected` | Всё остальное: чаще всего чужой пин, также невалидный сертификат устройства, обрыв посреди хендшейка | Всплеск = клиенты не знают ключа |
 
 Отказ во входе по лимиту одновременных хендшейков сюда не попадает — он
-считается в `handshake_admission_rejected_total`.
+считается в `handshake_admission_rejected_total`. Ключ малого порядка
+(identity клиента, ключи сертификата устройства) даёт `rejected`.
+
+**`connection_auth_total{result}`.** `ok` считает только сессии,
+подтверждённые первым кадром клиента после `AuthOk`; соединение без
+такого кадра закрывается через `SESSION_CONFIRM_TIMEOUT_SECS` и даёт
+`unconfirmed` (в логе — info
+`session not confirmed by the client; closing` с `reason` = `timeout` /
+`closed` / `unreadable`). Устойчивая доля `unconfirmed` означает клиентов,
+которые после `AuthOk` молчат, — их надо обновить; всплеск при ровном
+`ok` похож на повторы записанных хендшейков. `limit` бывает и после
+`AuthOk`: лимит сессий перепроверяется при подтверждении.
+
+**`connection_limit_rejected_total`** ненулевой — нода упёрлась в потолок
+открытых соединений: её заливают соединениями, либо потолок занижен под
+реальную нагрузку. Соседние сигналы — `connections_active` у потолка и
+`listener_accept_total{result="error"}`: рост последнего с warn
+`accept failed; pausing before retry` в логе означает, что раньше потолка
+кончились дескрипторы (EMFILE), см.
+[runbook-failure-modes.md](runbook-failure-modes.md).
 
 `pattern` = `ik` / `xx` / `unknown`. **Доля `xx` — это доля подключений,
 доверие в которых не проверено пином.** На зрелом развёртывании её рост
@@ -95,7 +115,7 @@ rate(handshake_admission_rejected_total[5m]) > 0
 
 | `reason` | Видно клиенту как | Комментарий |
 |---|---|---|
-| `full` | `SendAck` c `FULL` | Квота очереди получателя |
+| `full` | `SendAck` c `FULL` | Прямой бэкенд — квота очереди получателя. Брокерный — заполнен ящик получателя (`NATS_MAX_MSGS_PER_SUBJECT`) или весь поток (`NATS_STREAM_MAX_BYTES`); в логе warn `recipient queue in the broker is full; answering the sender with FULL` |
 | `rate_limited` | `SendAck` c `RATE_LIMITED` | Лимит msg/s или байт/сутки |
 | `invalid_ttl` | `SendAck` c `INVALID_TTL` | ttl ниже пола ноды |
 | `no_permit` | `SendAck` c `NO_PERMIT` | Депозит в неизвестную или отозванную очередь (только при `QUEUE_ADDRESSING_ENABLED=true`) |
@@ -112,6 +132,15 @@ rate(handshake_admission_rejected_total[5m]) > 0
 `delivery_unavailable` и `storage_unavailable`: оба приходят как
 `AuthError 503`. Закрытие живой сессии из-за умершего пула доставки
 считается не здесь, а в `pump_session_closed_total`.
+
+**`full` на брокерном бэкенде** бывает двух видов, и в логе они
+различаются текстом ошибки рядом с warn: `maximum messages per subject
+exceeded` — заполнен один ящик, отказ получают только отправители этому
+получателю; `maximum bytes exceeded` — заполнен поток целиком, и `FULL`
+получают все. Второе — авария: смотреть заполнение потока
+(`nats stream info messages`) и `NATS_STREAM_MAX_BYTES`. Принятые конверты
+при этом не теряются; поток разгружается подтверждениями клиентов и по
+`NATS_STREAM_MAX_AGE_DAYS`.
 
 ## Хранилище
 
@@ -160,7 +189,10 @@ rate(handshake_admission_rejected_total[5m]) > 0
 ещё или что схема конверта разъехалась между узлами.
 
 Рост `message_redelivered_total` без роста `message_broker_acked_total` —
-клиенты получают конверты, но не подтверждают их.
+клиенты получают конверты, но не подтверждают их. Неподтверждённые
+конверты занимают место в лимитах ящика и потока: подтверждённый конверт
+нода удаляет из потока, неподтверждённый лежит до `max_age`. Передоставка
+пушей не порождает.
 
 `inflight_released_total` — не авария: конверт, который некому
 подтвердить, возвращается в поток при завершении пула и выдаётся снова.
@@ -216,8 +248,19 @@ rate(handshake_admission_rejected_total[5m]) > 0
 `push_dropped_total{reason="channel_full"}` — очередь планировщика
 переполнена: путь доставки не блокируется на пушах, и лишний триггер
 отбрасывается. Устойчивый рост означает, что транспорт не справляется.
-Другие значения `reason`: `channel_closed`, `welcome_channel_full`,
-`welcome_channel_closed`.
+Другие значения `reason`:
+
+| `reason` | Что значит |
+|---|---|
+| `no_token` | У устройства нет alert-токена — будить нечем, состояние под пару не заводится. Фоновый уровень нормален: сообщения устройствам без пушей |
+| `recipient_backlog` | У одного устройства накопилось больше 64 необработанных триггеров, пока его предыдущая отправка висит. Рост — провайдер отвечает медленно |
+| `channel_closed`, `welcome_channel_full`, `welcome_channel_closed` | Планировщик остановлен или переполнен канал welcome-пушей |
+
+`push_sent_total{result}`: `ok`, `invalid_token`, `backoff`,
+`transient_error`; у ring'ов — ещё `cooldown` (подавлен окном
+`PUSH_RING_COOLDOWN_MS`). `result="no_token"` — токен исчез, пока копилось
+окно коалесинга: отправка отменена, состояние пары забыто. Одновременно к
+провайдеру идёт не больше `PUSH_SEND_CONCURRENCY` запросов.
 
 **`push_deferred_total` и `push_coalesced_total`.** Оба означают «пуш
 сейчас не ушёл», но ждут разного. Схлопнутый коалесингом уйдёт в известный

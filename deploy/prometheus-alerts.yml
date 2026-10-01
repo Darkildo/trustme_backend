@@ -99,6 +99,24 @@ groups:
             LIMIT_HANDSHAKE_INFLIGHT_PER_IP.
           runbook: docs/runbook-failure-modes.md
 
+      - alert: ConnectionLimitReached
+        # Соединения сверх LIMIT_MAX_CONNECTIONS закрываются сразу после
+        # accept, до хендшейка. Ноль — нормальное состояние: потолок
+        # (на проде 2048) с большим запасом над числом живых сессий.
+        expr: sum(rate(trust_message_tcp_connection_limit_rejected_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Нода упёрлась в потолок открытых соединений"
+          description: >-
+            Новые соединения закрываются до хендшейка, клиенты видят
+            обрыв без диагностики. Либо ноду заливают соединениями, либо
+            LIMIT_MAX_CONNECTIONS занижен под реальную нагрузку — тогда
+            поднимать его вместе с mem_limit контейнера и с запасом ниже
+            ulimit -n.
+          runbook: docs/runbook-failure-modes.md
+
       - alert: TofuShareGrowing
         # Доля подключений, доверие в которых не проверено пином.
         # 30% — под нынешний профиль, где новых установок единицы в день.
@@ -132,8 +150,9 @@ groups:
         annotations:
           summary: "Хранилище отвечает ошибками"
           description: >-
-            Диск, права или повреждение БД. Ошибка операции хранилища
-            закрывает сессию отправителя, то есть это уже видно клиентам.
+            Диск, права или повреждение БД. Это уже видно клиентам:
+            отправитель получает SendAck с INTERNAL, а сессия, чью
+            офлайн-очередь не прочитать, закрывается AuthError 503.
             Проверить место под STORAGE_PATH в первую очередь.
           runbook: docs/runbook-failure-modes.md
 
@@ -168,7 +187,7 @@ groups:
           description: >-
             Нода снимает такой конверт с потока навсегда. Означает, что в
             поток пишет кто-то ещё или что схема конверта разъехалась
-            между узлами. Каждый случай есть в логе с message_id.
+            между узлами. Каждый случай есть в логе со scope получателя.
           runbook: docs/protocol-schema.md
 
       - alert: DeliveryPumpFailing
@@ -236,6 +255,28 @@ groups:
             плодит сессии. retention_policy — сообщения отбрасываются
             политикой, и это может быть неожиданностью для отправителей.
           runbook: docs/runbook-metrics.md
+
+      - alert: RecipientQueueFull
+        # FULL получает новый конверт, когда полна очередь получателя
+        # (sled — QUOTA_*), его ящик в потоке (NATS_MAX_MSGS_PER_SUBJECT)
+        # или весь поток (NATS_STREAM_MAX_BYTES). В отличие от
+        # RejectRateHigh срабатывает на любой устойчивый FULL, а не на
+        # массовый: даже один полный ящик держится часами.
+        expr: sum(rate(trust_message_tcp_reject_total{reason="full"}[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Отправители получают FULL — очередь получателя или поток заполнены"
+          description: >-
+            Принятые конверты не теряются, отказ получают новые. В логе
+            рядом warn с текстом ошибки NATS: `maximum messages per subject
+            exceeded` — полон один ящик (получатель давно не подключался или
+            не подтверждает доставку); `maximum bytes exceeded` — полон весь
+            поток, и FULL получают все отправители: смотреть
+            `nats stream info messages` и NATS_STREAM_MAX_BYTES. На прямом
+            бэкенде — квоты QUOTA_*.
+          runbook: docs/runbook-failure-modes.md
 
       - alert: PushQueueOverflow
         expr: |
@@ -328,8 +369,9 @@ groups:
         annotations:
           summary: "На диске меньше 7% — sled рискует не записать"
           description: >-
-            Хранилище отвечает ошибками при полном диске, а ошибка
-            хранилища закрывает сессию клиента. Чистить немедленно.
+            Хранилище отвечает ошибками при полном диске: отправители
+            получают INTERNAL, офлайн-сообщения не сохраняются. Чистить
+            немедленно.
           runbook: docs/runbook-failure-modes.md
 
       - alert: DiskWillFillSoon
