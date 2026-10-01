@@ -36,7 +36,7 @@ async-nats = "0.39"                                        # клиент NATS J
 # Push: FCM HTTP v1 (OAuth2 JWT) и APNs voip (ES256 JWT); http2 обязателен
 # для APNs.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "http2"] }
-jsonwebtoken = "9"
+jsonwebtoken = "10"
 
 # Noise-транспорт, protobuf-схемы, gRPC-клиент push-шлюза
 snow = "0.10.0"
