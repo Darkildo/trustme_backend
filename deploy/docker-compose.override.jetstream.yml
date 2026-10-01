@@ -175,6 +175,9 @@ services:
       # (NATS_STREAM_MAX_BYTES выше) — то есть суточный бюджет перестаёт
       # быть ограничителем, и реальную границу держит поток.
       RATE_LIMIT_SEND_BYTES_PER_DAY: 17179869184
+      # Потолок одновременных соединений под mem_limit ниже: простаивающая
+      # сессия держит около 80 KiB буферов, 2048 сессий — около 160 MiB.
+      LIMIT_MAX_CONNECTIONS: 2048
       # FCM push: service account JSON is copied to /root/trust/secrets/ on
       # the host out-of-band (excluded from rsync to keep it out of the deploy
       # tree). Mounted read-only into the container at /secrets/fcm-sa.json.
@@ -236,6 +239,12 @@ services:
     # Лимит нужен не только против OOM: sled берёт размер своего кэша из
     # cgroup-лимита, и без него он считает своей всю память машины.
     mem_limit: 384m
+    # Дескрипторы с запасом над LIMIT_MAX_CONNECTIONS (файлы sled, NATS,
+    # исходящие HTTPS): иначе раньше потолка сработает EMFILE.
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
 
 volumes:
   nats-data:
