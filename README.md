@@ -274,3 +274,20 @@ retention или `ttlSeconds`; просроченное также отбрас�
 - [docs/runbook-metrics.md](docs/runbook-metrics.md) — метрики и алерты.
 - [docs/runbook-failure-modes.md](docs/runbook-failure-modes.md) —
   поведение при отказе брокера, диска, часов, при рестарте и за NAT.
+
+## Участие и безопасность
+
+- [CONTRIBUTING.md](CONTRIBUTING.md) — как предложить изменение; pull
+  request'ы принимаются после подписания [CLA](CLA.md).
+- [SECURITY.md](SECURITY.md) — как приватно сообщить об уязвимости.
+
+## Лицензия
+
+Source-available: [PolyForm Strict License 1.0.0](LICENSE) с дополнительными
+разрешениями из [LICENSING.md](LICENSING.md). Код можно читать, собирать и
+запускать в некоммерческих целях. Аудит безопасности разрешён всем, в том
+числе коммерческим организациям; изменения разрешены для подготовки pull
+request'ов. Коммерческое использование, производные работы и форки вне этого
+репозитория — по отдельной лицензии правообладателя.
+
+Copyright (c) 2025-2026 Requiem.

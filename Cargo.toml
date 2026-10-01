@@ -2,6 +2,9 @@
 name = "trust_message_tcp"
 version = "0.1.0"
 edition = "2024"
+license-file = "LICENSE"
+repository = "https://github.com/Darkildo/trust_message_tcp-public"
+publish = false
 
 [dependencies]
 tokio = { version = "1.49.0", features = ["full"] }        # async runtime, TcpListener/TcpStream
