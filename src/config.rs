@@ -652,20 +652,8 @@ struct RawConfig {
 }
 
 pub fn load() -> anyhow::Result<Config> {
-    let mut builder = ConfigSource::builder();
-
     let env_file = Path::new(".env");
-    if env_file.exists() {
-        builder = builder.add_source(File::new(&env_file.to_string_lossy(), FileFormat::Ini));
-    }
-
-    builder = builder.add_source(Environment::default().separator("__").try_parsing(true));
-
-    let raw: RawConfig = builder
-        .build()
-        .context("failed to build configuration sources")?
-        .try_deserialize()
-        .context("failed to deserialize configuration")?;
+    let raw = read_raw(env_file.exists().then_some(env_file), None)?;
 
     let RawConfig {
         bind_addr,
@@ -861,6 +849,42 @@ pub fn load() -> anyhow::Result<Config> {
         push,
         limits,
     })
+}
+
+/// Сырой конфиг из `.env` и окружения; окружение перекрывает файл.
+/// `env` подменяет переменные процесса (`None` — читать настоящие).
+///
+/// INI-источник config не меняет регистр ключей, и `NATS_URL` из файла не
+/// совпал бы с полем `nats_url` — значение молча ушло бы в дефолт. Поэтому
+/// пары из файла проходят через `Environment`, который приводит ключи к
+/// нижнему регистру, а значения оставляет строками, как INI.
+fn read_raw(
+    env_file: Option<&Path>,
+    env: Option<config::Map<String, String>>,
+) -> anyhow::Result<RawConfig> {
+    let mut builder = ConfigSource::builder();
+
+    if let Some(path) = env_file {
+        let pairs: config::Map<String, String> = ConfigSource::builder()
+            .add_source(File::new(&path.to_string_lossy(), FileFormat::Ini))
+            .build()
+            .and_then(ConfigSource::try_deserialize)
+            .with_context(|| format!("failed to read {}", path.display()))?;
+        builder = builder.add_source(Environment::default().source(Some(pairs)));
+    }
+
+    builder = builder.add_source(
+        Environment::default()
+            .separator("__")
+            .try_parsing(true)
+            .source(env),
+    );
+
+    builder
+        .build()
+        .context("failed to build configuration sources")?
+        .try_deserialize()
+        .context("failed to deserialize configuration")
 }
 
 fn normalize_optional_text(value: Option<String>) -> Option<String> {
@@ -1279,9 +1303,9 @@ fn check_tcp_keepalive(limits: &LimitsConfig) -> anyhow::Result<()> {
 mod tests {
     use super::{
         LimitsConfig, PushRawConfig, RetentionPolicy, check_tcp_keepalive, parse_retention_policy,
-        resolve_delivery, resolve_push,
+        read_raw, resolve_delivery, resolve_push,
     };
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     fn push_raw(enabled: bool) -> PushRawConfig {
         PushRawConfig {
@@ -1563,5 +1587,33 @@ mod tests {
                 "expected {field} complaint, got: {err}"
             );
         }
+    }
+
+    /// Ключи `.env` в верхнем регистре доходят до полей, окружение
+    /// перекрывает файл, а значения из файла разбираются в типы полей.
+    #[test]
+    fn env_file_keys_reach_fields_and_environment_wins() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("trust_message_tcp_config_{nanos}.env"));
+        std::fs::write(
+            &path,
+            "NATS_URL=nats://from-file:4222\nBIND_PORT=19000\nPUSH_ENABLED=true\n",
+        )
+        .unwrap();
+
+        let env = [("BIND_PORT", "19001")]
+            .into_iter()
+            .map(|(k, v)| (k.to_owned(), v.to_owned()))
+            .collect();
+        let raw = read_raw(Some(&path), Some(env));
+        std::fs::remove_file(&path).unwrap();
+        let raw = raw.unwrap();
+
+        assert_eq!(raw.nats_url.as_deref(), Some("nats://from-file:4222"));
+        assert_eq!(raw.bind_port, Some(19001));
+        assert_eq!(raw.push_enabled, Some(true));
     }
 }

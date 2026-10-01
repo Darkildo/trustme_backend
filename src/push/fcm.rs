@@ -881,4 +881,100 @@ mod tests {
             SendOutcome::TransientError
         ));
     }
+
+    /// Обмен на OAuth-токен: RS256-assertion, подписанный ключом service
+    /// account, уходит формой на `token_uri`. Ловит и jsonwebtoken без
+    /// бэкенда подписи (собирается, но паникует на первой подписи), и
+    /// reqwest без фичи `form`.
+    #[tokio::test]
+    async fn token_exchange_posts_rs256_assertion_signed_by_service_account() {
+        use aws_lc_rs::encoding::{AsDer, Pkcs8V1Der};
+        use aws_lc_rs::rsa::{KeyPair, KeySize};
+        use aws_lc_rs::signature::KeyPair as _;
+        use jsonwebtoken::{DecodingKey, Validation, decode};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let pair = KeyPair::generate(KeySize::Rsa2048).unwrap();
+        let pkcs8: Pkcs8V1Der = pair.as_der().unwrap();
+        let private_key = pem::encode(&pem::Pem::new("PRIVATE KEY", pkcs8.as_ref()));
+
+        // Token endpoint: принять один запрос, вернуть токен, отдать тело
+        // формы тесту.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let token_uri = format!("http://{}/token", listener.local_addr().unwrap());
+        let endpoint = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            let form = loop {
+                let n = socket.read(&mut buf).await.unwrap();
+                assert!(n > 0, "connection closed before the request body");
+                request.extend_from_slice(&buf[..n]);
+                let Some(head_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let head = String::from_utf8_lossy(&request[..head_end]).to_lowercase();
+                let body_len: usize = head
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length:"))
+                    .map_or(0, |len| len.trim().parse().unwrap());
+                let body = &request[head_end + 4..];
+                if body.len() >= body_len {
+                    break String::from_utf8(body[..body_len].to_vec()).unwrap();
+                }
+            };
+            let reply = r#"{"access_token":"ya29.test","expires_in":3600}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            form
+        });
+
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("trust_message_tcp_fcm_sa_{nanos}.json"));
+        let account = json!({
+            "client_email": "push@project.iam.gserviceaccount.com",
+            "private_key": private_key,
+            "token_uri": token_uri,
+        });
+        fs::write(&path, account.to_string()).unwrap();
+        let client =
+            FcmHttpV1Client::new("project", path.to_str().unwrap(), Duration::from_secs(5));
+        fs::remove_file(&path).unwrap();
+        let client = client.unwrap();
+
+        assert_eq!(client.bearer().await.unwrap(), "ya29.test");
+
+        let form = endpoint.await.unwrap();
+        let mut grant_type = None;
+        let mut assertion = None;
+        for pair in form.split('&') {
+            match pair.split_once('=') {
+                Some(("grant_type", value)) => grant_type = Some(value),
+                Some(("assertion", value)) => assertion = Some(value),
+                _ => {}
+            }
+        }
+        assert_eq!(
+            grant_type,
+            Some("urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer")
+        );
+
+        let mut validation = Validation::new(Algorithm::RS256);
+        validation.set_issuer(&["push@project.iam.gserviceaccount.com"]);
+        validation.set_audience(&[token_uri.as_str()]);
+        let claims = decode::<Value>(
+            assertion.expect("assertion in the form"),
+            &DecodingKey::from_rsa_der(pair.public_key().as_ref()),
+            &validation,
+        )
+        .unwrap()
+        .claims;
+        assert_eq!(claims["scope"], GOOGLE_TOKEN_SCOPE);
+    }
 }
