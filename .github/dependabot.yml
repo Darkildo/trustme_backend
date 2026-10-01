@@ -11,6 +11,8 @@ version: 2
 updates:
   - package-ecosystem: github-actions
     directory: /
+    # Разработка идёт в dev; master получает изменения вместе с релизом.
+    target-branch: dev
     schedule:
       interval: weekly
     groups:
@@ -21,6 +23,7 @@ updates:
     directories:
       - /
       - /fuzz
+    target-branch: dev
     schedule:
       interval: weekly
     groups:
