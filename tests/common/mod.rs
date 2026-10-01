@@ -104,6 +104,7 @@ pub fn test_config(storage_path: &str, limits: LimitsConfig) -> Config {
             nats_consumer_inactive_threshold: Duration::from_secs(30 * 86_400),
             nats_stream_max_age: Duration::from_secs(14 * 86_400),
             nats_stream_max_bytes: 1024 * 1024,
+            nats_max_msgs_per_subject: 10_000,
             nats_publish_timeout: Duration::from_millis(500),
         },
         push: disabled_push_config(),

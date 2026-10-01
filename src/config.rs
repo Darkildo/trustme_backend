@@ -260,10 +260,22 @@ pub struct DeliveryConfig {
     /// никто не забрал (`NATS_STREAM_MAX_AGE_DAYS`, сутки). Верхняя граница
     /// офлайн-доставки. Default: 14 суток.
     pub nats_stream_max_age: Duration,
-    /// Потолок стрима в байтах (`NATS_STREAM_MAX_BYTES`). При переполнении
-    /// JetStream вытесняет самые старые сообщения (`DiscardPolicy::Old`) —
-    /// приём новых не блокируется. Default: 350 MiB.
+    /// Потолок стрима в байтах (`NATS_STREAM_MAX_BYTES`). Поток работает по
+    /// `DiscardPolicy::New`: при переполнении отказ получает новый конверт
+    /// (отправителю — `FULL`), уже лежащие не вытесняются. Считается только
+    /// недоставленное: подтверждённый конверт нода из потока удаляет.
+    /// Default: 350 MiB.
     pub nats_stream_max_bytes: i64,
+    /// Потолок ящика получателя, конвертов (`NATS_MAX_MSGS_PER_SUBJECT`).
+    /// Ящик — subject `msg.user.<id>` (адресация на аккаунт) и каждый
+    /// `msg.user.<id>.device.<n>` по отдельности; при переполнении отказ
+    /// получает новый конверт (`FULL`), лежащие не трогаются. Считаются
+    /// только недоставленные конверты. Default: 10 000 — как
+    /// `QUOTA_MAX_MESSAGES_PER_QUEUE` прямого бэкенда.
+    ///
+    /// Без этого потолка один ящик мог бы занять весь `max_bytes` потока, и
+    /// отказ получали бы отправители всем остальным получателям.
+    pub nats_max_msgs_per_subject: i64,
     /// Сколько нода ждёт подтверждения публикации от JetStream, прежде чем
     /// считать отправку неудавшейся (`NATS_PUBLISH_TIMEOUT_MS`).
     /// Default: 2000 мс.
@@ -529,6 +541,8 @@ struct RawConfig {
     #[serde(default)]
     nats_stream_max_bytes: Option<i64>,
     #[serde(default)]
+    nats_max_msgs_per_subject: Option<i64>,
+    #[serde(default)]
     nats_publish_timeout_ms: Option<u64>,
     #[serde(default)]
     push_enabled: Option<bool>,
@@ -663,6 +677,7 @@ pub fn load() -> anyhow::Result<Config> {
         nats_consumer_inactive_threshold_days,
         nats_stream_max_age_days,
         nats_stream_max_bytes,
+        nats_max_msgs_per_subject,
         nats_publish_timeout_ms,
         push_enabled,
         push_gateway_url,
@@ -750,6 +765,7 @@ pub fn load() -> anyhow::Result<Config> {
         nats_consumer_inactive_threshold_days,
         nats_stream_max_age_days,
         nats_stream_max_bytes,
+        nats_max_msgs_per_subject,
         nats_publish_timeout_ms,
     )?;
     let push = resolve_push(PushRawConfig {
@@ -1074,6 +1090,7 @@ fn resolve_delivery(
     nats_consumer_inactive_threshold_days: Option<u64>,
     nats_stream_max_age_days: Option<u64>,
     nats_stream_max_bytes: Option<i64>,
+    nats_max_msgs_per_subject: Option<i64>,
     nats_publish_timeout_ms: Option<u64>,
 ) -> anyhow::Result<DeliveryConfig> {
     let backend = match delivery_backend
@@ -1136,6 +1153,17 @@ fn resolve_delivery(
         bail!("NATS_STREAM_MAX_BYTES must be greater than 0");
     }
 
+    // Тот же потолок, что у очереди прямого бэкенда: оба бэкенда отвечают
+    // `FULL` на одной глубине. Считаются только недоставленные конверты, и
+    // 10 000 — с большим запасом над тем, что получатель копит за `max_age`
+    // потока в обычной переписке, а ящик, забиваемый мелкими конвертами,
+    // упирается в свой потолок, не трогая остальных. «Без ограничения» не
+    // предусмотрено: тогда один ящик снова мог бы занять поток целиком.
+    let max_msgs_per_subject = nats_max_msgs_per_subject.unwrap_or(10_000);
+    if max_msgs_per_subject <= 0 {
+        bail!("NATS_MAX_MSGS_PER_SUBJECT must be greater than 0");
+    }
+
     // Две секунды — заметно меньше дефолта самого клиента NATS (~5 с) и
     // заметно больше round-trip до здорового брокера в той же сети:
     // отправитель узнаёт о мёртвом брокере за две секунды, а не за пять.
@@ -1154,6 +1182,7 @@ fn resolve_delivery(
         ),
         nats_stream_max_age: Duration::from_secs(stream_max_age_days * 24 * 60 * 60),
         nats_stream_max_bytes: stream_max_bytes,
+        nats_max_msgs_per_subject: max_msgs_per_subject,
         nats_publish_timeout: Duration::from_millis(publish_timeout_ms),
     })
 }
@@ -1347,10 +1376,12 @@ mod tests {
             max_age_days,
             max_bytes,
             None,
+            None,
         )
     }
 
-    /// Дефолты лимитов стрима (14 дней / 350 MiB) зафиксированы тестом:
+    /// Дефолты лимитов стрима (14 дней / 350 MiB / 10 000 конвертов на ящик)
+    /// зафиксированы тестом:
     /// `ensure_stream` применяет их и к уже существующему стриму, так что их
     /// смена молча переконфигурирует развёрнутые ноды при следующем деплое.
     #[test]
@@ -1358,6 +1389,7 @@ mod tests {
         let cfg = delivery(None, None, None).unwrap();
         assert_eq!(cfg.nats_stream_max_age, Duration::from_secs(14 * 24 * 3600));
         assert_eq!(cfg.nats_stream_max_bytes, 350 * 1024 * 1024);
+        assert_eq!(cfg.nats_max_msgs_per_subject, 10_000);
         assert_eq!(
             cfg.nats_consumer_inactive_threshold,
             Duration::from_secs(30 * 24 * 3600)
@@ -1374,6 +1406,7 @@ mod tests {
     fn rejects_zero_publish_timeout() {
         let err = resolve_delivery(
             Some("jetstream".to_string()),
+            None,
             None,
             None,
             None,
@@ -1401,6 +1434,30 @@ mod tests {
         // Равенство тоже отвергаем: гонка на границе даёт тот же дубль.
         assert!(delivery(Some(14), Some(14), None).is_err());
         assert!(delivery(Some(15), Some(14), None).is_ok());
+    }
+
+    /// Потолок ящика обязателен: без него один ящик снова занимал бы поток
+    /// целиком, и отказ получали бы все отправители.
+    #[test]
+    fn rejects_non_positive_mailbox_cap() {
+        let cap = |value: i64| {
+            resolve_delivery(
+                Some("jetstream".to_string()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(value),
+                None,
+            )
+        };
+        for value in [0, -1] {
+            let err = cap(value).unwrap_err().to_string();
+            assert!(err.contains("NATS_MAX_MSGS_PER_SUBJECT"), "got: {err}");
+        }
+        assert_eq!(cap(3).unwrap().nats_max_msgs_per_subject, 3);
     }
 
     #[test]

@@ -611,15 +611,35 @@ pub async fn handle_conn(
                           let message_id = match published {
                               Ok(id) => id,
                               Err(err) => {
-                                  error!(
-                                      sender = %hex::encode(user_id),
-                                      recipient = %hex::encode(recipient),
-                                      ?recipient_device_id,
-                                      size = body.len(),
-                                      error = %err,
-                                      "publish to broker failed; answering the sender with a reject"
-                                  );
-                                  reject_send(&mut framed, SendRejectReason::Internal).await?;
+                                  // Переполненный ящик или поток — штатный
+                                  // отказ новому конверту (FULL), уже лежащие
+                                  // не тронуты; всё прочее — авария ноды.
+                                  let reason = err
+                                      .downcast_ref::<crate::delivery::PublishError>()
+                                      .map_or(
+                                          SendRejectReason::Internal,
+                                          crate::delivery::PublishError::reject_reason,
+                                      );
+                                  if reason == SendRejectReason::Full {
+                                      warn!(
+                                          sender = %hex::encode(user_id),
+                                          recipient = %hex::encode(recipient),
+                                          ?recipient_device_id,
+                                          size = body.len(),
+                                          error = %err,
+                                          "recipient queue in the broker is full; answering the sender with FULL"
+                                      );
+                                  } else {
+                                      error!(
+                                          sender = %hex::encode(user_id),
+                                          recipient = %hex::encode(recipient),
+                                          ?recipient_device_id,
+                                          size = body.len(),
+                                          error = %err,
+                                          "publish to broker failed; answering the sender with a reject"
+                                      );
+                                  }
+                                  reject_send(&mut framed, reason).await?;
                                   messages_rejected += 1;
                                   continue;
                               }
