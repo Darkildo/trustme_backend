@@ -23,7 +23,8 @@ use anyhow::{Context, Result};
 use async_nats::jetstream;
 use common::{
     Incoming, encode_client_send, encode_delivery_ack, expect_auth_ok, next_frame,
-    next_incoming_within, random_identity, send_and_read_ack, spawn_jetstream_server, user_id_of,
+    next_incoming_within, random_identity, send_and_read_ack, spawn_jetstream_server,
+    spawn_jetstream_server_with_frame_max, user_id_of,
 };
 use trust_message_tcp::config::LimitsConfig;
 
@@ -162,6 +163,84 @@ async fn undecodable_envelope_does_not_wedge_the_pump() -> Result<()> {
         .await?
         .expect("нормальный конверт после неразбираемого обязан дойти");
     assert_eq!(incoming.body, b"after the poison");
+
+    Ok(())
+}
+
+/// Конверт, чей кадр доставки длиннее потолка кадра ноды, снимается с
+/// потока и не рвёт сессию получателя: следующее нормальное сообщение
+/// доходит по тому же соединению, и передоставка его не возвращает.
+///
+/// Через ноду такой конверт не проходит — тело ограничено на входе, — и
+/// поэтому публикуется в поток напрямую. Так выглядит конверт, принятый до
+/// появления этой проверки, и поток, переживший снижение `MAX_FRAME_LEN`.
+/// Раньше запись такого кадра закрывала сессию, конверт оставался
+/// неподтверждённым и приезжал снова при каждом подключении.
+#[tokio::test]
+#[ignore = "требует живого NATS с JetStream"]
+async fn oversized_envelope_does_not_disconnect_the_recipient() -> Result<()> {
+    use prost::Message;
+    use trust_message_tcp::broker::BrokerMessage;
+
+    // Потолок ниже боевого: конверт крупнее кадра обязан пролезть в
+    // `max_payload` брокера, а у nats-server по умолчанию это 1 MiB.
+    const NODE_FRAME_MAX: usize = 64 * 1024;
+
+    let server = spawn_jetstream_server_with_frame_max(
+        "js_oversized",
+        LimitsConfig::default(),
+        &nats_url(),
+        ACK_WAIT,
+        NODE_FRAME_MAX,
+    )
+    .await?;
+
+    let alice = random_identity();
+    let bob = random_identity();
+    let bob_id = user_id_of(&bob);
+
+    let mut bob_conn = common::connect(&server, &bob).await?;
+    expect_auth_ok(&next_frame(&mut bob_conn).await?, &bob_id)?;
+
+    // Тело ровно в размер потолка кадра: вместе со служебными полями
+    // `IncomingMessage` в кадр оно не помещается заведомо.
+    let mut message_id = [0u8; 8];
+    getrandom::fill(&mut message_id).expect("system randomness");
+    let oversized = BrokerMessage {
+        message_id: u64::from_le_bytes(message_id) | 1,
+        sender_user_id: user_id_of(&alice).to_vec(),
+        recipient_user_id: bob_id.to_vec(),
+        body: vec![0x42u8; NODE_FRAME_MAX],
+        created_at: common::unix_now_secs(),
+        ..BrokerMessage::default()
+    };
+    let context = jetstream::new(async_nats::connect(nats_url()).await?);
+    context
+        .publish(
+            format!("msg.user.{}", hex::encode(bob_id)),
+            oversized.encode_to_vec().into(),
+        )
+        .await?
+        .await?;
+
+    let mut alice_conn = common::connect(&server, &alice).await?;
+    expect_auth_ok(&next_frame(&mut alice_conn).await?, &user_id_of(&alice))?;
+    send_and_read_ack(&mut alice_conn, &bob_id, b"after the oversized", 0).await?;
+
+    // `next_incoming_within` падает на закрытом соединении: приход конверта
+    // сюда означает и то, что сессия получателя пережила негабаритный.
+    let incoming = next_incoming_within(&mut bob_conn, REDELIVERY_WINDOW)
+        .await?
+        .expect("нормальный конверт после негабаритного обязан дойти");
+    assert_eq!(incoming.body, b"after the oversized");
+    bob_conn
+        .send_frame(&encode_delivery_ack(incoming.message_id))
+        .await?;
+
+    // Негабаритный снят с потока, а не оставлен неподтверждённым: за окно
+    // передоставки ничего не приходит и соединение остаётся открытым.
+    let again = next_incoming_within(&mut bob_conn, SILENCE_WINDOW).await?;
+    assert!(again.is_none(), "после Term пришёл ещё конверт: {again:?}");
 
     Ok(())
 }

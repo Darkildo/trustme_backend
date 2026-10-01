@@ -17,6 +17,27 @@ use crate::wire::{self, Frame, frame};
 /// (см. `net::noise`).
 pub const PROTO_VERSION: u16 = 1;
 
+/// Запас кадра под служебные поля, байт.
+///
+/// Тело едет в двух кадрах: отправитель присылает его в `ClientSend`,
+/// получателю оно уходит в `IncomingMessage`. Тело одно, а служебные поля
+/// разные: к кадру доставки нода добавляет `proto_version`, `message_id` и
+/// `from_device_id`, за которые отправитель не платил. Без запаса
+/// `ClientSend` ровно в размер потолка превращается в `IncomingMessage`
+/// длиннее потолка: записать такой кадр получателю нельзя, а на брокерном
+/// бэкенде конверт ещё и возвращается при каждом подключении.
+///
+/// Тело не длиннее `max_frame_len - SEND_BODY_RESERVE` помещается в оба
+/// кадра при любых значениях остальных полей: худший `IncomingMessage`
+/// занимает 65 байт сверх тела, худший `ClientSend` — 121.
+pub const SEND_BODY_RESERVE: usize = 128;
+
+/// Наибольшее тело `ClientSend`, которое нода принимает при потолке кадра
+/// `max_frame_len`. Более длинное отклоняется `SendAck` с `TOO_LARGE`.
+pub fn max_send_body_len(max_frame_len: usize) -> usize {
+    max_frame_len.saturating_sub(SEND_BODY_RESERVE)
+}
+
 pub fn decode_frame(bytes: &[u8]) -> Result<Frame> {
     Frame::decode(bytes).context("decode frame")
 }
@@ -249,8 +270,9 @@ fn retention_config(policy: RetentionPolicy) -> wire::RetentionConfig {
 #[cfg(test)]
 mod tests {
     use super::{
-        PROTO_VERSION, as_fixed_32, decode_device_id, decode_frame, encode_device_id,
-        encode_incoming, encode_send_ack, encode_signed_server_config, verify_signed_server_config,
+        PROTO_VERSION, SEND_BODY_RESERVE, as_fixed_32, decode_device_id, decode_frame,
+        encode_device_id, encode_incoming, encode_send_ack, encode_signed_server_config,
+        max_send_body_len, verify_signed_server_config,
     };
     use crate::config::{RetentionPolicy, ServerConfigSnapshot};
     use crate::domain::priority::MessagePriority;
@@ -522,5 +544,94 @@ mod tests {
             SendRejectReason::from_wire(ack.reason),
             SendRejectReason::Unspecified
         );
+    }
+
+    /// Тело на границе потолка помещается в кадр доставки при худших
+    /// служебных полях: наибольший `message_id`, наибольший `deviceId`,
+    /// приоритет задан. Без запаса такой `IncomingMessage` выходил длиннее
+    /// `max_frame_len`, и запись его в сокет рвала сессию получателя.
+    #[test]
+    fn body_at_the_ceiling_fits_the_delivery_frame() {
+        for max_frame_len in [1024usize, 1024 * 1024, 8 * 1024 * 1024] {
+            let body = vec![0xABu8; max_send_body_len(max_frame_len)];
+            let frame = encode_incoming(
+                user(1),
+                Some(u16::MAX),
+                u64::MAX,
+                &body,
+                Some(MessagePriority::High),
+            );
+            assert!(
+                frame.len() <= max_frame_len,
+                "delivery frame of {} bytes exceeds max_frame_len {max_frame_len}",
+                frame.len()
+            );
+        }
+    }
+
+    /// Тот же потолок оставляет место и входящему кадру: `ClientSend` с
+    /// таким телом проходит по размеру, даже когда заполнены все поля и
+    /// каждое занимает на проводе максимум.
+    #[test]
+    fn body_at_the_ceiling_fits_the_client_send_frame() {
+        use crate::wire::{ClientSend, Frame};
+        use prost::Message;
+
+        for max_frame_len in [1024usize, 1024 * 1024, 8 * 1024 * 1024] {
+            let frame = Frame {
+                proto_version: u32::from(PROTO_VERSION),
+                payload: Some(frame::Payload::ClientSend(ClientSend {
+                    recipient_id: vec![0xFF; 32],
+                    body: vec![0xABu8; max_send_body_len(max_frame_len)],
+                    recipient_device_id: Some(u32::MAX),
+                    // Отрицательное значение enum — худший случай: int32
+                    // кодируется десятью байтами.
+                    priority: -1,
+                    wake_hint: -1,
+                    queue_id: vec![0xFF; 32],
+                    ttl_seconds: u64::MAX,
+                })),
+            }
+            .encode_to_vec();
+            assert!(
+                frame.len() <= max_frame_len,
+                "client frame of {} bytes exceeds max_frame_len {max_frame_len}",
+                frame.len()
+            );
+        }
+    }
+
+    /// Запас не взят с потолка: тело ровно в размер старого предела
+    /// (кадр `ClientSend` в точности `max_frame_len`) в кадр доставки не
+    /// помещается — именно этот случай запас и закрывает.
+    #[test]
+    fn body_filling_the_client_frame_overflows_the_delivery_frame() {
+        use crate::wire::{ClientSend, Frame};
+        use prost::Message;
+
+        let max_frame_len = 1024 * 1024;
+        // Наибольшее тело, с которым минимальный `ClientSend` (без
+        // `proto_version`, только получатель и тело) ещё укладывается в кадр.
+        let mut body_len = max_frame_len;
+        let client_frame_len = |body_len: usize| {
+            Frame {
+                proto_version: 0,
+                payload: Some(frame::Payload::ClientSend(ClientSend {
+                    recipient_id: vec![0xFF; 32],
+                    body: vec![0u8; body_len],
+                    ..ClientSend::default()
+                })),
+            }
+            .encoded_len()
+        };
+        while client_frame_len(body_len) > max_frame_len {
+            body_len -= 1;
+        }
+        assert_eq!(client_frame_len(body_len), max_frame_len);
+        assert!(body_len > max_send_body_len(max_frame_len));
+        assert!(body_len + SEND_BODY_RESERVE > max_frame_len);
+
+        let delivery = encode_incoming(user(1), None, 1, &vec![0u8; body_len], None);
+        assert!(delivery.len() > max_frame_len);
     }
 }

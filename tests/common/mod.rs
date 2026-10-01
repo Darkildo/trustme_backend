@@ -175,6 +175,23 @@ pub async fn spawn_server(label: &str, limits: LimitsConfig) -> Result<ServerHan
     spawn_node(label, limits, NodeOptions::default()).await
 }
 
+/// Внутренности ноды, до которых клиенту по проводу не дотянуться.
+///
+/// Нужны тестам состояний, в которые нода сама себя не приводит: запись в
+/// очереди или кадр в канале сессии, каких через `ClientSend` не создать.
+pub struct NodeInternals {
+    pub storage: Storage,
+    pub registry: ConnRegistry,
+}
+
+/// Нода на прямом бэкенде вместе с её хранилищем и реестром сессий.
+pub async fn spawn_server_with_internals(
+    label: &str,
+    limits: LimitsConfig,
+) -> Result<(ServerHandle, NodeInternals)> {
+    spawn_node_with_internals(label, limits, NodeOptions::default()).await
+}
+
 /// Нода с включённой адресацией по очередям. Отдельный конструктор, а не
 /// поле в `LimitsConfig`: это не лимит, а режим маршрутизации, и тесты
 /// обеих веток должны стоять рядом.
@@ -236,6 +253,31 @@ pub async fn spawn_jetstream_server(
     .await
 }
 
+/// То же, но с заданным потолком кадра ноды. Нужен тестам, которые кладут
+/// в поток конверт крупнее кадра: с боевым потолком такой конверт не
+/// пролезает в `max_payload` брокера по умолчанию (1 MiB).
+pub async fn spawn_jetstream_server_with_frame_max(
+    label: &str,
+    limits: LimitsConfig,
+    nats_url: &str,
+    ack_wait: Duration,
+    max_frame_len: usize,
+) -> Result<ServerHandle> {
+    spawn_node(
+        label,
+        limits,
+        NodeOptions {
+            jetstream: Some(JetStreamSetup {
+                nats_url: nats_url.to_string(),
+                ack_wait,
+            }),
+            max_frame_len: Some(max_frame_len),
+            ..NodeOptions::default()
+        },
+    )
+    .await
+}
+
 pub struct JetStreamSetup {
     pub nats_url: String,
     pub ack_wait: Duration,
@@ -247,6 +289,8 @@ struct NodeOptions {
     queue_addressing: bool,
     /// `Some` — push включён и отправляет в этот транспорт.
     push: Option<Arc<MockTransport>>,
+    /// `Some` — потолок кадра ноды вместо [`FRAME_MAX`].
+    max_frame_len: Option<usize>,
 }
 
 /// Имя потока общее для всех тестов: JetStream запрещает двум
@@ -260,10 +304,20 @@ async fn spawn_node(
     limits: LimitsConfig,
     options: NodeOptions,
 ) -> Result<ServerHandle> {
+    let (server, _internals) = spawn_node_with_internals(label, limits, options).await?;
+    Ok(server)
+}
+
+async fn spawn_node_with_internals(
+    label: &str,
+    limits: LimitsConfig,
+    options: NodeOptions,
+) -> Result<(ServerHandle, NodeInternals)> {
     let NodeOptions {
         jetstream,
         queue_addressing,
         push,
+        max_frame_len,
     } = options;
     let storage_path = temp_storage_path(label);
     let storage = Storage::open(
@@ -292,6 +346,9 @@ async fn spawn_node(
     let node_public = node.public();
     let mut cfg = test_config(&storage_path, limits);
     cfg.queue_addressing_enabled = queue_addressing;
+    if let Some(max_frame_len) = max_frame_len {
+        cfg.max_frame_len = max_frame_len;
+    }
     if let Some(setup) = &jetstream {
         cfg.delivery.backend = DeliveryBackendKind::JetStream;
         cfg.delivery.nats_url = setup.nats_url.clone();
@@ -313,6 +370,10 @@ async fn spawn_node(
 
     let listener = TcpListener::bind(&cfg.bind_addr).await?;
     let addr = listener.local_addr()?;
+    let internals = NodeInternals {
+        storage: storage.clone(),
+        registry: registry.clone(),
+    };
 
     tokio::spawn(accept_loop(
         listener,
@@ -325,11 +386,14 @@ async fn spawn_node(
         cfg,
     ));
 
-    Ok(ServerHandle {
-        addr,
-        node_public,
-        storage_path,
-    })
+    Ok((
+        ServerHandle {
+            addr,
+            node_public,
+            storage_path,
+        },
+        internals,
+    ))
 }
 
 /// Клиентская сторона Noise-сессии в тестах.

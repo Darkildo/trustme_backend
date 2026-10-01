@@ -26,6 +26,9 @@ pub enum SendRejectReason {
     Internal,
     /// Сессия открыта сертификатом устройства без права на отправку.
     Forbidden,
+    /// Тело не помещается в кадр доставки (`IncomingMessage`) при потолке
+    /// `max_frame_len`.
+    TooLarge,
 }
 
 impl SendRejectReason {
@@ -39,6 +42,7 @@ impl SendRejectReason {
             Self::InvalidTtl => WireSendRejectReason::InvalidTtl,
             Self::Internal => WireSendRejectReason::Internal,
             Self::Forbidden => WireSendRejectReason::Forbidden,
+            Self::TooLarge => WireSendRejectReason::TooLarge,
         };
         wire as i32
     }
@@ -54,6 +58,7 @@ impl SendRejectReason {
             Ok(WireSendRejectReason::InvalidTtl) => Self::InvalidTtl,
             Ok(WireSendRejectReason::Internal) => Self::Internal,
             Ok(WireSendRejectReason::Forbidden) => Self::Forbidden,
+            Ok(WireSendRejectReason::TooLarge) => Self::TooLarge,
             Ok(WireSendRejectReason::Unspecified) | Err(_) => Self::Unspecified,
         }
     }
@@ -69,6 +74,7 @@ impl SendRejectReason {
             Self::InvalidTtl => "invalid_ttl",
             Self::Internal => "internal",
             Self::Forbidden => "forbidden",
+            Self::TooLarge => "too_large",
         }
     }
 }
@@ -89,6 +95,7 @@ mod tests {
             SendRejectReason::InvalidTtl,
             SendRejectReason::Internal,
             SendRejectReason::Forbidden,
+            SendRejectReason::TooLarge,
         ] {
             assert_eq!(SendRejectReason::from_wire(domain.to_wire()), domain);
         }
@@ -115,6 +122,7 @@ mod tests {
         );
         assert_eq!(SendRejectReason::Internal.as_metric_label(), "internal");
         assert_eq!(SendRejectReason::Forbidden.as_metric_label(), "forbidden");
+        assert_eq!(SendRejectReason::TooLarge.as_metric_label(), "too_large");
     }
 
     #[test]

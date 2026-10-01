@@ -15,7 +15,7 @@ use crate::domain::wake::WakeHint;
 use crate::net::framing::{
     PROTO_VERSION, as_fixed_32, decode_device_id, decode_frame, encode_auth_error, encode_auth_ok,
     encode_incoming, encode_pong, encode_push_token_ack, encode_queue_ack, encode_queue_list,
-    encode_send_ack, encode_signed_server_config,
+    encode_send_ack, encode_signed_server_config, max_send_body_len,
 };
 use crate::net::noise::{HandshakePolicy, NodeIdentity, NoiseFramed};
 use crate::net::rate_limit::{AdmissionGuard, PingGate, SessionLimits, unix_now_secs};
@@ -570,6 +570,7 @@ pub async fn handle_conn(
                           body.len(),
                           ttl_seconds,
                           unix_now_secs(),
+                          max_send_body_len(framed.max_frame_len()),
                       ) {
                           warn!(
                               sender = %hex::encode(user_id),
@@ -1088,6 +1089,24 @@ pub async fn handle_conn(
                   size,
                   "forwarding envelope to recipient TCP socket"
               );
+              // Страховка: кадр длиннее потолка `send_frame` отвергает
+              // ошибкой, и раньше она закрывала сессию получателя — один
+              // негабаритный конверт рвал её при каждой доставке. Штатно
+              // такой кадр сюда не доходит: тело ограничено на входе, а
+              // пул доставки снимает негабаритный конверт с потока сам.
+              if size > framed.max_frame_len() {
+                  observability::observe_oversized_envelope("session");
+                  error!(
+                      recipient = %hex::encode(user_id),
+                      recipient_device_id = ?device_id,
+                      sender = ?sender_hex,
+                      message_id = ?outgoing.message_id,
+                      size,
+                      max_frame_len = framed.max_frame_len(),
+                      "outbound frame exceeds max_frame_len; dropped, session kept"
+                  );
+                  continue;
+              }
               if let Err(err) = framed.send_frame(&outgoing.bytes).await {
                   if is_connection_reset(&err) {
                       observability::observe_connection_reset_by_peer();
@@ -1213,10 +1232,16 @@ fn trigger_offline_pushes(
 /// Дешёвая валидация депозита до публикации. `Some(reason)` — кадр
 /// принимать нельзя, клиенту уходит `SendAck { ok: false, reason }`.
 ///
-/// Порядок проверок значим: детерминированная валидация ttl идёт перед
-/// rate-limit'ом, иначе поток заведомо невалидных кадров выжигал бы
+/// Порядок проверок значим: детерминированная валидация размера и ttl идёт
+/// перед rate-limit'ом, иначе поток заведомо невалидных кадров выжигал бы
 /// секундный и суточный бюджет пользователя (успешный `check_at` списывает
 /// бюджет, отказ — нет).
+///
+/// `max_body_len` — потолок тела (`framing::max_send_body_len`). Кадр
+/// `ClientSend` уже уложился в `max_frame_len`, иначе он не был бы
+/// прочитан; но получателю тело уходит в `IncomingMessage`, у которого
+/// служебных полей больше. Тело, не оставляющее под них места, нельзя
+/// доставить вовсе, поэтому его нельзя и принимать.
 ///
 /// `ttl_seconds == 0` — «не указан» (клиенты без node-header v3): действует
 /// только глобальная retention-политика ноды, пол не применяется.
@@ -1226,7 +1251,12 @@ fn precheck_send(
     body_len: usize,
     ttl_seconds: u64,
     now_secs: u64,
+    max_body_len: usize,
 ) -> Option<SendRejectReason> {
+    if body_len > max_body_len {
+        return Some(SendRejectReason::TooLarge);
+    }
+
     if limits.cfg.ttl_min_seconds > 0 && ttl_seconds > 0 && ttl_seconds < limits.cfg.ttl_min_seconds
     {
         return Some(SendRejectReason::InvalidTtl);
@@ -1605,6 +1635,39 @@ async fn replay_messages(
             message.priority,
         );
 
+        // Запись, которую нельзя доставить ни в одной сессии: кадр длиннее
+        // потолка. Оставить её — значит пробовать заново при каждом
+        // подключении и держать под неё квоту очереди до конца хранения.
+        // Свежие записи такими не бывают (тело ограничено на входе); эта
+        // принята раньше либо потолок кадра с тех пор снизили.
+        if frame.len() > framed.max_frame_len() {
+            observability::observe_oversized_envelope("offline_replay");
+            *messages_failed += 1;
+            error!(
+                user = %hex::encode(user_id),
+                sender = %hex::encode(message.sender_id),
+                message_id = message.id,
+                size = message.body.len(),
+                max_frame_len = framed.max_frame_len(),
+                "offline message does not fit max_frame_len; removing it from the queue"
+            );
+            let removed = match scope {
+                ReplayScope::Account => storage.remove_inbox(user_id, message.id),
+                ReplayScope::Device(device_id) => {
+                    storage.remove_device_inbox(user_id, device_id, message.id)
+                }
+            };
+            if let Err(err) = removed {
+                warn!(
+                    user = %hex::encode(user_id),
+                    message_id = message.id,
+                    error = %err,
+                    "failed to remove an undeliverable offline message"
+                );
+            }
+            continue;
+        }
+
         match framed.send_frame(&frame).await {
             Ok(_) => {
                 let remove_result = match scope {
@@ -1954,6 +2017,25 @@ mod tests {
         (storage, path)
     }
 
+    /// Тело сверх потолка отклоняется как `TooLarge`, на самом потолке
+    /// проходит. Отказ не списывает бюджет отправителя: следующая посылка
+    /// в том же окне проходит при лимите в одно сообщение в секунду.
+    #[test]
+    fn precheck_send_rejects_a_body_over_the_ceiling() {
+        let limits = limits_with(LimitsConfig {
+            send_msgs_per_sec: 1,
+            send_bytes_per_day: 0,
+            ..LimitsConfig::default()
+        });
+        let user = [3u8; 32];
+
+        assert_eq!(
+            precheck_send(&limits, &user, 101, 0, 1_000, 100),
+            Some(SendRejectReason::TooLarge)
+        );
+        assert_eq!(precheck_send(&limits, &user, 100, 0, 1_000, 100), None);
+    }
+
     /// ttl ниже пола ноды отвергается, ttl == 0 (legacy-клиент без
     /// node-header v3) проходит, ttl на самом полу проходит.
     #[test]
@@ -1967,12 +2049,21 @@ mod tests {
         let user = [1u8; 32];
 
         assert_eq!(
-            precheck_send(&limits, &user, 10, 3_600, 1_000),
+            precheck_send(&limits, &user, 10, 3_600, 1_000, usize::MAX),
             Some(SendRejectReason::InvalidTtl)
         );
-        assert_eq!(precheck_send(&limits, &user, 10, 0, 1_000), None);
-        assert_eq!(precheck_send(&limits, &user, 10, 86_400, 1_000), None);
-        assert_eq!(precheck_send(&limits, &user, 10, 172_800, 1_000), None);
+        assert_eq!(
+            precheck_send(&limits, &user, 10, 0, 1_000, usize::MAX),
+            None
+        );
+        assert_eq!(
+            precheck_send(&limits, &user, 10, 86_400, 1_000, usize::MAX),
+            None
+        );
+        assert_eq!(
+            precheck_send(&limits, &user, 10, 172_800, 1_000, usize::MAX),
+            None
+        );
     }
 
     /// Пол ttl == 0 отключает проверку целиком.
@@ -1984,7 +2075,10 @@ mod tests {
             send_bytes_per_day: 0,
             ..LimitsConfig::default()
         });
-        assert_eq!(precheck_send(&limits, &[2u8; 32], 10, 1, 1_000), None);
+        assert_eq!(
+            precheck_send(&limits, &[2u8; 32], 10, 1, 1_000, usize::MAX),
+            None
+        );
     }
 
     #[test]
@@ -1997,14 +2091,14 @@ mod tests {
         });
         let user = [3u8; 32];
 
-        assert_eq!(precheck_send(&limits, &user, 10, 0, 500), None);
-        assert_eq!(precheck_send(&limits, &user, 10, 0, 500), None);
+        assert_eq!(precheck_send(&limits, &user, 10, 0, 500, usize::MAX), None);
+        assert_eq!(precheck_send(&limits, &user, 10, 0, 500, usize::MAX), None);
         assert_eq!(
-            precheck_send(&limits, &user, 10, 0, 500),
+            precheck_send(&limits, &user, 10, 0, 500, usize::MAX),
             Some(SendRejectReason::RateLimited)
         );
         // Новое секундное окно — бюджет снова есть.
-        assert_eq!(precheck_send(&limits, &user, 10, 0, 501), None);
+        assert_eq!(precheck_send(&limits, &user, 10, 0, 501, usize::MAX), None);
     }
 
     /// Порядок проверок: невалидный ttl не должен списывать rate-бюджет,
@@ -2021,12 +2115,12 @@ mod tests {
 
         for _ in 0..5 {
             assert_eq!(
-                precheck_send(&limits, &user, 10, 60, 700),
+                precheck_send(&limits, &user, 10, 60, 700, usize::MAX),
                 Some(SendRejectReason::InvalidTtl)
             );
         }
         // Единственный слот секунды всё ещё свободен.
-        assert_eq!(precheck_send(&limits, &user, 10, 0, 700), None);
+        assert_eq!(precheck_send(&limits, &user, 10, 0, 700, usize::MAX), None);
     }
 
     #[test]
