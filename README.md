@@ -134,7 +134,8 @@ python3 scripts/coverage-gate.py coverage.json origin/master --min 70
 
 CI (`.github/workflows/`): fmt, clippy, тесты, брокерные тесты под живым
 NATS, `buf lint`/`buf breaking`, покрытие диффа, минутный фаззинг каждого
-таргета; ночной фаззинг — `nightly-fuzz.yml`. Сторонние actions
+таргета; ночной фаззинг — `nightly-fuzz.yml`; `cargo audit` по базе
+RustSec на каждом PR и раз в сутки — `audit.yml`. Сторонние actions
 закреплены SHA коммита; обновления actions и cargo-зависимостей приходят
 от dependabot pull request'ами в ветку `dev`.
 
