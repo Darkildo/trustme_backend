@@ -1,0 +1,37 @@
+// Формат конверта в брокере (JetStream). Живёт отдельно от wire-схемы: это
+// внутренний формат ноды, клиент его не видит, и номера полей
+// эволюционируют независимо от клиентского протокола.
+//
+// Изменения схемы обязаны оставаться совместимыми с конвертами, уже
+// лежащими в потоке (те же правила, что у wire-схемы: номера не
+// переиспользуются, новые поля аддитивны). Конверт, который нода не может
+// декодировать, она снимает с потока (`Term`) и учитывает в метрике
+// `trust_message_tcp_broker_decode_error_total`, а не падает; для
+// недоставленного сообщения это означает его потерю.
+
+syntax = "proto3";
+
+package trustmessage.broker.v1;
+
+import "trustmessage/wire/v1/wire.proto";
+
+message BrokerMessage {
+  // Идентификатор, выданный нодой при приёме (sled `generate_id`). По нему
+  // клиент подтверждает доставку через wire-кадр DeliveryAck.
+  uint64 message_id = 1;
+  bytes sender_user_id = 2;
+  optional uint32 sender_device_id = 3;
+  bytes recipient_user_id = 4;
+  optional uint32 recipient_device_id = 5;
+  bytes body = 6;
+  // Unix-секунды приёма конверта нодой.
+  uint64 created_at = 7;
+  trustmessage.wire.v1.MessagePriority priority = 8;
+  // Переслан из ClientSend. В sled-inbox не сохраняется: выдача устаревшего
+  // OFFER'а из офлайн-очереди не должна вызывать звонок.
+  trustmessage.wire.v1.WakeHint wake_hint = 9;
+  // `ClientSend.ttl_seconds`; 0 = не задан. На брокерном бэкенде нода
+  // значение переносит, но не применяет: срок хранения задаёт `max_age`
+  // потока.
+  uint64 ttl_seconds = 10;
+}

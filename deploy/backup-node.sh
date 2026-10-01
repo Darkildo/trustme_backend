@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Бэкап состояния ноды. Запускается вручную или по cron; run-deploy.sh
+# его в cron не ставит (почему — см. комментарий там).
+#
+# Что забирается и почему именно это:
+#   * данные sled — очереди, push-токены, реестр очередей. Восстановимо
+#     только отсюда;
+#   * `.env` рядом с compose — в нём NODE_IDENTITY_KEY. Потеря ключа
+#     отрезает всех клиентов с пином, и никакой бэкап данных этого не
+#     чинит;
+#   * каталог secrets — креды FCM/APNs.
+#
+# Данных JetStream здесь намеренно нет. Поток — транспорт с
+# ретеншном 14 суток, а не источник истины; восстанавливать недоставленное
+# из бэкапа означало бы передоставить то, что клиенты уже подтвердили.
+#
+# Бэкап пишется на тот же диск, что и данные. Это защита от «стёрли
+# каталог», а не от «умер диск». Уносить копию с машины — отдельная
+# задача, и она не решена: см. docs/deployment.md.
+#
+# Снимок берётся с живой базы, без остановки ноды. Для sled это
+# crash-consistent копия: формат журнальный, и восстановление обрезает
+# недописанный хвост ровно так же, как после внезапного выключения. То
+# есть архив равнозначен состоянию «ноду выключили из розетки в этот
+# момент» — приемлемо, но проверяется только разворачиванием, а не
+# рассуждением. Репетиция описана в docs/deployment.md.
+
+DEPLOY_DIR=${DEPLOY_DIR:-/root/trust/Trust_me_deploy}
+BACKUP_DIR=${BACKUP_DIR:-/root/trust/backups}
+SECRETS_DIR=${SECRETS_DIR:-/root/trust/secrets}
+KEEP=${KEEP:-7}
+
+stamp=$(date -u +%Y%m%d-%H%M%S)
+target="$BACKUP_DIR/node-$stamp.tgz"
+mkdir -p "$BACKUP_DIR"
+
+# Свободное место проверяется до архивации: бэкап, доевший последние
+# проценты диска, — это авария, а не страховка от неё.
+need_kb=$(du -sk "$DEPLOY_DIR/data" | cut -f1)
+free_kb=$(df -Pk "$BACKUP_DIR" | awk 'NR==2 {print $4}')
+if [ "$free_kb" -lt "$((need_kb * 2))" ]; then
+  echo "backup aborted: need ~$((need_kb / 1024)) MiB, free $((free_kb / 1024)) MiB" >&2
+  exit 1
+fi
+
+tar czf "$target" \
+  -C "$DEPLOY_DIR" data \
+  -C "$DEPLOY_DIR" .env \
+  -C "$(dirname "$SECRETS_DIR")" "$(basename "$SECRETS_DIR")"
+
+chmod 600 "$target"
+
+# Ротация: держим последние $KEEP. Без неё бэкапы и есть та самая течь,
+# от которой стоит алерт DiskWillFillSoon.
+ls -1t "$BACKUP_DIR"/node-*.tgz | tail -n +$((KEEP + 1)) | xargs -r rm -f
+
+echo "backup ok: $target ($(du -h "$target" | cut -f1))"

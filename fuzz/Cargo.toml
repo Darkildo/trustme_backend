@@ -1,0 +1,48 @@
+# Фаззинг разборщиков недоверенных байт. Отдельный крейт и отдельный
+# workspace — так требует cargo-fuzz (сборка идёт с санитайзером и на
+# nightly, и мешать это с обычной сборкой не нужно).
+[package]
+name = "trust_message_tcp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+prost = "0.14"
+
+[dependencies.trust_message_tcp]
+path = ".."
+
+[[bin]]
+name = "frame_decode"
+path = "fuzz_targets/frame_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "chunk_framing"
+path = "fuzz_targets/chunk_framing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "client_hello"
+path = "fuzz_targets/client_hello.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "signed_server_config"
+path = "fuzz_targets/signed_server_config.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]

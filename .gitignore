@@ -1,0 +1,22 @@
+/target
+/.claude
+
+# Секреты и локальное состояние ноды: ключи, креды, sled.
+/data
+/secret
+/secrets
+.env
+.env.*
+!.env.example
+*firebase-adminsdk*.json
+*.p8
+node_identity_key
+
+# Фаззинг и покрытие.
+fuzz/corpus
+fuzz/artifacts
+coverage.json
+lcov.info
+
+# Артефакт сборки: бинарь кладёт сюда build-message-runtime.sh на сервере.
+deploy/message-runtime/trust_message_tcp

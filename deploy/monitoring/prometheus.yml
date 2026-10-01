@@ -1,0 +1,36 @@
+# Конфигурация Prometheus для ноды.
+#
+# run-deploy.sh раскладывает этот файл и правила из
+# `deploy/prometheus-alerts.yml` в `$DEPLOY_DIR/monitoring/`.
+
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# Без этой секции все правила ниже — просто текст на диске.
+rule_files:
+  - /etc/prometheus/rules/prometheus-alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets:
+            - alertmanager:9093
+
+scrape_configs:
+  # Сама нода.
+  - job_name: trust-message
+    static_configs:
+      - targets:
+          - message:9000
+
+  # Хост: диск, память, swap. Без него у ноды нет ни одной метрики о
+  # железе, на котором она стоит, а закончившееся место валит её так же
+  # надёжно, как любой баг.
+  - job_name: node
+    static_configs:
+      - targets:
+          - node-exporter:9100
+
+  # Job для auth-сервиса не заведён: сервис выключен профилем
+  # `legacy-auth`, и его таргет был бы всегда down.

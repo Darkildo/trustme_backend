@@ -1,0 +1,95 @@
+# Долгий фаззинг, которому не место в PR-гейте.
+#
+# Гейт в ci.yml гоняет по минуте на таргет — это проверка «не падает на
+# первых байтах». Здесь по 20 минут с накоплением корпуса между запусками:
+# именно накопление и делает фаззинг поиском, а не лотереей.
+name: Nightly fuzz
+
+on:
+  schedule:
+    # Каждую ночь в 02:30 UTC.
+    - cron: "30 2 * * *"
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: "Минут на таргет"
+        required: false
+        default: "20"
+
+permissions:
+  contents: read
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-latest
+    strategy:
+      # Один упавший таргет не должен обрывать остальные: интересно
+      # состояние каждого.
+      fail-fast: false
+      matrix:
+        target:
+          - frame_decode
+          - chunk_framing
+          - client_hello
+          - signed_server_config
+    steps:
+      - uses: actions/checkout@v6
+
+      # Санитайзер несовместим со статически слинкованным libc — таргет
+      # задаётся явно, иначе cargo-fuzz берёт musl и не собирается.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+
+      # Корпус переживает запуски: без этого каждая ночь начинается с
+      # нуля и находит ровно то же, что вчера.
+      - name: Restore corpus
+        uses: actions/cache/restore@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: |
+            fuzz-corpus-${{ matrix.target }}-
+
+      - name: Fuzz
+        env:
+          # Ввод workflow_dispatch идёт через env, а не подстановкой в скрипт.
+          FUZZ_MINUTES: ${{ github.event.inputs.minutes || '20' }}
+        run: |
+          case "$FUZZ_MINUTES" in
+            ''|*[!0-9]*) echo "minutes must be a positive integer: $FUZZ_MINUTES"; exit 1 ;;
+          esac
+          # Первую ночь кэша ещё нет, а libFuzzer требует существующий
+          # каталог под новые входы.
+          mkdir -p "fuzz/corpus/${{ matrix.target }}"
+          cargo fuzz run --target x86_64-unknown-linux-gnu "${{ matrix.target }}" \
+            "fuzz/corpus/${{ matrix.target }}" "fuzz/seeds/${{ matrix.target }}" \
+            -- -dict=fuzz/proto.dict \
+               -max_total_time=$(( FUZZ_MINUTES * 60 )) \
+               -print_final_stats=1
+
+      # Корпус сохраняется даже после падения: вход, на котором таргет
+      # упал, для следующего прогона ценнее всего.
+      - name: Save corpus
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: fuzz/artifacts

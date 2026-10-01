@@ -1,0 +1,54 @@
+[package]
+name = "trust_message_tcp"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { version = "1.49.0", features = ["full"] }        # async runtime, TcpListener/TcpStream
+tokio-util = { version = "0.7.18", features = ["codec"] }  # LengthDelimitedCodec для кадров Noise
+bytes = "1"
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] } # identity клиента и ноды, конверсия в X25519
+sled = "0.34"                                              # локальное KV-хранилище
+dashmap = "5"                                              # конкурентные карты: реестр сессий, состояние push
+anyhow = "1.0.101"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features=["fmt","env-filter"] }
+config = "0.14"                                            # конфиг из .env и переменных окружения
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+
+# Напрямую не используется: объявлен ради фич по умолчанию (в т.ч.
+# prefer-post-quantum) у rustls, через который ходят reqwest и tonic.
+rustls = "0.23"
+
+# Метрики
+metrics = "0.24.3"
+metrics-exporter-prometheus = "0.18.1"                     # /metrics endpoint
+
+futures-util = { version = "0.3.31", features = ["sink"] } # Stream/Sink-комбинаторы (Noise-кадры, JetStream)
+async-nats = "0.39"                                        # клиент NATS JetStream (брокерный бэкенд доставки)
+
+# Push: FCM HTTP v1 (OAuth2 JWT) и APNs voip (ES256 JWT); http2 обязателен
+# для APNs.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "http2"] }
+jsonwebtoken = "9"
+
+# Noise-транспорт, protobuf-схемы, gRPC-клиент push-шлюза
+snow = "0.10.0"
+curve25519-dalek = "5.0.0"
+prost = "0.14"
+getrandom = "0.4.3"
+tonic = { version = "0.14.6", default-features = false, features = ["codegen", "channel", "tls-aws-lc", "tls-native-roots"] }
+tonic-prost = "0.14.6"
+
+[build-dependencies]
+prost-build = "0.14"
+protox = "0.9.1"
+tonic-prost-build = "0.14.6"
+
+[dev-dependencies]
+# Тесты пула доставки публикуют в поток напрямую, минуя ноду: так
+# проверяется реакция на то, чего нода сама произвести не может —
+# например, на неразбираемый конверт.
+async-nats = "0.39"

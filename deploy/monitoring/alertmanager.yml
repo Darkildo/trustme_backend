@@ -1,0 +1,41 @@
+# Маршрутизация алертов.
+#
+# По умолчанию канал доставки не задан: алерты вычисляются и видны в UI
+# Prometheus и Alertmanager, но никого не будят.
+#
+# Чтобы включить доставку, задайте в `.env` рядом с compose:
+#   ALERT_WEBHOOK_URL=https://…
+# и передеплойте — run-deploy.sh подставит его в receiver `channel`.
+# Подойдёт любой webhook-приёмник: telegram-бот через шлюз, Slack,
+# ntfy.sh, собственный обработчик.
+
+global:
+  resolve_timeout: 5m
+
+route:
+  # Группируем по имени алерта и severity: пять одинаковых срабатываний
+  # подряд — это одно событие, а не пять писем.
+  group_by: [alertname, severity]
+  group_wait: 30s
+  group_interval: 5m
+  # Критичное повторяем чаще: невидимая авария хуже назойливой.
+  repeat_interval: 4h
+  receiver: channel
+  routes:
+    - matchers:
+        - severity = "critical"
+      receiver: channel
+      repeat_interval: 1h
+
+receivers:
+  - name: channel
+    # __WEBHOOK_BLOCK__ — подставляется деплоем. Без ALERT_WEBHOOK_URL
+    # приёмник остаётся пустым: алерты видны в UI и никуда не уходят.
+
+inhibit_rules:
+  # Пока нода не отвечает на scrape, всё остальное про неё — следствие.
+  - source_matchers:
+      - alertname = "NodeDown"
+    target_matchers:
+      - severity =~ "warning|critical"
+    equal: [instance]

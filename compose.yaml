@@ -1,0 +1,40 @@
+services:
+  nats:
+    image: nats:2.10-alpine
+    command:
+      - "--jetstream"
+      - "--store_dir=/data"
+      - "--http_port=8222"
+    ports:
+      - "127.0.0.1:8222:8222"
+    volumes:
+      - nats-data:/data
+
+  message-service:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    depends_on:
+      - nats
+    environment:
+      # Ключ ноды генерируется при первом старте в STORAGE_PATH и печатается
+      # в лог как node_key=... — клиенту он нужен до подключения (Noise IK).
+      BIND_HOST: 0.0.0.0
+      BIND_PORT: 5000
+      STORAGE_PATH: /srv/trust-message/data
+      METRICS_ENABLED: "true"
+      METRICS_ADDR: 0.0.0.0:9000
+      DELIVERY_BACKEND: jetstream
+      NATS_URL: nats://nats:4222
+      NATS_STREAM_NAME: messages
+      NATS_ACK_WAIT_SECS: 30
+      NATS_PUBLISH_TIMEOUT_MS: 2000
+    ports:
+      - "5000:5000"
+      - "9000:9000"
+    volumes:
+      - message-data:/srv/trust-message/data
+
+volumes:
+  nats-data:
+  message-data:

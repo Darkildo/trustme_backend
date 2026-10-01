@@ -1,0 +1,229 @@
+# Гейты, которые обязаны держать инварианты, зафиксированные в docs/:
+# формат, отсутствие clippy-предупреждений, тесты, совместимость схемы,
+# покрытие изменённого кода и smoke-фаззинг разборщиков.
+#
+# Сборка образа живёт в docker-image.yml и здесь не дублируется.
+name: CI
+
+on:
+  push:
+    branches: ["master", "dev", "stable"]
+  pull_request:
+    branches: ["master", "dev", "stable"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  NATS_VERSION: v2.12.6
+  # SHA256 из SHA256SUMS официального релиза nats-server.
+  NATS_SHA256: 77fe7dd69ff5144126026b78355900be0ab0bb4339dc61a7621dcc9b9e9d07a6
+
+jobs:
+  check:
+    name: fmt / clippy / tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      # Базовая линия clippy — ноль предупреждений, без списка исключений.
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Tests
+        run: cargo test --all-targets
+
+  jetstream:
+    name: delivery over JetStream
+    runs-on: ubuntu-latest
+    # Брокерный тракт — единственная часть доставки, которую нельзя
+    # проверить в процессе: передоставка, снятие конверта по подтверждению
+    # и терминация неразбираемого конверта существуют только в связке с
+    # живым потоком.
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Бинарь, а не контейнер: один из тестов поднимает и убивает
+      # собственный брокер, и ему нужен исполняемый файл под рукой.
+      - name: Install NATS server
+        run: |
+          archive="nats-server-$NATS_VERSION-linux-amd64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/nats-io/nats-server/releases/download/$NATS_VERSION/$archive"
+          echo "$NATS_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/nats-bin"
+          tar xzf "$RUNNER_TEMP/$archive" --strip-components=1 -C "$RUNNER_TEMP/nats-bin" --wildcards '*/nats-server'
+          echo "$RUNNER_TEMP/nats-bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/nats-bin/nats-server" --version
+
+      - name: Start NATS with JetStream
+        run: |
+          nats-server -js -sd "$RUNNER_TEMP/nats" > "$RUNNER_TEMP/nats.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            if grep -q "Server is ready" "$RUNNER_TEMP/nats.log" 2>/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "NATS did not become ready"
+          cat "$RUNNER_TEMP/nats.log"
+          exit 1
+
+      # --test-threads=1: поток в JetStream один на все тесты (два потока
+      # не могут делить subject), параллельные прогоны спорили бы за него.
+      - name: Delivery tests
+        env:
+          TRUST_MESSAGE_TEST_NATS_URL: nats://127.0.0.1:4222
+          TRUST_MESSAGE_TEST_NATS_BIN: nats-server
+        run: cargo test --test jetstream_delivery -- --ignored --test-threads=1
+
+  schema:
+    name: buf lint / breaking
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          # buf breaking сравнивает с master — нужна история, а не срез.
+          fetch-depth: 0
+
+      - uses: bufbuild/buf-setup-action@v1
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Lint
+        working-directory: schemas
+        run: buf lint
+
+      # Переиспользованный номер поля ломает клиентов молча — единственное
+      # место, где это ловится автоматически.
+      - name: Breaking changes
+        if: github.event_name == 'pull_request'
+        working-directory: schemas
+        run: buf breaking --against '../.git#branch=master,subdir=schemas'
+
+  coverage:
+    name: coverage of changed files
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Брокерные тесты помечены `#[ignore]`, и без них замер врёт: код
+      # пула доставки выглядит непокрытым ровно потому, что проверяющие
+      # его тесты не запущены.
+      - name: Install NATS server
+        run: |
+          archive="nats-server-$NATS_VERSION-linux-amd64.tar.gz"
+          curl -sSfL -o "$RUNNER_TEMP/$archive" \
+            "https://github.com/nats-io/nats-server/releases/download/$NATS_VERSION/$archive"
+          echo "$NATS_SHA256  $RUNNER_TEMP/$archive" | sha256sum -c -
+          mkdir -p "$RUNNER_TEMP/nats-bin"
+          tar xzf "$RUNNER_TEMP/$archive" --strip-components=1 -C "$RUNNER_TEMP/nats-bin" --wildcards '*/nats-server'
+          echo "$RUNNER_TEMP/nats-bin" >> "$GITHUB_PATH"
+
+      - name: Start NATS with JetStream
+        run: |
+          nats-server -js -sd "$RUNNER_TEMP/nats" > "$RUNNER_TEMP/nats.log" 2>&1 &
+          for _ in $(seq 1 30); do
+            if grep -q "Server is ready" "$RUNNER_TEMP/nats.log" 2>/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "NATS did not become ready"
+          cat "$RUNNER_TEMP/nats.log"
+          exit 1
+
+      - name: Collect coverage
+        env:
+          TRUST_MESSAGE_TEST_NATS_URL: nats://127.0.0.1:4222
+          TRUST_MESSAGE_TEST_NATS_BIN: nats-server
+        run: |
+          cargo llvm-cov --all-targets --json --output-path coverage.json \
+            -- --include-ignored --test-threads=1
+
+      - name: Gate changed files
+        run: |
+          python3 scripts/coverage-gate.py \
+            coverage.json \
+            "origin/${{ github.base_ref }}" \
+            --min 70
+
+  fuzz:
+    name: smoke fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # Таргет задаётся явно: санитайзер несовместим со статически
+      # слинкованным libc, а cargo-fuzz на этом раннере по умолчанию
+      # берёт musl и падает на `sanitizer is incompatible with statically
+      # linked libc`.
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            fuzz
+
+      # Короткий прогон: цель не «найти всё», а не пустить в master
+      # разборщик, падающий на первых же случайных байтах. Настоящий
+      # фаззинг — долгий и живёт в nightly-fuzz.yml.
+      #
+      # fuzz/seeds — фиксированный набор валидных кадров. Он не ускоряет
+      # поиск (замерено: покрытие насыщается за секунды в обоих случаях),
+      # но делает короткий прогон детерминированным: регрессия, ломающая
+      # разбор валидного кадра, падает сразу, а не с какой-то
+      # вероятностью.
+      - name: Fuzz parsers
+        run: |
+          for target in frame_decode chunk_framing client_hello signed_server_config; do
+            echo "::group::$target"
+            # Корпус в .gitignore (он растёт и живёт в кэше), а libFuzzer
+            # требует, чтобы каталог для новых входов уже существовал.
+            mkdir -p "fuzz/corpus/$target"
+            cargo fuzz run --target x86_64-unknown-linux-gnu "$target" \
+              "fuzz/corpus/$target" "fuzz/seeds/$target" \
+              -- -dict=fuzz/proto.dict -max_total_time=60 -print_final_stats=1
+            echo "::endgroup::"
+          done
+
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts

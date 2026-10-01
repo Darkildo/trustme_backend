@@ -1,0 +1,9 @@
+# Рабочий корпус и находки фаззера — не в репозиторий.
+target
+corpus
+artifacts
+coverage
+
+# fuzz/seeds/ отслеживается: это входные данные, а не артефакты.
+# Именованные `*.bin` генерирует `cargo run --example gen_fuzz_seeds`;
+# файлы с именами-хэшами в seeds/frame_decode — минимизированный корпус.

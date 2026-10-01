@@ -1,0 +1,423 @@
+# Правила алертов для ноды trust_message_tcp.
+#
+# Подключается через `rule_files` в deploy/monitoring/prometheus.yml:
+# run-deploy.sh кладёт файл в `$DEPLOY_DIR/monitoring/`, который
+# смонтирован в контейнер Prometheus как /etc/prometheus/rules.
+#
+# Пороги подобраны под текущее развёртывание: одна нода, ~1 ГБ RAM, 1 CPU,
+# 14 ГБ диска, десятки активных пользователей. При росте профиля их надо
+# пересматривать — там, где значение зависит от масштаба, это отмечено
+# в комментарии рядом.
+#
+# После выкладки run-deploy.sh сверяет число загруженных Prometheus
+# правил с числом правил в этом файле.
+#
+# Разбор каждой метрики — docs/runbook-metrics.md.
+
+groups:
+  # ------------------------------------------------------------------
+  # Ключ ноды. Единственная авария, невидимая ни в чём другом: нода с
+  # новым ключом работает идеально и не обслуживает никого.
+  # ------------------------------------------------------------------
+  - name: trust-message-node-key
+    rules:
+      - alert: NodeKeyRegenerated
+        expr: trust_message_tcp_node_key_source{source="generated"} == 1
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Нода сгенерировала НОВЫЙ ключ — все клиенты отрезаны"
+          description: >-
+            Файла ключа не было при старте: том пересоздан или не
+            смонтирован. Клиенты, запиннутые на прежний ключ, подключиться
+            не могут, при этом все остальные графики зелёные.
+            Немедленно остановить ноду и вернуть секрет из бэкапа —
+            работа с новым ключом закрепит потерю.
+          runbook: docs/runbook-node-key.md
+
+      - alert: NodeKeyPermissionsLoose
+        expr: trust_message_tcp_node_key_permissions_ok == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Файл ключа ноды читаем не только владельцем"
+          description: >-
+            chmod 600 и разобраться, кто имел доступ. При сомнениях
+            считать утечкой и ротировать: владелец секрета может выдавать
+            себя за ноду перед клиентами со старым пином.
+          runbook: docs/runbook-node-key.md
+
+  # ------------------------------------------------------------------
+  # Вход: клиенты не могут подключиться.
+  # ------------------------------------------------------------------
+  - name: trust-message-handshake
+    rules:
+      - alert: HandshakeRejectionSpike
+        expr: |
+          sum(rate(trust_message_tcp_noise_handshake_total{result="rejected"}[5m]))
+            > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Нода отказывает клиентам на хендшейке"
+          description: >-
+            Чаще всего означает чужой или устаревший пин. Сверить node_key
+            в логе ноды с тем, что раздан клиентам, и проверить, не было
+            ли незапланированной ротации.
+          runbook: docs/runbook-node-key.md
+
+      - alert: UnsupportedProtocolVersion
+        expr: |
+          sum(rate(trust_message_tcp_noise_handshake_total{result="unsupported_version"}[15m]))
+            > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Клиенты приходят с другой версией протокола"
+          description: >-
+            Ожидаемо в окне выкатки новой версии и должно сойти на нет.
+            Устойчиво ненулевое значение = в поле остались необновлённые
+            клиенты.
+          runbook: docs/protocol-schema.md
+
+      - alert: HandshakeAdmissionRejections
+        expr: sum(rate(trust_message_tcp_handshake_admission_rejected_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Нода упёрлась в потолок входа ({{ $labels.reason }})"
+          description: >-
+            reason=global — ноду заливают либо потолок занижен.
+            reason=per_ip — либо один источник флудит, либо клиенты
+            приходят через общий NAT/балансировщик и выглядят одним
+            адресом. Второе лечится подъёмом
+            LIMIT_HANDSHAKE_INFLIGHT_PER_IP.
+          runbook: docs/runbook-failure-modes.md
+
+      - alert: TofuShareGrowing
+        # Доля подключений, доверие в которых не проверено пином.
+        # 30% — под нынешний профиль, где новых установок единицы в день.
+        # При волне регистраций (релиз, рассылка) поднимать временно, а не
+        # молча глушить правило.
+        expr: |
+          sum(rate(trust_message_tcp_noise_handshake_total{result="ok",pattern="xx"}[1h]))
+            /
+          clamp_min(sum(rate(trust_message_tcp_noise_handshake_total{result="ok"}[1h])), 0.001)
+            > 0.3
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: "Больше 30% сессий открыто без пина (TOFU)"
+          description: >-
+            На зрелом развёртывании означает, что клиенты теряют пин.
+            При волне новых установок — норма.
+          runbook: docs/runbook-node-key.md
+
+  # ------------------------------------------------------------------
+  # Хранилище и брокер.
+  # ------------------------------------------------------------------
+  - name: trust-message-storage
+    rules:
+      - alert: StorageErrors
+        expr: sum(rate(trust_message_tcp_storage_operation_total{result="error"}[5m])) > 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Хранилище отвечает ошибками"
+          description: >-
+            Диск, права или повреждение БД. Ошибка операции хранилища
+            закрывает сессию отправителя, то есть это уже видно клиентам.
+            Проверить место под STORAGE_PATH в первую очередь.
+          runbook: docs/runbook-failure-modes.md
+
+      - alert: QuotaScanSlow
+        # Скан квоты на горячем пути офлайн-депозита; его p99 растёт
+        # вместе с глубиной очередей.
+        #
+        # Экспортер отдаёт длительности как summary с готовыми
+        # квантилями, а не как histogram с бакетами, поэтому здесь
+        # обращение к метке quantile, а не histogram_quantile(): правило
+        # через *_bucket не сработало бы никогда.
+        expr: |
+          max(trust_message_tcp_storage_operation_seconds{op="scan_queue_quota",quantile="0.99"})
+            > 0.005
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Проверка квот занимает больше 5 мс (p99)"
+          description: >-
+            Чьи-то очереди подошли к потолку квоты. Само по себе не
+            авария, но горячий путь приёма замедляется — стоит посмотреть,
+            кому и почему не доставляют.
+
+      - alert: BrokerDecodeErrors
+        expr: sum(rate(trust_message_tcp_broker_decode_error_total[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Конверты в брокере не разбираются"
+          description: >-
+            Нода снимает такой конверт с потока навсегда. Означает, что в
+            поток пишет кто-то ещё или что схема конверта разъехалась
+            между узлами. Каждый случай есть в логе с message_id.
+          runbook: docs/protocol-schema.md
+
+      - alert: DeliveryPumpFailing
+        expr: sum(rate(trust_message_tcp_jetstream_pump_failed_total[10m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Пулы доставки падают — получатели теряют входящие и переподключаются"
+          description: >-
+            Нода закрывает сессии упавшего пула (pump_session_closed_total),
+            поэтому клиенты уходят на переподключение вместо тихого
+            молчания. Практически всегда означает недоступный брокер:
+            проверить NATS и reject_total{reason="internal"} рядом. Если
+            pump_session_closed_total не растёт вместе с этой метрикой —
+            известить сессии не удалось, и они молчат.
+          runbook: docs/runbook-failure-modes.md
+
+      - alert: BrokerPublishTimingOut
+        expr: sum(rate(trust_message_tcp_broker_publish_timeout_total[5m])) > 0
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Публикация в брокер не укладывается в таймаут"
+          description: >-
+            Отправители получают SendAck с INTERNAL. Брокер жив не
+            настолько, насколько считает клиент NATS: смотреть здоровье
+            JetStream и сеть до него. Если таймаут срабатывает на здоровом
+            брокере — поднять NATS_PUBLISH_TIMEOUT_MS.
+          runbook: docs/runbook-failure-modes.md
+
+      - alert: RedeliveryWithoutAcks
+        expr: |
+          sum(rate(trust_message_tcp_message_redelivered_total[15m])) > 0
+          and
+          sum(rate(trust_message_tcp_message_broker_acked_total[15m])) == 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Конверты передоставляются, но никто их не подтверждает"
+          description: >-
+            Клиенты получают сообщения и не шлют DeliveryAck. Либо баг
+            клиента, либо он отваливается до подтверждения.
+
+  # ------------------------------------------------------------------
+  # Отказы приёма и пуши.
+  # ------------------------------------------------------------------
+  - name: trust-message-rejects
+    rules:
+      - alert: RejectRateHigh
+        # Ноль — нормальное состояние. 0.5 отказа в секунду за десять минут
+        # (≈300 отказов) при десятках активных пользователей означает, что
+        # кто-то упёрся в квоту всерьёз, а не разово промахнулся с ttl.
+        expr: sum(rate(trust_message_tcp_reject_total[10m])) > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Нода массово отказывает в приёме ({{ $labels.reason }})"
+          description: >-
+            rate_limited/full — кто-то упёрся в квоты: либо флуд, либо
+            лимит занижен под реальный профиль. session_limit — клиент
+            плодит сессии. retention_policy — сообщения отбрасываются
+            политикой, и это может быть неожиданностью для отправителей.
+          runbook: docs/runbook-metrics.md
+
+      - alert: PushQueueOverflow
+        expr: |
+          sum(rate(trust_message_tcp_push_dropped_total{reason="channel_full"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Очередь push-планировщика переполняется"
+          description: >-
+            Горячий путь доставки не блокируется на пушах, поэтому лишние
+            триггеры отбрасываются. Устойчивый рост означает, что
+            транспорт пушей не справляется — офлайн-получателей перестают
+            будить.
+
+      - alert: PushSendFailing
+        # Смотрим на положительное свидетельство поломки — долю попыток,
+        # закончившихся backoff'ом или сетевой ошибкой, — а не на
+        # отсутствие пушей: на малотрафикой ноде «кто-то ждёт, а пушей нет»
+        # неотличимо от тихой ночи. clamp_min в знаменателе — чтобы в
+        # тихий час не делить на ноль.
+        expr: |
+          sum(rate(trust_message_tcp_push_sent_total{result=~"backoff|transient_error"}[15m]))
+            /
+          clamp_min(sum(rate(trust_message_tcp_push_sent_total[15m])), 0.001)
+            > 0.5
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Больше половины пушей не доходит до провайдера"
+          description: >-
+            backoff — провайдер отвечает 5xx или квотой; transient_error —
+            сеть, таймаут, TLS. Если нода работает через шлюз
+            (PUSH_GATEWAY_URL), проверять сначала его: транспортный сбой
+            шлюза выглядит здесь точно так же. Токены при этом не
+            вычищаются: эвикция только по invalid_token.
+          runbook: docs/runbook-metrics.md
+
+      - alert: PushTokensDyingEnMasse
+        # Массовая эвикция токенов означает не отток пользователей, а
+        # разъехавшуюся конфигурацию: чужой FCM-проект, sandbox-токены на
+        # production-эндпоинте APNs, сменившийся bundle id. По одному
+        # токену это норма и шума не создаёт.
+        expr: sum(rate(trust_message_tcp_push_token_removed_total[1h])) > 0.01
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Токены снимаются пачками — похоже на конфигурацию, а не на отток"
+          description: >-
+            Больше ~36 снятых токенов в час. Сверить FCM_PROJECT_ID,
+            APNS_BUNDLE_ID и APNS_ENVIRONMENT с тем, чем подписаны
+            клиентские сборки.
+          runbook: docs/runbook-metrics.md
+
+  # ------------------------------------------------------------------
+  # Железо под нодой. Метрики даёт node-exporter; без него эта группа
+  # молчит всегда — проверять надо не отсутствие алертов, а наличие
+  # таргета `node` в /targets.
+  # ------------------------------------------------------------------
+  - name: trust-message-host
+    rules:
+      - alert: DiskSpaceLow
+        expr: |
+          node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}
+            / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}
+            < 0.15
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "На диске меньше 15% свободного места"
+          description: >-
+            Обычные едоки: слои docker, инкрементальные артефакты сборки в
+            tcp_message_server/target, json-логи контейнеров, том nats-data
+            под потоком JetStream. `docker system df`, `du -sh /root/trust/*`
+            и `docker system df -v | grep nats-data` показывают, кто именно.
+            Кончившееся место валит и сборку, и sled.
+          runbook: docs/runbook-failure-modes.md
+
+      - alert: DiskSpaceCritical
+        expr: |
+          node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}
+            / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}
+            < 0.07
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "На диске меньше 7% — sled рискует не записать"
+          description: >-
+            Хранилище отвечает ошибками при полном диске, а ошибка
+            хранилища закрывает сессию клиента. Чистить немедленно.
+          runbook: docs/runbook-failure-modes.md
+
+      - alert: DiskWillFillSoon
+        # Второе условие обязательно. Предсказание по короткому окну
+        # срабатывает на любом всплеске записи — например, на слоях docker
+        # во время сборки, — и без ограничения «запас уже невелик» правило
+        # кричало бы после каждого деплоя при десяти свободных гигабайтах.
+        expr: |
+          predict_linear(
+            node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}[6h],
+            24 * 3600
+          ) < 0
+          and
+          node_filesystem_avail_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}
+            / node_filesystem_size_bytes{mountpoint="/",fstype!~"tmpfs|overlay"}
+            < 0.30
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Диск заполнится в ближайшие сутки при нынешнем темпе"
+          description: >-
+            Предсказание по шести часам: ловит медленную течь (логи без
+            ротации, растущая очередь) до того, как она станет аварией.
+
+      - alert: MemoryPressure
+        # Машина маленькая (~1 ГБ), поэтому смотрим на available, а не на
+        # used: страничный кэш занимает почти всё и это нормально.
+        expr: |
+          node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.10
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Меньше 10% доступной памяти"
+          description: >-
+            Следующий шаг — OOM-killer, и он выберет процесс сам. У ноды
+            задан mem_limit, поэтому под лимит она уйдёт первой; проверить
+            `docker stats` и не растёт ли кэш sled.
+
+      - alert: SwapThrashing
+        # Порог поставлен по измерению, а не наугад: сборка ноды идёт на
+        # этой же машине и штатно даёт ~200 страниц/с обмена. Правило с
+        # порогом 100 срабатывало бы на каждом деплое.
+        #
+        # 1000 страниц/с (≈4 МБ/с), держащиеся час, — это уже не сборка, а
+        # нехватка памяти в рабочем режиме. Второе условие отсекает случай
+        # «swap занят, но памяти хватает»: сам по себе занятый swap аварией
+        # не является.
+        expr: |
+          rate(node_vmstat_pswpin[15m]) + rate(node_vmstat_pswpout[15m]) > 1000
+          and
+          node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes < 0.20
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Устойчивый обмен со swap при нехватке памяти"
+          description: >-
+            Swap как буфер — нормально, swap как рабочий режим — нет: на
+            одном CPU это превращает latency ноды в лотерею. Смотреть
+            `docker stats` и не растёт ли кэш sled — он берёт размер из
+            cgroup-лимита контейнера.
+
+  # ------------------------------------------------------------------
+  # Живость процесса.
+  # ------------------------------------------------------------------
+  - name: trust-message-process
+    rules:
+      - alert: NodeDown
+        # Имя job'а — из deploy/monitoring/prometheus.yml. Если правило и
+        # конфиг разъедутся, алерт станет вечно-зелёным, что хуже, чем
+        # вечно-красным: тишина читается как «всё хорошо».
+        expr: up{job="trust-message"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Нода не отвечает на scrape"
+
+      - alert: NodeRestartLoop
+        expr: increase(trust_message_tcp_process_start_total[15m]) > 3
+        labels:
+          severity: critical
+        annotations:
+          summary: "Нода перезапускается по кругу"
+          description: >-
+            Больше трёх стартов за 15 минут. Частая причина — брокер
+            недоступен: в jetstream-режиме нода намеренно не поднимается
+            без него.
+          runbook: docs/runbook-failure-modes.md

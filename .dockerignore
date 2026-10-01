@@ -1,0 +1,22 @@
+target
+.git
+.gitignore
+**/*.rs.bk
+**/*.swp
+**/*.swo
+
+# Секреты и локальное состояние не должны попадать в build context.
+data
+secret
+secrets
+.env
+.env.*
+.claude
+**/*.p8
+**/*firebase-adminsdk*.json
+**/node_identity_key
+
+# Не нужны сборке образа.
+fuzz/target
+fuzz/corpus
+fuzz/artifacts
