@@ -461,6 +461,9 @@ pub struct JetStreamBackend {
     stream_max_bytes: i64,
     max_messages_per_subject: i64,
     publish_timeout: Duration,
+    /// Потолок логического кадра сессии (`Config::max_frame_len`): конверт,
+    /// чей `IncomingMessage` длиннее, доставить нельзя ни одной сессии.
+    max_frame_len: usize,
     inflight: Arc<DashMap<u64, InflightDelivery>>,
     pumps: Arc<PumpTable>,
     push_tokens: PushTokenStore,
@@ -510,6 +513,7 @@ impl DeliveryBackend {
                     stream_max_bytes: cfg.delivery.nats_stream_max_bytes,
                     max_messages_per_subject: cfg.delivery.nats_max_msgs_per_subject,
                     publish_timeout: cfg.delivery.nats_publish_timeout,
+                    max_frame_len: cfg.max_frame_len,
                     inflight: Arc::new(DashMap::new()),
                     pumps: Arc::new(PumpTable::default()),
                     push_tokens,
@@ -1012,22 +1016,42 @@ impl JetStreamBackend {
                         error = %err,
                         "undecodable envelope in the stream; terminating it"
                     );
-                    let sequence = message.info().ok().map(|info| info.stream_sequence);
-                    match message.ack_with(AckKind::Term).await {
-                        Ok(()) => {
-                            if let Some(sequence) = sequence {
-                                self.forget_delivered(scope, sequence);
-                            }
-                        }
-                        Err(term_err) => warn!(
-                            scope = %scope.key(),
-                            error = %term_err,
-                            "failed to terminate an undecodable envelope; it will be redelivered"
-                        ),
-                    }
+                    self.terminate_envelope(scope, &message).await;
                     continue;
                 }
             };
+
+            // Кадр доставки собирается до маршрутизации: конверт, который
+            // не помещается в `max_frame_len`, нельзя записать ни в одну
+            // сессию. Раньше запись такого кадра рвала сессию получателя,
+            // конверт оставался неподтверждённым и приезжал снова при
+            // каждом подключении — получатель не мог удержать сессию до
+            // `max_age` потока. Поэтому он снимается с потока так же, как
+            // неразбираемый, и никого не будит. Свежие конверты такими не
+            // бывают: тело ограничено на входе (`max_send_body_len`).
+            let frame_bytes = encode_incoming(
+                payload.sender_user_id,
+                payload.sender_device_id,
+                payload.message_id,
+                &payload.body,
+                payload.priority,
+            );
+            if frame_bytes.len() > self.max_frame_len {
+                observability::observe_oversized_envelope("broker");
+                error!(
+                    scope = %scope.key(),
+                    message_id = payload.message_id,
+                    sender = %hex::encode(payload.sender_user_id),
+                    recipient = %hex::encode(payload.recipient_user_id),
+                    recipient_device_id = ?payload.recipient_device_id,
+                    size = payload.body.len(),
+                    frame_len = frame_bytes.len(),
+                    max_frame_len = self.max_frame_len,
+                    "envelope does not fit max_frame_len; terminating it"
+                );
+                self.terminate_envelope(scope, &message).await;
+                continue;
+            }
 
             debug!(
                 scope = %scope.key(),
@@ -1090,13 +1114,7 @@ impl JetStreamBackend {
             );
 
             let outgoing = OutboundFrame {
-                bytes: encode_incoming(
-                    payload.sender_user_id,
-                    payload.sender_device_id,
-                    payload.message_id,
-                    &payload.body,
-                    payload.priority,
-                ),
+                bytes: frame_bytes,
                 message_id: Some(payload.message_id),
                 close_after_send: false,
                 sender_user_id: Some(payload.sender_user_id),
@@ -1327,6 +1345,26 @@ impl JetStreamBackend {
             }
         }
         Ok(acked)
+    }
+
+    /// Снять конверт с потока навсегда (`Term`) и удалить запись. Для
+    /// конвертов, которые нельзя доставить вовсе — неразбираемых и не
+    /// помещающихся в кадр: неподтверждённым такой конверт возвращался бы
+    /// при каждой выдаче.
+    async fn terminate_envelope(&self, scope: DeliveryScope, message: &jetstream::Message) {
+        let sequence = message.info().ok().map(|info| info.stream_sequence);
+        match message.ack_with(AckKind::Term).await {
+            Ok(()) => {
+                if let Some(sequence) = sequence {
+                    self.forget_delivered(scope, sequence);
+                }
+            }
+            Err(term_err) => warn!(
+                scope = %scope.key(),
+                error = %term_err,
+                "failed to terminate an undeliverable envelope; it will be redelivered"
+            ),
+        }
     }
 
     /// Удалить из потока конверт, который больше никому не нужен:

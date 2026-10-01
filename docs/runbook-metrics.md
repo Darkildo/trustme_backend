@@ -117,6 +117,7 @@ rate(handshake_admission_rejected_total[5m]) > 0
 |---|---|---|
 | `full` | `SendAck` c `FULL` | Прямой бэкенд — квота очереди получателя. Брокерный — заполнен ящик получателя (`NATS_MAX_MSGS_PER_SUBJECT`) или весь поток (`NATS_STREAM_MAX_BYTES`); в логе warn `recipient queue in the broker is full; answering the sender with FULL` |
 | `rate_limited` | `SendAck` c `RATE_LIMITED` | Лимит msg/s или байт/сутки |
+| `too_large` | `SendAck` c `TOO_LARGE` | Тело длиннее `MAX_FRAME_LEN − 128` байт. Постоянный рост — клиент режет медиа на куски крупнее потолка ноды |
 | `invalid_ttl` | `SendAck` c `INVALID_TTL` | ttl ниже пола ноды |
 | `no_permit` | `SendAck` c `NO_PERMIT` | Депозит в неизвестную или отозванную очередь (только при `QUEUE_ADDRESSING_ENABLED=true`) |
 | `forbidden` | `SendAck` c `FORBIDDEN` | Сессия по сертификату устройства без права отправки |
@@ -178,6 +179,7 @@ exceeded` — заполнен один ящик, отказ получают т
 | `message_broker_acked_total` | — | Подтверждённые доставки (по `DeliveryAck` клиента) |
 | `message_redelivered_total` | — | Передоставки после ack-таймаута |
 | `broker_decode_error_total` | `scope` | Конверт снят с потока: разобрать нельзя |
+| `oversized_envelope_total` | `path` | Конверт снят, не доставлен: его кадр длиннее `MAX_FRAME_LEN`. `path`: `broker` — с потока, `offline_replay` — из офлайн-очереди прямого бэкенда, `session` — отброшен в канале сессии |
 | `jetstream_no_targets_total` | `scope` | Конверт пришёл, а получателя уже нет онлайн |
 | `jetstream_pump_failed_total` | `scope` | Пул доставки упал |
 | `jetstream_pump_revived_total` | `scope` | Пул доставки поднят заново |
@@ -187,6 +189,14 @@ exceeded` — заполнен один ящик, отказ получают т
 
 Ненулевой `broker_decode_error_total` означает, что в поток пишет кто-то
 ещё или что схема конверта разъехалась между узлами.
+
+Ненулевой `oversized_envelope_total` — это потерянные сообщения: конверт
+удалён, получатель его не увидит. Свежие конверты сюда не попадают — тело
+сверх потолка нода отклоняет отправителю (`reject_total{reason="too_large"}`).
+Причины: `MAX_FRAME_LEN` снизили при непустом хранилище; конверт принят
+нодой версии 0.2.1 или раньше; в поток пишет кто-то в обход ноды. В логе —
+error `envelope does not fit max_frame_len; terminating it` с отправителем,
+получателем и размером. `path="session"` штатно не срабатывает вовсе.
 
 Рост `message_redelivered_total` без роста `message_broker_acked_total` —
 клиенты получают конверты, но не подтверждают их. Неподтверждённые
