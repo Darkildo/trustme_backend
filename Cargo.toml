@@ -1,6 +1,6 @@
 [package]
 name = "trust_message_tcp"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/Darkildo/trustme_backend"
