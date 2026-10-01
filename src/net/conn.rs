@@ -1760,6 +1760,7 @@ mod tests {
             suppress_initial: Duration::from_secs(1),
             suppress_max: Duration::from_secs(8),
             channel_capacity: 64,
+            send_concurrency: crate::push::DEFAULT_SEND_CONCURRENCY,
             apns: None,
             ring_cooldown: Duration::from_secs(3),
         }

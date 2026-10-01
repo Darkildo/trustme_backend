@@ -94,7 +94,7 @@ type RecipientKey = (UserId, DeviceId);
 /// запросе, переставал разбирать канал, тот заполнялся — и отбрасывались
 /// триггеры всех получателей, а не только тех, чья отправка висела. 32
 /// запроса помещаются в одно HTTP/2-соединение и к FCM, и к APNs.
-const DEFAULT_SEND_CONCURRENCY: usize = 32;
+pub const DEFAULT_SEND_CONCURRENCY: usize = 32;
 
 /// Сколько триггеров одного получателя могут ждать, пока обрабатывается
 /// предыдущий. Сверх этого триггеры отбрасываются
@@ -200,14 +200,8 @@ impl PushScheduler {
         S: TokenStore,
         V: VoipRingTransport,
     {
-        Self::spawn(
-            cfg,
-            transport,
-            tokens,
-            persistence,
-            voip,
-            DEFAULT_SEND_CONCURRENCY,
-        )
+        let send_concurrency = cfg.send_concurrency;
+        Self::spawn(cfg, transport, tokens, persistence, voip, send_concurrency)
     }
 
     fn spawn<T, S, V>(
@@ -1019,6 +1013,7 @@ mod integration_tests {
             suppress_initial: Duration::from_secs(1),
             suppress_max: Duration::from_secs(8),
             channel_capacity: 64,
+            send_concurrency: crate::push::DEFAULT_SEND_CONCURRENCY,
             apns: None,
             ring_cooldown: Duration::from_secs(3),
         }

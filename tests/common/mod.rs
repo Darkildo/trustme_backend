@@ -58,6 +58,7 @@ pub fn disabled_push_config() -> PushConfig {
         suppress_initial: Duration::from_secs(30),
         suppress_max: Duration::from_secs(3600),
         channel_capacity: 64,
+        send_concurrency: trust_message_tcp::push::DEFAULT_SEND_CONCURRENCY,
         apns: None,
         ring_cooldown: Duration::from_secs(3),
     }

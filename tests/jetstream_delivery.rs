@@ -384,14 +384,14 @@ mod broker_guarantees {
     use ed25519_dalek::SigningKey;
     use futures_util::StreamExt;
     use prost::Message;
-    use tokio::net::{TcpListener, TcpStream};
+    use tokio::net::TcpListener;
     use trust_message_tcp::config::{Config, DeliveryBackendKind, LimitsConfig, RetentionPolicy};
     use trust_message_tcp::delivery::DeliveryBackend;
     use trust_message_tcp::domain::push::PushPlatform;
     use trust_message_tcp::domain::reject::SendRejectReason;
     use trust_message_tcp::domain::wake::WakeHint;
     use trust_message_tcp::net::listener::accept_loop;
-    use trust_message_tcp::net::noise::{NodeIdentity, NoiseFramed};
+    use trust_message_tcp::net::noise::NodeIdentity;
     use trust_message_tcp::push::{MockTransport, NoopStatePersistence, PushScheduler};
     use trust_message_tcp::state::push_tokens::PushTokenStore;
     use trust_message_tcp::state::{registry::ConnRegistry, storage::Storage};
@@ -576,7 +576,7 @@ mod broker_guarantees {
         node: &Node,
         identity: &SigningKey,
         device_id: Option<u16>,
-    ) -> Result<(NoiseFramed<TcpStream>, Vec<Incoming>)> {
+    ) -> Result<(common::Conn, Vec<Incoming>)> {
         let mut conn =
             common::connect_as(&node.handle, identity, device_id, common::FRAME_MAX).await?;
         conn.send_frame(&frame(Payload::Ping(wire::Ping {})))
@@ -604,7 +604,7 @@ mod broker_guarantees {
 
     /// Дочитать входящие до `count` штук.
     async fn collect_incoming(
-        conn: &mut NoiseFramed<TcpStream>,
+        conn: &mut common::Conn,
         mut received: Vec<Incoming>,
         count: usize,
     ) -> Result<Vec<Incoming>> {
@@ -618,7 +618,7 @@ mod broker_guarantees {
     }
 
     async fn send(
-        conn: &mut NoiseFramed<TcpStream>,
+        conn: &mut common::Conn,
         recipient: &[u8; 32],
         device_id: Option<u16>,
         body: &[u8],
@@ -635,7 +635,7 @@ mod broker_guarantees {
     }
 
     async fn send_with(
-        conn: &mut NoiseFramed<TcpStream>,
+        conn: &mut common::Conn,
         recipient: &[u8; 32],
         device_id: Option<u16>,
         body: &[u8],

@@ -392,6 +392,11 @@ pub struct PushConfig {
     /// path is never blocked. Default: 8192.
     pub channel_capacity: usize,
 
+    /// Upper bound on concurrent requests to the push provider
+    /// (`PUSH_SEND_CONCURRENCY`), in requests. Sends to one device stay
+    /// sequential; the bound applies across devices. Default: 32.
+    pub send_concurrency: usize,
+
     /// APNs voip (PushKit ring) — `None` = voip выключен, ring-конверты идут
     /// обычным FCM-wake путём. Включается `APNS_ENABLED=true` плюс
     /// `APNS_KEY_PATH`, `APNS_KEY_ID`, `APNS_TEAM_ID`, `APNS_BUNDLE_ID`.
@@ -581,6 +586,8 @@ struct RawConfig {
     #[serde(default)]
     push_channel_capacity: Option<usize>,
     #[serde(default)]
+    push_send_concurrency: Option<usize>,
+    #[serde(default)]
     apns_enabled: Option<bool>,
     #[serde(default)]
     apns_key_path: Option<String>,
@@ -697,6 +704,7 @@ pub fn load() -> anyhow::Result<Config> {
         push_suppress_initial_ms,
         push_suppress_max_ms,
         push_channel_capacity,
+        push_send_concurrency,
         apns_enabled,
         apns_key_path,
         apns_key_id,
@@ -787,6 +795,7 @@ pub fn load() -> anyhow::Result<Config> {
         suppress_initial_ms: push_suppress_initial_ms,
         suppress_max_ms: push_suppress_max_ms,
         channel_capacity: push_channel_capacity,
+        send_concurrency: push_send_concurrency,
         apns_enabled,
         apns_key_path,
         apns_key_id,
@@ -945,6 +954,7 @@ struct PushRawConfig {
     suppress_initial_ms: Option<u64>,
     suppress_max_ms: Option<u64>,
     channel_capacity: Option<usize>,
+    send_concurrency: Option<usize>,
     apns_enabled: Option<bool>,
     apns_key_path: Option<String>,
     apns_key_id: Option<String>,
@@ -1024,6 +1034,10 @@ fn resolve_push(raw: PushRawConfig) -> anyhow::Result<PushConfig> {
     }
 
     let channel_capacity = raw.channel_capacity.unwrap_or(8192).max(1);
+    let send_concurrency = raw
+        .send_concurrency
+        .unwrap_or(crate::push::DEFAULT_SEND_CONCURRENCY)
+        .max(1);
 
     let apns_enabled = raw.apns_enabled.unwrap_or(false);
     let apns = if apns_enabled {
@@ -1069,6 +1083,7 @@ fn resolve_push(raw: PushRawConfig) -> anyhow::Result<PushConfig> {
         suppress_initial,
         suppress_max,
         channel_capacity,
+        send_concurrency,
         apns,
         ring_cooldown,
     })
@@ -1288,6 +1303,7 @@ mod tests {
             suppress_initial_ms: None,
             suppress_max_ms: None,
             channel_capacity: None,
+            send_concurrency: None,
             apns_enabled: None,
             apns_key_path: None,
             apns_key_id: None,
