@@ -85,6 +85,27 @@ impl PushStateStore {
         }
     }
 
+    /// Delete the row for `(user, device)`. Missing rows are not an error.
+    pub fn delete(&self, user: &UserId, device: DeviceId) -> Result<()> {
+        self.tree
+            .remove(make_key(user, device))
+            .context("failed to delete push state row")?;
+        Ok(())
+    }
+
+    /// Best-effort delete. A row that survives a sled error is harmless: the
+    /// scheduler drops idle and token-less rows again on the next startup.
+    pub fn delete_lossy(&self, user: &UserId, device: DeviceId) {
+        if let Err(err) = self.delete(user, device) {
+            warn!(
+                user = %hex::encode(user),
+                device,
+                error = %err,
+                "push state delete failed"
+            );
+        }
+    }
+
     /// Every persisted row, read at startup to seed the in-memory cache.
     /// Malformed rows are logged and skipped.
     pub fn iter_all(&self) -> Vec<((UserId, DeviceId), PushState)> {
@@ -124,6 +145,9 @@ impl crate::push::PushStatePersistence for PushStateStore {
     }
     fn save(&self, user: UserId, device: DeviceId, state: &PushState) {
         self.store_lossy(&user, device, *state);
+    }
+    fn remove(&self, user: UserId, device: DeviceId) {
+        self.delete_lossy(&user, device);
     }
 }
 
@@ -250,6 +274,34 @@ mod tests {
 
         assert_eq!(store.load(&user(1), 1).unwrap().unwrap(), s1);
         assert_eq!(store.load(&user(2), 1).unwrap().unwrap(), s2);
+        drop(db);
+        let _ = fs::remove_dir_all(&path);
+    }
+
+    /// Удаление через трейт планировщика убирает строку и из `iter_all`:
+    /// иначе вычищенное в памяти возвращалось бы гидрацией после рестарта.
+    #[test]
+    fn remove_through_the_trait_deletes_the_row() {
+        use crate::push::PushStatePersistence as _;
+
+        let path = temp_path("remove");
+        let db = sled::open(&path).unwrap();
+        let store = PushStateStore::open(&db).unwrap();
+
+        let state = PushState {
+            pending_since_last_push: 1,
+            ..PushState::default()
+        };
+        store.save(user(1), 1, &state);
+        store.save(user(1), 2, &state);
+
+        store.remove(user(1), 1);
+        // Повторное удаление и удаление несуществующего — не ошибка.
+        store.remove(user(1), 1);
+        store.delete(&user(9), 9).unwrap();
+
+        assert!(store.load(&user(1), 1).unwrap().is_none());
+        assert_eq!(store.load_all(), vec![((user(1), 2), state)]);
         drop(db);
         let _ = fs::remove_dir_all(&path);
     }

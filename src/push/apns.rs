@@ -16,7 +16,10 @@
 //!   `DeviceTokenNotForTopic` → `InvalidToken` (scheduler эвиктит voip-слот)
 //! - 429 `TooManyRequests` → `Backoff(Quota)`
 //! - 503 → `Backoff(Unavailable)`, прочие 5xx → `Backoff(ServerError)`
-//! - 403 (протух/битый provider token) → инвалидация JWT-кэша + `TransientError`
+//! - 403 `ExpiredProviderToken` / `InvalidProviderToken` → `TransientError` и
+//!   сброс JWT-кэша, но не чаще раза в 20 минут; прочие 403 (сертификат,
+//!   окружение, `Forbidden`) → `TransientError` без сброса: новый токен их не
+//!   лечит, а частый перевыпуск APNs карает `TooManyProviderTokenUpdates`
 //! - сеть / таймаут / неожиданный статус → `TransientError`
 //!
 //! Ретраев внутри клиента нет: неудавшийся ring scheduler отправляет обычным
@@ -35,10 +38,16 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
-use crate::push::transport::{BackoffReason, RingPayload, SendOutcome, VoipRingTransport};
+use crate::push::transport::{
+    BackoffReason, RingPayload, SendOutcome, VoipRingTransport, loggable,
+};
 
 /// APNs принимает provider-токены возрастом до часа; обновляем заранее.
 const PROVIDER_TOKEN_TTL: Duration = Duration::from_secs(50 * 60);
+
+/// Перевыпуск provider-токена чаще раза в 20 минут APNs отвергает
+/// (`TooManyProviderTokenUpdates`).
+const MIN_PROVIDER_TOKEN_REFRESH: Duration = Duration::from_secs(20 * 60);
 
 /// Звонок протухает быстро: если устройство недоступно дольше ring-окна,
 /// доставлять voip-пуш уже вредно (phantom-ring на давно отменённый звонок).
@@ -86,12 +95,53 @@ struct Inner {
     /// `apns-topic` для voip-пушей: `<bundle-id>.voip`.
     voip_topic: String,
     host: String,
-    provider_token: Mutex<Option<CachedToken>>,
+    provider_token: Mutex<ProviderTokenCache>,
 }
 
 struct CachedToken {
     jwt: String,
     minted_at: Instant,
+}
+
+/// Кэш provider-токена. Вынесен в отдельный тип, чтобы правила перевыпуска
+/// проверялись без ключа и сети.
+#[derive(Default)]
+struct ProviderTokenCache {
+    cached: Option<CachedToken>,
+}
+
+impl ProviderTokenCache {
+    /// Закэшированный токен, если он ещё не подошёл к пределу жизни.
+    fn fresh(&self, now: Instant) -> Option<&str> {
+        self.cached
+            .as_ref()
+            .filter(|cached| now.saturating_duration_since(cached.minted_at) < PROVIDER_TOKEN_TTL)
+            .map(|cached| cached.jwt.as_str())
+    }
+
+    fn store(&mut self, jwt: String, now: Instant) {
+        self.cached = Some(CachedToken {
+            jwt,
+            minted_at: now,
+        });
+    }
+
+    /// APNs отверг закэшированный токен (`ExpiredProviderToken` /
+    /// `InvalidProviderToken`). Сбрасывает его, только если перевыпуск уже
+    /// разрешён: токен моложе 20 минут по возрасту протухнуть не мог, значит,
+    /// дело в ключе или часах, и свежий APNs отверг бы так же — да ещё с
+    /// `TooManyProviderTokenUpdates`. При устойчиво битом ключе это даёт не
+    /// больше одного перевыпуска за 20 минут вместо перевыпуска на каждый
+    /// ring. Возвращает `true`, если токен сброшен.
+    fn on_rejected(&mut self, now: Instant) -> bool {
+        let refresh_allowed = self.cached.as_ref().is_some_and(|cached| {
+            now.saturating_duration_since(cached.minted_at) >= MIN_PROVIDER_TOKEN_REFRESH
+        });
+        if refresh_allowed {
+            self.cached = None;
+        }
+        refresh_allowed
+    }
 }
 
 #[derive(Serialize)]
@@ -146,7 +196,7 @@ impl ApnsVoipClient {
                 team_id,
                 voip_topic: format!("{bundle_id}.voip"),
                 host: environment.host().to_string(),
-                provider_token: Mutex::new(None),
+                provider_token: Mutex::new(ProviderTokenCache::default()),
             }),
         })
     }
@@ -158,11 +208,10 @@ impl ApnsVoipClient {
     }
 
     async fn provider_token(&self) -> Result<String> {
-        let mut guard = self.inner.provider_token.lock().await;
-        if let Some(cached) = guard.as_ref()
-            && cached.minted_at.elapsed() < PROVIDER_TOKEN_TTL
-        {
-            return Ok(cached.jwt.clone());
+        let mut cache = self.inner.provider_token.lock().await;
+        let now = Instant::now();
+        if let Some(jwt) = cache.fresh(now) {
+            return Ok(jwt.to_owned());
         }
 
         let iat = SystemTime::now()
@@ -178,17 +227,8 @@ impl ApnsVoipClient {
         let jwt = jwt_encode(&header, &claims, &self.inner.encoding_key)
             .context("failed to sign APNs provider token")?;
 
-        *guard = Some(CachedToken {
-            jwt: jwt.clone(),
-            minted_at: Instant::now(),
-        });
+        cache.store(jwt.clone(), now);
         Ok(jwt)
-    }
-
-    /// Force-invalidate the cached provider token. Called after a `403` so the
-    /// next attempt mints a fresh one.
-    async fn invalidate_provider_token(&self) {
-        *self.inner.provider_token.lock().await = None;
     }
 
     async fn dispatch(&self, payload: RingPayload) -> SendOutcome {
@@ -219,34 +259,32 @@ impl ApnsVoipClient {
         {
             Ok(resp) => resp,
             Err(err) => {
-                warn!(error = %err, "APNs request failed at transport layer");
+                // Токен устройства — часть URL, а reqwest печатает URL в
+                // тексте ошибки.
+                warn!(error = %loggable(err), "APNs request failed at transport layer");
                 return SendOutcome::TransientError;
             }
         };
 
         let status = response.status();
-        let response_body = response.text().await.unwrap_or_default();
-
-        match status {
-            s if s.is_success() => {
-                debug!(topic = %self.inner.voip_topic, "APNs voip ring ok");
-                SendOutcome::Ok
-            }
-            StatusCode::GONE => SendOutcome::InvalidToken, // 410 Unregistered
-            StatusCode::FORBIDDEN => {
-                warn!(body = %response_body, "APNs returned 403 — provider token invalidated");
-                self.invalidate_provider_token().await;
-                SendOutcome::TransientError
-            }
-            StatusCode::TOO_MANY_REQUESTS => SendOutcome::Backoff(BackoffReason::Quota),
-            StatusCode::SERVICE_UNAVAILABLE => SendOutcome::Backoff(BackoffReason::Unavailable),
-            s if s.is_server_error() => SendOutcome::Backoff(BackoffReason::ServerError),
-            s if s.is_client_error() => classify_client_error(&response_body),
-            _ => {
-                warn!(status = %status, body = %response_body, "APNs returned unexpected status");
-                SendOutcome::TransientError
-            }
+        if status.is_success() {
+            debug!(topic = %self.inner.voip_topic, "APNs voip ring ok");
+            return SendOutcome::Ok;
         }
+
+        let response_body = response.text().await.unwrap_or_default();
+        let rejection = classify_rejection(status, &response_body);
+        if rejection.provider_token_rejected
+            && self
+                .inner
+                .provider_token
+                .lock()
+                .await
+                .on_rejected(Instant::now())
+        {
+            debug!("APNs provider token dropped; the next ring mints a new one");
+        }
+        rejection.outcome
     }
 }
 
@@ -268,26 +306,55 @@ fn build_ring_payload(payload: &RingPayload) -> Value {
     })
 }
 
-/// APNs кладёт машинную причину в JSON-поле `reason` тела ответа.
-fn classify_client_error(body: &str) -> SendOutcome {
+/// Как поступить с неуспешным ответом APNs.
+#[derive(Debug, PartialEq, Eq)]
+struct Rejection {
+    outcome: SendOutcome,
+    /// APNs отверг сам provider-токен: кэш стоит сбросить (с оглядкой на
+    /// `ProviderTokenCache::on_rejected`).
+    provider_token_rejected: bool,
+}
+
+/// Классификация неуспешного ответа. Машинную причину APNs кладёт в
+/// JSON-поле `reason` тела; токена устройства в теле нет.
+fn classify_rejection(status: StatusCode, body: &str) -> Rejection {
     let reason = serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_string))
         .unwrap_or_default();
+    let provider_token_rejected = matches!(
+        reason.as_str(),
+        "ExpiredProviderToken" | "InvalidProviderToken"
+    );
 
-    match reason.as_str() {
-        "BadDeviceToken" | "Unregistered" | "DeviceTokenNotForTopic" => SendOutcome::InvalidToken,
-        "ExpiredProviderToken" | "InvalidProviderToken" | "MissingProviderToken" => {
-            // APNs отдаёт эти причины с 403 — та ветка сбрасывает кэш JWT.
-            // Здесь (не-403 статус) кэш не сбрасывается: токен перевыпустится
-            // только по истечении `PROVIDER_TOKEN_TTL`.
-            SendOutcome::TransientError
-        }
-        "TooManyProviderTokenUpdates" => SendOutcome::Backoff(BackoffReason::Quota),
-        other => {
-            warn!(reason = %other, body = %body, "APNs client error");
-            SendOutcome::TransientError
-        }
+    let outcome = match status {
+        // 410: `Unregistered` / `ExpiredToken` — токен устройства мёртв.
+        StatusCode::GONE => SendOutcome::InvalidToken,
+        StatusCode::TOO_MANY_REQUESTS => SendOutcome::backoff(BackoffReason::Quota),
+        StatusCode::SERVICE_UNAVAILABLE => SendOutcome::backoff(BackoffReason::Unavailable),
+        s if s.is_server_error() => SendOutcome::backoff(BackoffReason::ServerError),
+        _ => match reason.as_str() {
+            "BadDeviceToken" | "Unregistered" | "DeviceTokenNotForTopic" => {
+                SendOutcome::InvalidToken
+            }
+            "TooManyProviderTokenUpdates" => SendOutcome::backoff(BackoffReason::Quota),
+            // Сюда же причины 403 про сертификат, окружение и `Forbidden`:
+            // ни ретрай, ни новый provider-токен их не лечат, нужен оператор.
+            other => {
+                warn!(
+                    status = %status,
+                    reason = %other,
+                    body = %body,
+                    "APNs rejected the voip push"
+                );
+                SendOutcome::TransientError
+            }
+        },
+    };
+
+    Rejection {
+        outcome,
+        provider_token_rejected,
     }
 }
 
@@ -331,31 +398,108 @@ mod tests {
         assert!(ApnsEnvironment::parse("staging").is_err());
     }
 
+    fn outcome(status: StatusCode, body: &str) -> SendOutcome {
+        classify_rejection(status, body).outcome
+    }
+
     #[test]
     fn client_error_classification_maps_apns_reasons() {
+        let bad_request = StatusCode::BAD_REQUEST;
         assert_eq!(
-            classify_client_error(r#"{"reason":"BadDeviceToken"}"#),
+            outcome(bad_request, r#"{"reason":"BadDeviceToken"}"#),
             SendOutcome::InvalidToken
         );
         assert_eq!(
-            classify_client_error(r#"{"reason":"Unregistered"}"#),
+            outcome(StatusCode::GONE, r#"{"reason":"Unregistered"}"#),
             SendOutcome::InvalidToken
         );
         assert_eq!(
-            classify_client_error(r#"{"reason":"DeviceTokenNotForTopic"}"#),
+            outcome(bad_request, r#"{"reason":"DeviceTokenNotForTopic"}"#),
             SendOutcome::InvalidToken
         );
         assert_eq!(
-            classify_client_error(r#"{"reason":"TooManyProviderTokenUpdates"}"#),
-            SendOutcome::Backoff(BackoffReason::Quota)
+            outcome(
+                StatusCode::TOO_MANY_REQUESTS,
+                r#"{"reason":"TooManyProviderTokenUpdates"}"#
+            ),
+            SendOutcome::backoff(BackoffReason::Quota)
         );
         assert_eq!(
-            classify_client_error(r#"{"reason":"PayloadTooLarge"}"#),
+            outcome(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                r#"{"reason":"PayloadTooLarge"}"#
+            ),
             SendOutcome::TransientError
         );
         assert_eq!(
-            classify_client_error("not json"),
+            outcome(bad_request, "not json"),
             SendOutcome::TransientError
         );
+        assert_eq!(
+            outcome(StatusCode::SERVICE_UNAVAILABLE, ""),
+            SendOutcome::backoff(BackoffReason::Unavailable)
+        );
+        assert_eq!(
+            outcome(StatusCode::INTERNAL_SERVER_ERROR, ""),
+            SendOutcome::backoff(BackoffReason::ServerError)
+        );
+    }
+
+    /// Кэш сбрасывают только причины про сам provider-токен. Прочие 403
+    /// (сертификат, окружение, `Forbidden`) раньше тоже сбрасывали его, и
+    /// при устойчивой ошибке каждый ring минтил новый токен — прямой путь к
+    /// `TooManyProviderTokenUpdates`.
+    #[test]
+    fn only_provider_token_reasons_reject_the_cached_token() {
+        let forbidden = StatusCode::FORBIDDEN;
+        for reason in ["ExpiredProviderToken", "InvalidProviderToken"] {
+            let rejection = classify_rejection(forbidden, &format!(r#"{{"reason":"{reason}"}}"#));
+            assert!(rejection.provider_token_rejected, "{reason}");
+            assert_eq!(rejection.outcome, SendOutcome::TransientError);
+        }
+
+        for body in [
+            r#"{"reason":"BadCertificateEnvironment"}"#,
+            r#"{"reason":"BadCertificate"}"#,
+            r#"{"reason":"Forbidden"}"#,
+            r#"{"reason":"MissingProviderToken"}"#,
+            "",
+        ] {
+            let rejection = classify_rejection(forbidden, body);
+            assert!(!rejection.provider_token_rejected, "{body}");
+            assert_eq!(rejection.outcome, SendOutcome::TransientError);
+        }
+    }
+
+    #[test]
+    fn rejected_token_is_dropped_at_most_once_per_refresh_window() {
+        let minted = Instant::now();
+        let mut cache = ProviderTokenCache::default();
+        assert!(!cache.on_rejected(minted), "пустой кэш сбрасывать нечего");
+
+        cache.store("jwt-1".into(), minted);
+        assert_eq!(cache.fresh(minted), Some("jwt-1"));
+
+        // Свежий токен APNs отверг — дело не в возрасте, перевыпуск не
+        // поможет и только сожжёт лимит.
+        assert!(!cache.on_rejected(minted + Duration::from_secs(60)));
+        assert_eq!(cache.fresh(minted + Duration::from_secs(60)), Some("jwt-1"));
+
+        // Через 20 минут перевыпуск уже разрешён.
+        assert!(cache.on_rejected(minted + MIN_PROVIDER_TOKEN_REFRESH));
+        assert_eq!(cache.fresh(minted + MIN_PROVIDER_TOKEN_REFRESH), None);
+    }
+
+    #[test]
+    fn cached_token_expires_before_apns_would_reject_it() {
+        let minted = Instant::now();
+        let mut cache = ProviderTokenCache::default();
+        cache.store("jwt".into(), minted);
+
+        assert_eq!(
+            cache.fresh(minted + PROVIDER_TOKEN_TTL - Duration::from_secs(1)),
+            Some("jwt")
+        );
+        assert_eq!(cache.fresh(minted + PROVIDER_TOKEN_TTL), None);
     }
 }

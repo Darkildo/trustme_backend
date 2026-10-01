@@ -10,8 +10,15 @@
 //! Design:
 //! - Single bounded mpsc trigger channel; `on_undelivered` uses `try_send`, so
 //!   the hot delivery path never blocks and a saturated channel drops triggers.
-//! - One worker task with per-key coalescing timers and one in-flight send at
-//!   a time: a slow transport delays every recipient, not just one.
+//! - A dispatcher task hands triggers to per-recipient tasks: triggers of one
+//!   `(user, device)` run strictly one after another, in arrival order, while
+//!   different recipients run concurrently. Provider calls are bounded by a
+//!   semaphore (`DEFAULT_SEND_CONCURRENCY`), so a degraded provider slows
+//!   sends down but does not stall decisions for everyone else.
+//! - State exists only for devices with a push token and only while it can
+//!   still affect a decision: idle entries are dropped on write and swept
+//!   every `SWEEP_INTERVAL`, together with the auxiliary maps.
+//! - Coalescing timers are re-armed after a restart from the persisted state.
 //! - The decision logic is pure (`state::decide`) and unit-tested.
 //! - The incoming-call marker (`WakeHint::IncomingCall`) survives the decision
 //!   machine via `Worker::call_hints` and reaches the transport in
@@ -23,13 +30,15 @@ pub mod gateway;
 pub mod state;
 pub mod transport;
 
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use dashmap::DashMap;
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tokio::time::MissedTickBehavior;
+use tracing::{debug, info, warn};
 
 use crate::config::PushConfig;
 use crate::domain::priority::MessagePriority;
@@ -42,7 +51,7 @@ pub use fcm::FcmHttpV1Client;
 pub use gateway::PushGatewayClient;
 pub use state::{
     Decision, DecisionAction, DecisionConfig, DecisionInput, PushState, decide, on_send_backoff,
-    on_send_success,
+    on_send_success, resume_deadline,
 };
 pub use transport::{
     BackoffReason, InMemoryTokenStore, MockRingTransport, MockTransport, NoVoipRingTransport,
@@ -60,6 +69,10 @@ pub use transport::{
 pub trait PushStatePersistence: Send + Sync + 'static {
     fn load_all(&self) -> Vec<((UserId, DeviceId), PushState)>;
     fn save(&self, user: UserId, device: DeviceId, state: &PushState);
+    /// Forget the row for `(user, device)`: its state no longer affects any
+    /// decision, or the device has no push token left. Removing a missing row
+    /// is not an error.
+    fn remove(&self, user: UserId, device: DeviceId);
 }
 
 /// No-op persistence for tests and other setups that don't need durability.
@@ -70,9 +83,31 @@ impl PushStatePersistence for NoopStatePersistence {
         Vec::new()
     }
     fn save(&self, _user: UserId, _device: DeviceId, _state: &PushState) {}
+    fn remove(&self, _user: UserId, _device: DeviceId) {}
 }
 
 type RecipientKey = (UserId, DeviceId);
+
+/// Сколько обращений к провайдеру (wake, ring, welcome) идут одновременно.
+///
+/// Последовательный воркер при деградации провайдера ждал таймаут на каждом
+/// запросе, переставал разбирать канал, тот заполнялся — и отбрасывались
+/// триггеры всех получателей, а не только тех, чья отправка висела. 32
+/// запроса помещаются в одно HTTP/2-соединение и к FCM, и к APNs.
+const DEFAULT_SEND_CONCURRENCY: usize = 32;
+
+/// Сколько триггеров одного получателя могут ждать, пока обрабатывается
+/// предыдущий. Сверх этого триггеры отбрасываются
+/// (`push_dropped_total{reason="recipient_backlog"}`): поток сообщений одному
+/// устройству, чья отправка повисла, не должен копить память без предела, а
+/// пуш на окно коалесинга всё равно один.
+const MAX_QUEUED_PER_RECIPIENT: usize = 64;
+
+/// Как часто вычищаются состояния, которые больше ни на что не влияют, и
+/// служебные отметки: cooldown ring'ов, протухшие call-hint'ы, отработавшие
+/// таймеры. Без вычистки все эти карты росли бы на каждую пару, которой хоть
+/// раз слали пуш.
+const SWEEP_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Сколько живёт «ожидающий call-hint» — промежуток между решением разбудить
 /// под звонок и фактической отправкой wake-пуша (отправку может отложить
@@ -117,6 +152,16 @@ enum Trigger {
     },
 }
 
+impl Trigger {
+    fn key(&self) -> RecipientKey {
+        match self {
+            Self::NewMessage { user, device, .. }
+            | Self::TimerTick { user, device }
+            | Self::Welcome { user, device } => (*user, *device),
+        }
+    }
+}
+
 impl PushScheduler {
     /// Spawn the worker task and return a handle. The transport, token store,
     /// and persistence layer are kept alive for as long as the scheduler is.
@@ -155,53 +200,49 @@ impl PushScheduler {
         S: TokenStore,
         V: VoipRingTransport,
     {
-        let (tx, rx) = mpsc::channel(cfg.channel_capacity.max(1));
-        let worker_tx = tx.clone();
-        let decision_cfg = cfg.decision_config();
-        let ring_cooldown = cfg.ring_cooldown;
+        Self::spawn(
+            cfg,
+            transport,
+            tokens,
+            persistence,
+            voip,
+            DEFAULT_SEND_CONCURRENCY,
+        )
+    }
+
+    fn spawn<T, S, V>(
+        cfg: PushConfig,
+        transport: Arc<T>,
+        tokens: Arc<S>,
+        persistence: Arc<dyn PushStatePersistence>,
+        voip: Option<Arc<V>>,
+        send_concurrency: usize,
+    ) -> Self
+    where
+        T: PushTransport,
+        S: TokenStore,
+        V: VoipRingTransport,
+    {
+        let capacity = cfg.channel_capacity.max(1);
+        let (tx, rx) = mpsc::channel(capacity);
         let enabled = cfg.enabled;
 
-        // Hydrate the in-memory state map from persistence so a restart
-        // keeps honouring prior coalescing windows and backoff deadlines.
-        // Timers are not re-armed: a recipient with pending counters is
-        // re-evaluated only on its next trigger.
-        let states = DashMap::new();
-        let loaded = persistence.load_all();
-        let loaded_count = loaded.len();
-        let mut pending_recipients = 0usize;
-        for (key, state) in loaded {
-            if state.pending_since_last_push > 0 {
-                pending_recipients += 1;
-            }
-            states.insert(key, state);
-        }
-        // Глубина восстанавливается абсолютным значением ровно здесь: дальше
-        // её двигают только дельты переходов, и стартовать с нуля значило бы
-        // уйти в минус на первом же гашении переживших рестарт счётчиков.
-        observability::set_push_pending_recipients(pending_recipients);
-        if loaded_count > 0 {
-            tracing::info!(
-                loaded = loaded_count,
-                "push scheduler hydrated state from persistence"
-            );
-        }
-
-        let worker = Worker {
-            rx,
-            tx: worker_tx,
+        let worker = Arc::new(Worker::new(
+            &cfg,
+            tx.clone(),
             transport,
             tokens,
             voip,
             persistence,
-            decision_cfg,
-            ring_cooldown,
-            states,
-            timers: DashMap::new(),
-            last_ring: DashMap::new(),
-            call_hints: DashMap::new(),
-        };
-
-        tokio::spawn(worker.run());
+            send_concurrency,
+        ));
+        // Выключенные пуши не должны «досылать» накопленное моком: оно
+        // дождётся включения.
+        worker.hydrate(enabled);
+        // Занятых получателей не больше, чем вмещает канал: дальше диспетчер
+        // перестаёт его разбирать, канал заполняется, и `on_undelivered`
+        // отбрасывает триггеры — горячий путь доставки не ждёт никогда.
+        tokio::spawn(worker.run(rx, capacity));
 
         Self {
             inner: Arc::new(SchedulerInner { tx, enabled }),
@@ -265,20 +306,40 @@ impl PushScheduler {
     }
 }
 
+/// Освобождает получателя в диспетчере, когда его задача завершилась.
+/// Через `Drop`, а не явным вызовом: паника внутри обработки иначе навсегда
+/// оставила бы получателя «занятым», и его триггеры копились бы в очереди.
+struct RecipientRelease {
+    key: RecipientKey,
+    done: mpsc::UnboundedSender<RecipientKey>,
+}
+
+impl Drop for RecipientRelease {
+    fn drop(&mut self) {
+        let _ = self.done.send(self.key);
+    }
+}
+
 struct Worker<T: PushTransport, S: TokenStore, V: VoipRingTransport> {
-    rx: mpsc::Receiver<Trigger>,
     tx: mpsc::Sender<Trigger>,
     transport: Arc<T>,
     tokens: Arc<S>,
     voip: Option<Arc<V>>,
     persistence: Arc<dyn PushStatePersistence>,
     decision_cfg: DecisionConfig,
+    /// [`DecisionConfig::longest_gap_secs`], посчитанный один раз: сколько
+    /// после пуша состояние без накопленного ещё влияет на решения.
+    longest_gap_secs: u64,
     /// Окно подавления повторного voip-ring'а той же `(user, device)` —
     /// mesh-леги/ре-офферы одной комнаты не должны дёргать APNs очередью.
     ring_cooldown: Duration,
+    /// Разрешения на обращение к провайдеру; см. [`DEFAULT_SEND_CONCURRENCY`].
+    send_permits: Semaphore,
     states: DashMap<RecipientKey, PushState>,
     timers: DashMap<RecipientKey, JoinHandle<()>>,
-    last_ring: DashMap<RecipientKey, u64>,
+    /// Момент последнего успешного ring'а. `Instant`, а не unix-секунды:
+    /// cooldown задан в миллисекундах и сравнивается в них же.
+    last_ring: DashMap<RecipientKey, Instant>,
     /// Устройства, чей ближайший FCM-wake будит получателя под звонок, и
     /// момент (unix-секунды) выставления признака. Заводится, когда
     /// voip-ring не состоялся и звонковый конверт ушёл в decision-машину:
@@ -289,10 +350,164 @@ struct Worker<T: PushTransport, S: TokenStore, V: VoipRingTransport> {
 }
 
 impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
-    async fn run(mut self) {
-        while let Some(trigger) = self.rx.recv().await {
-            self.process(trigger).await;
+    fn new(
+        cfg: &PushConfig,
+        tx: mpsc::Sender<Trigger>,
+        transport: Arc<T>,
+        tokens: Arc<S>,
+        voip: Option<Arc<V>>,
+        persistence: Arc<dyn PushStatePersistence>,
+        send_concurrency: usize,
+    ) -> Self {
+        let decision_cfg = cfg.decision_config();
+        Self {
+            tx,
+            transport,
+            tokens,
+            voip,
+            persistence,
+            longest_gap_secs: decision_cfg.longest_gap_secs(),
+            decision_cfg,
+            ring_cooldown: cfg.ring_cooldown,
+            send_permits: Semaphore::new(send_concurrency.max(1)),
+            states: DashMap::new(),
+            timers: DashMap::new(),
+            last_ring: DashMap::new(),
+            call_hints: DashMap::new(),
         }
+    }
+
+    /// Поднять состояние из персистентности, чтобы рестарт не сбрасывал окна
+    /// коалесинга и backoff'а, и перевзвести таймеры накопленного: таймеры
+    /// живут только в памяти, и без перевзвода отложенные wake терялись бы
+    /// на каждом деплое.
+    ///
+    /// Записи, которые уже ни на что не влияют, и записи устройств без
+    /// токена не грузятся, а удаляются: их наплодили версии, заводившие
+    /// состояние под любую пару.
+    fn hydrate(&self, resume_timers: bool) {
+        let now = now_secs();
+        let mut kept = 0usize;
+        let mut dropped = 0usize;
+        let mut pending_recipients = 0usize;
+        for (key, state) in self.persistence.load_all() {
+            if state.is_idle(now, self.longest_gap_secs)
+                || self.tokens.resolve(&key.0, key.1).is_none()
+            {
+                self.persistence.remove(key.0, key.1);
+                dropped += 1;
+                continue;
+            }
+            if state.pending_since_last_push > 0 {
+                pending_recipients += 1;
+            }
+            if resume_timers && let Some(fire_at) = resume_deadline(&state, &self.decision_cfg) {
+                self.schedule_timer(key, fire_at, now);
+            }
+            self.states.insert(key, state);
+            kept += 1;
+        }
+        // Глубина восстанавливается абсолютным значением ровно здесь: дальше
+        // её двигают только дельты переходов, и стартовать с нуля значило бы
+        // уйти в минус на первом же гашении переживших рестарт счётчиков.
+        observability::set_push_pending_recipients(pending_recipients);
+        if kept > 0 || dropped > 0 {
+            info!(
+                kept,
+                dropped, "push scheduler hydrated state from persistence"
+            );
+        }
+    }
+
+    /// Диспетчер: раздаёт триггеры задачам по получателям. Пока задача
+    /// получателя работает, его следующие триггеры ждут в его же очереди —
+    /// так переходы состояния одной пары остаются строго последовательными,
+    /// а медленная отправка одному не задерживает решения для остальных.
+    async fn run(self: Arc<Self>, mut rx: mpsc::Receiver<Trigger>, max_busy: usize) {
+        let (done_tx, mut done_rx) = mpsc::unbounded_channel::<RecipientKey>();
+        let mut busy: HashMap<RecipientKey, VecDeque<Trigger>> = HashMap::new();
+        let mut sweep =
+            tokio::time::interval_at(tokio::time::Instant::now() + SWEEP_INTERVAL, SWEEP_INTERVAL);
+        sweep.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        loop {
+            tokio::select! {
+                // Сначала завершения: они освобождают место под новые триггеры.
+                biased;
+                Some(key) = done_rx.recv() => {
+                    match busy.get_mut(&key).and_then(VecDeque::pop_front) {
+                        Some(next) => self.spawn_process(key, next, &done_tx),
+                        None => {
+                            busy.remove(&key);
+                        }
+                    }
+                }
+                received = rx.recv(), if busy.len() < max_busy => {
+                    // Канал не закрывается, пока жив сам воркер: таймеры
+                    // держат его отправителя.
+                    let Some(trigger) = received else { break };
+                    let key = trigger.key();
+                    match busy.get_mut(&key) {
+                        None => {
+                            busy.insert(key, VecDeque::new());
+                            self.spawn_process(key, trigger, &done_tx);
+                        }
+                        Some(queue) if queue.len() < MAX_QUEUED_PER_RECIPIENT => {
+                            queue.push_back(trigger);
+                        }
+                        Some(_) => observability::observe_push_dropped("recipient_backlog"),
+                    }
+                }
+                _ = sweep.tick() => self.sweep(&busy),
+            }
+        }
+    }
+
+    fn spawn_process(
+        self: &Arc<Self>,
+        key: RecipientKey,
+        trigger: Trigger,
+        done: &mpsc::UnboundedSender<RecipientKey>,
+    ) {
+        let worker = Arc::clone(self);
+        let release = RecipientRelease {
+            key,
+            done: done.clone(),
+        };
+        tokio::spawn(async move {
+            let _release = release;
+            worker.process(trigger).await;
+        });
+    }
+
+    /// Вычистка того, что больше ни на что не влияет. Получатели, чья задача
+    /// сейчас работает, пропускаются: их состояние меняется прямо сейчас.
+    fn sweep(&self, busy: &HashMap<RecipientKey, VecDeque<Trigger>>) {
+        let now = now_secs();
+        let idle: Vec<RecipientKey> = self
+            .states
+            .iter()
+            .filter(|entry| {
+                !busy.contains_key(entry.key()) && entry.value().is_idle(now, self.longest_gap_secs)
+            })
+            .map(|entry| *entry.key())
+            .collect();
+        for key in idle {
+            if self
+                .states
+                .remove_if(&key, |_, state| state.is_idle(now, self.longest_gap_secs))
+                .is_some()
+            {
+                self.persistence.remove(key.0, key.1);
+            }
+        }
+
+        let ring_cooldown = self.ring_cooldown;
+        self.last_ring
+            .retain(|_, rang_at| rang_at.elapsed() < ring_cooldown);
+        self.call_hints
+            .retain(|_, at| now.saturating_sub(*at) <= CALL_HINT_TTL_SECS);
+        self.timers.retain(|_, timer| !timer.is_finished());
     }
 
     async fn process(&self, trigger: Trigger) {
@@ -304,15 +519,29 @@ impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
                 wake_hint,
             } => {
                 let key = (user, device);
+                let incoming_call = wake_hint == Some(WakeHint::IncomingCall);
                 // Звонковый конверт: устройству с PushKit-токеном — APNs
                 // voip-ring, минуя decision-машину (коалесинг звонку вреден).
                 // Неудача ring'а (нет voip-слота / invalid token / сеть)
                 // проваливается в обычный FCM-wake ниже — Android и
                 // legacy-iOS пути не меняются.
-                if wake_hint == Some(WakeHint::IncomingCall) {
-                    if self.try_dispatch_ring(key).await {
-                        return;
-                    }
+                if incoming_call && self.try_dispatch_ring(key).await {
+                    return;
+                }
+                // Без alert-токена будить нечем, и состояние под такую пару
+                // не заводится. `device_id` выбирает отправитель, так что
+                // иначе любой клиент раздувал бы карту и дерево
+                // `push_state` произвольными парами.
+                if self.tokens.resolve(&key.0, key.1).is_none() {
+                    observability::observe_push_dropped("no_token");
+                    debug!(
+                        user = %hex::encode(key.0),
+                        device = key.1,
+                        "push trigger dropped: no token"
+                    );
+                    return;
+                }
+                if incoming_call {
                     // FCM-путь звонок не различает: decision-машина видит
                     // только приоритет. Без маркера на конверте получатель
                     // покажет баннер «новые сообщения» вместо ринга, поэтому
@@ -321,7 +550,16 @@ impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
                 }
                 (key, DecisionInput::NewMessage(priority))
             }
-            Trigger::TimerTick { user, device } => ((user, device), DecisionInput::TimerTick),
+            Trigger::TimerTick { user, device } => {
+                let key = (user, device);
+                // Таймер, приславший тик, отработал — его handle больше не нужен.
+                self.timers.remove_if(&key, |_, timer| timer.is_finished());
+                // Тик от уже погашенного окна: заводить под него запись незачем.
+                if !self.states.contains_key(&key) {
+                    return;
+                }
+                (key, DecisionInput::TimerTick)
+            }
             Trigger::Welcome { user, device } => {
                 self.dispatch_welcome((user, device)).await;
                 return;
@@ -336,7 +574,7 @@ impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
             .unwrap_or_default();
 
         let decision = decide(prior, input, now, &self.decision_cfg);
-        self.write_state(key, decision.state);
+        self.write_state(key, decision.state, now);
 
         match decision.action {
             DecisionAction::Idle => {
@@ -346,7 +584,11 @@ impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
                 if let DecisionInput::NewMessage(p) = input {
                     observability::observe_push_deferred(priority_label(p));
                 }
-                debug!(?key, "push decision: idle");
+                debug!(
+                    user = %hex::encode(key.0),
+                    device = key.1,
+                    "push decision: idle"
+                );
             }
             DecisionAction::WaitUntil(fire_at) => {
                 if let DecisionInput::NewMessage(p) = input {
@@ -375,11 +617,16 @@ impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
         let call_hint_at = self.take_call_hint(key, now);
 
         let Some(token) = self.tokens.resolve(&key.0, key.1) else {
-            // No push token for this device — record and move on. The state
-            // has already been advanced by `decide` (counters reset), so an
-            // unregistered device is not retried forever.
+            // Токен исчез, пока копилось окно: будить нечем, и состояние пары
+            // больше ни на что не влияет. Без токена новых триггеров под неё
+            // не будет, поэтому запись не ретраится, а забывается.
             observability::observe_push_sent(priority_label(max_priority), "no_token");
-            warn!(?key, "push send skipped: no token");
+            debug!(
+                user = %hex::encode(key.0),
+                device = key.1,
+                "push send skipped: no token"
+            );
+            self.forget(key);
             return;
         };
 
@@ -394,14 +641,10 @@ impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
             wake_hint: call_hint_at.map(|_| WakeHint::IncomingCall),
         };
 
-        let started = std::time::Instant::now();
-        let outcome = self.transport.send(payload).await;
-        observability::observe_push_latency(started.elapsed());
-
-        match outcome {
+        match self.send_wake(payload).await {
             SendOutcome::Ok => {
                 observability::observe_push_sent(priority_label(max_priority), "ok");
-                self.mutate_state(key, on_send_success);
+                self.mutate_state(key, now, on_send_success);
                 // After a successful send, fresh NewMessage triggers will handle
                 // re-firing — no preemptive tick needed.
             }
@@ -409,35 +652,49 @@ impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
                 observability::observe_push_sent(priority_label(max_priority), "invalid_token");
                 observability::observe_push_token_removed("invalid_token");
                 self.tokens.remove(&key.0, key.1);
-                // Treat as a successful send for backoff purposes — the
-                // token is gone, retrying won't help.
-                self.mutate_state(key, on_send_success);
+                // Токена больше нет — состояние под пару держать незачем.
+                self.forget(key);
             }
-            SendOutcome::Backoff(reason) => {
+            SendOutcome::Backoff {
+                reason,
+                retry_after,
+            } => {
                 observability::observe_push_sent(priority_label(max_priority), "backoff");
                 self.restore_call_hint(key, call_hint_at);
-                self.rollback_and_suppress(key, pending, max_priority, now);
-                debug!(?key, ?reason, "push backoff");
+                self.rollback_and_suppress(key, pending, max_priority, now, retry_after);
+                debug!(
+                    user = %hex::encode(key.0),
+                    device = key.1,
+                    ?reason,
+                    ?retry_after,
+                    "push backoff"
+                );
             }
             SendOutcome::TransientError => {
                 observability::observe_push_sent(priority_label(max_priority), "transient_error");
                 self.restore_call_hint(key, call_hint_at);
-                self.rollback_and_suppress(key, pending, max_priority, now);
+                self.rollback_and_suppress(key, pending, max_priority, now, None);
             }
         }
     }
 
+    /// Обращение к wake-транспорту под разрешением семафора: одновременных
+    /// запросов к провайдеру не больше `DEFAULT_SEND_CONCURRENCY`. Задержка
+    /// меряется без ожидания разрешения — это задержка провайдера.
+    async fn send_wake(&self, payload: PushPayload) -> SendOutcome {
+        let _permit = self.send_permits.acquire().await.ok();
+        let started = Instant::now();
+        let outcome = self.transport.send(payload).await;
+        observability::observe_push_latency(started.elapsed());
+        outcome
+    }
+
     /// Пометить `key`: ближайший wake этому устройству будит его под звонок.
-    ///
-    /// Попутно подметает протухшее. Подметание нужно потому, что hint
-    /// ставится и тогда, когда `decide` решит не будить вовсе (конверт без
-    /// приоритета на ноде с `wake_on_unspecified = false`): такой записи
-    /// иначе некому истечь, и карта росла бы на каждый несостоявшийся вызов.
+    /// Hint ставится и тогда, когда `decide` решит не будить вовсе (конверт
+    /// без приоритета на ноде с `wake_on_unspecified = false`); протухшие
+    /// такие записи вычищает [`Self::sweep`].
     fn remember_call_hint(&self, key: RecipientKey) {
-        let now = now_secs();
-        self.call_hints
-            .retain(|_, at| now.saturating_sub(*at) <= CALL_HINT_TTL_SECS);
-        self.call_hints.insert(key, now);
+        self.call_hints.insert(key, now_secs());
     }
 
     /// Снять hint устройства. Возвращает момент выставления, если он ещё
@@ -477,15 +734,22 @@ impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
             return false;
         };
 
-        let now = now_secs();
-        if let Some(last) = self.last_ring.get(&key)
-            && now.saturating_sub(*last.value()) < self.ring_cooldown.as_secs()
+        // Сравнение в `Duration`, а не в целых секундах: cooldown в конфиге
+        // миллисекундный, и `as_secs()` превращал 500 мс в ноль.
+        if self
+            .last_ring
+            .get(&key)
+            .is_some_and(|rang_at| rang_at.elapsed() < self.ring_cooldown)
         {
             // Устройство уже звонит: повторные OFFER'ы той же комнаты
             // (mesh-леги, ре-офферы) не должны слать очередь voip-пушей —
             // каждый из них iOS обязует репортить отдельный CallKit-звонок.
             observability::observe_push_sent("ring", "cooldown");
-            debug!(?key, "voip ring suppressed by cooldown");
+            debug!(
+                user = %hex::encode(key.0),
+                device = key.1,
+                "voip ring suppressed by cooldown"
+            );
             return true;
         }
 
@@ -493,17 +757,21 @@ impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
             user_id: key.0,
             device_id: key.1,
             token,
-            server_ts_secs: now,
+            server_ts_secs: now_secs(),
         };
 
-        let started = std::time::Instant::now();
-        let outcome = voip.send_ring(payload).await;
-        observability::observe_push_latency(started.elapsed());
+        let (outcome, started) = {
+            let _permit = self.send_permits.acquire().await.ok();
+            let started = Instant::now();
+            let outcome = voip.send_ring(payload).await;
+            observability::observe_push_latency(started.elapsed());
+            (outcome, started)
+        };
 
         match outcome {
             SendOutcome::Ok => {
                 observability::observe_push_sent("ring", "ok");
-                self.last_ring.insert(key, now);
+                self.last_ring.insert(key, started);
                 true
             }
             SendOutcome::InvalidToken => {
@@ -513,9 +781,14 @@ impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
                 // Voip-слот мёртв — пусть хотя бы FCM-wake разбудит.
                 false
             }
-            SendOutcome::Backoff(reason) => {
+            SendOutcome::Backoff { reason, .. } => {
                 observability::observe_push_sent("ring", "backoff");
-                debug!(?key, ?reason, "voip ring backoff; falling back to FCM wake");
+                debug!(
+                    user = %hex::encode(key.0),
+                    device = key.1,
+                    ?reason,
+                    "voip ring backoff; falling back to FCM wake"
+                );
                 false
             }
             SendOutcome::TransientError => {
@@ -530,7 +803,11 @@ impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
     /// consumes the budget of the next real-message wake.
     async fn dispatch_welcome(&self, key: RecipientKey) {
         let Some(token) = self.tokens.resolve(&key.0, key.1) else {
-            warn!(?key, "welcome push skipped: no token at dispatch time");
+            warn!(
+                user = %hex::encode(key.0),
+                device = key.1,
+                "welcome push skipped: no token at dispatch time"
+            );
             return;
         };
 
@@ -546,27 +823,38 @@ impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
             wake_hint: None,
         };
 
-        let started = std::time::Instant::now();
-        let outcome = self.transport.send(payload).await;
-        observability::observe_push_latency(started.elapsed());
-
-        match outcome {
+        match self.send_wake(payload).await {
             SendOutcome::Ok => {
                 observability::observe_push_sent("welcome", "ok");
-                tracing::info!(?key, "welcome push sent");
+                // Идентификаторы получателя — метаданные переписки; в info
+                // им не место.
+                debug!(
+                    user = %hex::encode(key.0),
+                    device = key.1,
+                    "welcome push sent"
+                );
             }
             SendOutcome::InvalidToken => {
                 observability::observe_push_sent("welcome", "invalid_token");
                 observability::observe_push_token_removed("invalid_token");
                 self.tokens.remove(&key.0, key.1);
             }
-            SendOutcome::Backoff(reason) => {
+            SendOutcome::Backoff { reason, .. } => {
                 observability::observe_push_sent("welcome", "backoff");
-                debug!(?key, ?reason, "welcome push backoff; not retrying");
+                debug!(
+                    user = %hex::encode(key.0),
+                    device = key.1,
+                    ?reason,
+                    "welcome push backoff; not retrying"
+                );
             }
             SendOutcome::TransientError => {
                 observability::observe_push_sent("welcome", "transient_error");
-                debug!(?key, "welcome push transient error; not retrying");
+                debug!(
+                    user = %hex::encode(key.0),
+                    device = key.1,
+                    "welcome push transient error; not retrying"
+                );
             }
         }
     }
@@ -579,14 +867,15 @@ impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
         pending: u32,
         max_priority: Option<MessagePriority>,
         now: u64,
+        retry_after: Option<Duration>,
     ) {
-        let until = self.mutate_state(key, |state| {
+        let until = self.mutate_state(key, now, |state| {
             state.pending_since_last_push = state.pending_since_last_push.saturating_add(pending);
             let restored = MessagePriority::as_storage_byte(max_priority);
             if restored > state.highest_pending_priority {
                 state.highest_pending_priority = restored;
             }
-            on_send_backoff(state, now, &self.decision_cfg);
+            on_send_backoff(state, now, &self.decision_cfg, retry_after);
             state.suppressed_until_secs
         });
         self.schedule_timer(key, until, now);
@@ -594,13 +883,36 @@ impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
 
     /// Replace the cached state for `key`, mirroring the new value to durable
     /// storage. Use this on every transition that begins as a `Decision`.
-    fn write_state(&self, key: RecipientKey, state: PushState) {
+    /// A state that no longer affects decisions is dropped instead of stored.
+    fn write_state(&self, key: RecipientKey, state: PushState, now: u64) {
+        if state.is_idle(now, self.longest_gap_secs) {
+            self.forget_state(key);
+            return;
+        }
         let prior = self.states.insert(key, state);
         Self::track_pending_depth(
             prior.map(|p| p.pending_since_last_push).unwrap_or(0),
             state.pending_since_last_push,
         );
         self.persistence.save(key.0, key.1, &state);
+    }
+
+    /// Убрать состояние пары из памяти и из персистентности.
+    fn forget_state(&self, key: RecipientKey) {
+        if let Some((_, prior)) = self.states.remove(&key) {
+            Self::track_pending_depth(prior.pending_since_last_push, 0);
+            self.persistence.remove(key.0, key.1);
+        }
+    }
+
+    /// Забыть пару целиком: у неё не осталось токена, будить нечем. Таймер
+    /// снимается, чтобы тик не пришёл к уже забытой паре.
+    fn forget(&self, key: RecipientKey) {
+        self.forget_state(key);
+        if let Some((_, timer)) = self.timers.remove(&key) {
+            timer.abort();
+        }
+        self.call_hints.remove(&key);
     }
 
     /// Двигает глубину `push_pending_recipients` на переходах «накопленного
@@ -615,17 +927,27 @@ impl<T: PushTransport, S: TokenStore, V: VoipRingTransport> Worker<T, S, V> {
         }
     }
 
-    /// Apply `f` to the mutable in-place state and write the result back through
-    /// `persistence`. The closure can return a value (e.g. the new
+    /// Apply `f` to a copy of the current state and write the result back
+    /// through [`Self::write_state`] (same depth accounting, same "idle is not
+    /// stored" rule). The closure can return a value (e.g. the new
     /// `suppressed_until_secs`) which is forwarded to the caller.
-    fn mutate_state<R>(&self, key: RecipientKey, f: impl FnOnce(&mut PushState) -> R) -> R {
-        let mut entry = self.states.entry(key).or_default();
-        let before = entry.value().pending_since_last_push;
-        let result = f(entry.value_mut());
-        let snapshot = *entry.value();
-        drop(entry);
-        Self::track_pending_depth(before, snapshot.pending_since_last_push);
-        self.persistence.save(key.0, key.1, &snapshot);
+    ///
+    /// Read-modify-write без замка безопасен: переходы одной пары
+    /// выполняются строго последовательно (см. [`Self::run`]), а вычистка
+    /// пропускает занятые пары.
+    fn mutate_state<R>(
+        &self,
+        key: RecipientKey,
+        now: u64,
+        f: impl FnOnce(&mut PushState) -> R,
+    ) -> R {
+        let mut next = self
+            .states
+            .get(&key)
+            .map(|entry| *entry.value())
+            .unwrap_or_default();
+        let result = f(&mut next);
+        self.write_state(key, next, now);
         result
     }
 
@@ -764,28 +1086,31 @@ mod integration_tests {
         assert!(tokens.resolve(&user(2), 3).is_none());
     }
 
-    /// Records every `save` call so tests can assert that the worker mirrors
-    /// state changes to persistence. Hydrated from a seed map on construction.
+    /// Records every `save` / `remove` call so tests can assert that the
+    /// worker mirrors state changes to persistence. Hydrated from a seed map
+    /// on construction.
     struct RecordingPersistence {
         seed: Vec<((UserId, DeviceId), PushState)>,
         saves: std::sync::Mutex<Vec<(UserId, DeviceId, PushState)>>,
+        removes: std::sync::Mutex<Vec<RecipientKey>>,
     }
 
     impl RecordingPersistence {
         fn empty() -> Self {
-            Self {
-                seed: Vec::new(),
-                saves: std::sync::Mutex::new(Vec::new()),
-            }
+            Self::seeded(Vec::new())
         }
         fn seeded(seed: Vec<((UserId, DeviceId), PushState)>) -> Self {
             Self {
                 seed,
                 saves: std::sync::Mutex::new(Vec::new()),
+                removes: std::sync::Mutex::new(Vec::new()),
             }
         }
         fn save_count(&self) -> usize {
             self.saves.lock().unwrap().len()
+        }
+        fn removed(&self) -> Vec<RecipientKey> {
+            self.removes.lock().unwrap().clone()
         }
     }
 
@@ -795,6 +1120,9 @@ mod integration_tests {
         }
         fn save(&self, user: UserId, device: DeviceId, state: &PushState) {
             self.saves.lock().unwrap().push((user, device, *state));
+        }
+        fn remove(&self, user: UserId, device: DeviceId) {
+            self.removes.lock().unwrap().push((user, device));
         }
     }
 
@@ -1142,22 +1470,32 @@ mod integration_tests {
         transport: Arc<MockTransport>,
         tokens: Arc<InMemoryTokenStore>,
     ) -> Worker<MockTransport, InMemoryTokenStore, NoVoipRingTransport> {
-        let cfg = fast_cfg();
-        let (tx, rx) = mpsc::channel(8);
-        Worker {
-            rx,
+        bare_worker_with(
+            fast_cfg(),
+            transport,
+            tokens,
+            Arc::new(NoopStatePersistence),
+        )
+    }
+
+    fn bare_worker_with(
+        cfg: PushConfig,
+        transport: Arc<MockTransport>,
+        tokens: Arc<InMemoryTokenStore>,
+        persistence: Arc<dyn PushStatePersistence>,
+    ) -> Worker<MockTransport, InMemoryTokenStore, NoVoipRingTransport> {
+        // Получатель канала не нужен: тики таймеров в этих тестах никто не
+        // разбирает, и отправитель просто упрётся в закрытый канал.
+        let (tx, _rx) = mpsc::channel(8);
+        Worker::new(
+            &cfg,
             tx,
             transport,
             tokens,
-            voip: None,
-            persistence: Arc::new(NoopStatePersistence),
-            decision_cfg: cfg.decision_config(),
-            ring_cooldown: cfg.ring_cooldown,
-            states: DashMap::new(),
-            timers: DashMap::new(),
-            last_ring: DashMap::new(),
-            call_hints: DashMap::new(),
-        }
+            None,
+            persistence,
+            DEFAULT_SEND_CONCURRENCY,
+        )
     }
 
     /// Hint старше TTL относится к звонку, который у звонящего давно
@@ -1223,7 +1561,7 @@ mod integration_tests {
     #[tokio::test]
     async fn failed_send_keeps_the_call_hint_for_the_retry() {
         let transport = Arc::new(MockTransport::scripted([
-            SendOutcome::Backoff(BackoffReason::Quota),
+            SendOutcome::backoff(BackoffReason::Quota),
             SendOutcome::Ok,
         ]));
         let tokens = Arc::new(InMemoryTokenStore::default());
@@ -1271,5 +1609,455 @@ mod integration_tests {
 
         assert!(transport.sent_payloads().is_empty());
         assert!(worker.call_hints.is_empty());
+    }
+
+    fn new_message(user: UserId, device: DeviceId, priority: MessagePriority) -> Trigger {
+        Trigger::NewMessage {
+            user,
+            device,
+            priority: Some(priority),
+            wake_hint: None,
+        }
+    }
+
+    /// `device_id` выбирает отправитель. Триггер для пары без токена не
+    /// должен заводить ни состояния в памяти, ни строки в `push_state` —
+    /// иначе любой клиент раздувал бы их произвольными парами.
+    #[tokio::test]
+    async fn trigger_without_token_leaves_no_state() {
+        let transport = Arc::new(MockTransport::always_ok());
+        let tokens = Arc::new(InMemoryTokenStore::default());
+        let persistence = Arc::new(RecordingPersistence::empty());
+        let worker = bare_worker_with(fast_cfg(), transport.clone(), tokens, persistence.clone());
+
+        for device in 0..50u16 {
+            worker
+                .process(new_message(user(30), device, MessagePriority::Medium))
+                .await;
+        }
+        worker
+            .process(Trigger::NewMessage {
+                user: user(30),
+                device: 7,
+                priority: Some(MessagePriority::High),
+                wake_hint: Some(WakeHint::IncomingCall),
+            })
+            .await;
+
+        assert!(worker.states.is_empty());
+        assert!(worker.call_hints.is_empty(), "hint без токена не нужен");
+        assert_eq!(persistence.save_count(), 0);
+        assert!(transport.sent_payloads().is_empty());
+    }
+
+    /// Тик от уже погашенного окна не заводит пустую запись.
+    #[tokio::test]
+    async fn stale_timer_tick_leaves_no_state() {
+        let transport = Arc::new(MockTransport::always_ok());
+        let tokens = Arc::new(InMemoryTokenStore::default());
+        tokens.insert(user(31), 1, "tok");
+        let persistence = Arc::new(RecordingPersistence::empty());
+        let worker = bare_worker_with(fast_cfg(), transport, tokens, persistence.clone());
+
+        worker
+            .process(Trigger::TimerTick {
+                user: user(31),
+                device: 1,
+            })
+            .await;
+
+        assert!(worker.states.is_empty());
+        assert_eq!(persistence.save_count(), 0);
+    }
+
+    /// Мёртвый токен — состояние пары больше ни на что не влияет и
+    /// забывается вместе с ним, а не висит в памяти и в дереве навсегда.
+    #[tokio::test]
+    async fn invalid_token_forgets_the_state() {
+        let transport = Arc::new(MockTransport::always_invalid_token());
+        let tokens = Arc::new(InMemoryTokenStore::default());
+        tokens.insert(user(32), 2, "dead");
+        let persistence = Arc::new(RecordingPersistence::empty());
+        let worker = bare_worker_with(fast_cfg(), transport, tokens, persistence.clone());
+
+        worker
+            .process(new_message(user(32), 2, MessagePriority::High))
+            .await;
+
+        assert!(worker.states.is_empty());
+        assert_eq!(persistence.removed(), vec![(user(32), 2)]);
+    }
+
+    /// Если ни один интервал не держит окно, после успешной отправки
+    /// помнить нечего — запись не хранится вовсе.
+    #[tokio::test]
+    async fn nothing_is_retained_when_no_gap_holds_the_window() {
+        let mut cfg = fast_cfg();
+        cfg.min_gap_low = Duration::ZERO;
+        cfg.min_gap_none = Duration::ZERO;
+        let transport = Arc::new(MockTransport::always_ok());
+        let tokens = Arc::new(InMemoryTokenStore::default());
+        tokens.insert(user(33), 4, "tok");
+        let persistence = Arc::new(RecordingPersistence::empty());
+        let worker = bare_worker_with(cfg, transport.clone(), tokens, persistence.clone());
+
+        worker
+            .process(new_message(user(33), 4, MessagePriority::High))
+            .await;
+
+        assert_eq!(transport.sent_payloads().len(), 1);
+        assert!(worker.states.is_empty());
+        assert_eq!(persistence.save_count(), 0);
+    }
+
+    /// Вычистка убирает состояния, которые уже ни на что не влияют, из
+    /// памяти и из персистентности; живые и занятые прямо сейчас — оставляет.
+    #[tokio::test]
+    async fn sweep_drops_idle_states_but_keeps_live_and_busy_ones() {
+        let transport = Arc::new(MockTransport::always_ok());
+        let tokens = Arc::new(InMemoryTokenStore::default());
+        let persistence = Arc::new(RecordingPersistence::empty());
+        let worker = bare_worker_with(fast_cfg(), transport, tokens, persistence.clone());
+
+        let now = now_secs();
+        let long_ago = PushState {
+            last_push_at_secs: now - 10_000,
+            ..Default::default()
+        };
+        let idle = (user(34), 1);
+        let busy_idle = (user(34), 2);
+        let recent = (user(34), 3);
+        let pending = (user(34), 4);
+        worker.states.insert(idle, long_ago);
+        worker.states.insert(busy_idle, long_ago);
+        worker.states.insert(
+            recent,
+            PushState {
+                last_push_at_secs: now,
+                ..Default::default()
+            },
+        );
+        worker.states.insert(
+            pending,
+            PushState {
+                pending_since_last_push: 1,
+                ..long_ago
+            },
+        );
+
+        let busy = HashMap::from([(busy_idle, VecDeque::new())]);
+        worker.sweep(&busy);
+
+        assert!(!worker.states.contains_key(&idle));
+        assert!(worker.states.contains_key(&busy_idle));
+        assert!(worker.states.contains_key(&recent));
+        assert!(worker.states.contains_key(&pending));
+        assert_eq!(persistence.removed(), vec![idle]);
+    }
+
+    /// Служебные карты тоже не растут без предела: истёкший cooldown,
+    /// протухший call-hint и отработавший таймер вычищаются.
+    #[tokio::test]
+    async fn sweep_prunes_auxiliary_maps() {
+        let mut cfg = fast_cfg();
+        cfg.ring_cooldown = Duration::from_millis(30);
+        let transport = Arc::new(MockTransport::always_ok());
+        let tokens = Arc::new(InMemoryTokenStore::default());
+        let worker = bare_worker_with(cfg, transport, tokens, Arc::new(NoopStatePersistence));
+
+        let now = now_secs();
+        let old = (user(35), 1);
+        let fresh = (user(35), 2);
+
+        worker.last_ring.insert(old, Instant::now());
+        worker
+            .call_hints
+            .insert(old, now.saturating_sub(CALL_HINT_TTL_SECS + 1));
+        worker.timers.insert(old, tokio::spawn(async {}));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        worker.last_ring.insert(fresh, Instant::now());
+        worker.call_hints.insert(fresh, now);
+        worker.timers.insert(
+            fresh,
+            tokio::spawn(tokio::time::sleep(Duration::from_secs(60))),
+        );
+
+        worker.sweep(&HashMap::new());
+
+        assert!(!worker.last_ring.contains_key(&old));
+        assert!(worker.last_ring.contains_key(&fresh));
+        assert!(!worker.call_hints.contains_key(&old));
+        assert!(worker.call_hints.contains_key(&fresh));
+        assert!(!worker.timers.contains_key(&old));
+        assert!(worker.timers.contains_key(&fresh));
+    }
+
+    /// Гидрация не грузит мусор: записи, которые уже ни на что не влияют, и
+    /// записи устройств без токена удаляются из персистентности.
+    #[tokio::test]
+    async fn hydration_drops_idle_and_tokenless_rows() {
+        let now = now_secs();
+        let tokens = Arc::new(InMemoryTokenStore::default());
+        tokens.insert(user(36), 1, "tok");
+        tokens.insert(user(36), 3, "tok");
+
+        let idle = PushState {
+            last_push_at_secs: now - 10_000,
+            ..Default::default()
+        };
+        let live = PushState {
+            last_push_at_secs: now,
+            ..Default::default()
+        };
+        let persistence = Arc::new(RecordingPersistence::seeded(vec![
+            ((user(36), 1), idle),
+            ((user(36), 2), live),
+            ((user(36), 3), live),
+        ]));
+        let worker = bare_worker_with(
+            fast_cfg(),
+            Arc::new(MockTransport::always_ok()),
+            tokens,
+            persistence.clone(),
+        );
+
+        worker.hydrate(false);
+
+        assert_eq!(worker.states.len(), 1);
+        assert!(worker.states.contains_key(&(user(36), 3)));
+        let mut removed = persistence.removed();
+        removed.sort();
+        assert_eq!(removed, vec![(user(36), 1), (user(36), 2)]);
+    }
+
+    /// Таймеры живут только в памяти. Накопленное до рестарта, срок
+    /// которого уже наступил, обязано уйти само, без нового сообщения тому
+    /// же устройству, — иначе каждый деплой терял бы отложенные wake.
+    #[tokio::test]
+    async fn hydration_rearms_timers_for_pending_state() {
+        let transport = Arc::new(MockTransport::always_ok());
+        let tokens = Arc::new(InMemoryTokenStore::default());
+        tokens.insert(user(37), 6, "tok");
+
+        let pending = PushState {
+            last_push_at_secs: now_secs() - 1_000,
+            pending_since_last_push: 2,
+            highest_pending_priority: MessagePriority::as_storage_byte(Some(MessagePriority::Low)),
+            ..Default::default()
+        };
+        let persistence = Arc::new(RecordingPersistence::seeded(vec![((user(37), 6), pending)]));
+
+        let _scheduler = PushScheduler::start(fast_cfg(), transport.clone(), tokens, persistence);
+
+        wait_for(|| !transport.sent_payloads().is_empty()).await;
+        let sent = transport.sent_payloads();
+        assert_eq!(sent.len(), 1, "накопленное до рестарта должно уйти");
+        assert_eq!(sent[0].pending, 2);
+        assert_eq!(sent[0].max_priority, Some(MessagePriority::Low));
+    }
+
+    /// Выключенные пуши ничего не «досылают» по перевзведённым таймерам.
+    #[tokio::test]
+    async fn disabled_scheduler_does_not_resume_pending_state() {
+        let mut cfg = fast_cfg();
+        cfg.enabled = false;
+        let transport = Arc::new(MockTransport::always_ok());
+        let tokens = Arc::new(InMemoryTokenStore::default());
+        tokens.insert(user(38), 6, "tok");
+        let pending = PushState {
+            last_push_at_secs: now_secs() - 1_000,
+            pending_since_last_push: 2,
+            ..Default::default()
+        };
+        let persistence = Arc::new(RecordingPersistence::seeded(vec![((user(38), 6), pending)]));
+
+        let _scheduler = PushScheduler::start(cfg, transport.clone(), tokens, persistence);
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(transport.sent_payloads().is_empty());
+    }
+
+    /// Cooldown меньше секунды раньше округлялся до нуля через `as_secs()`
+    /// и не подавлял ничего. Теперь он сравнивается в своих миллисекундах.
+    #[tokio::test]
+    async fn sub_second_ring_cooldown_still_suppresses_duplicates() {
+        let mut cfg = fast_cfg();
+        cfg.ring_cooldown = Duration::from_millis(800);
+        let transport = Arc::new(MockTransport::always_ok());
+        let ring = Arc::new(MockRingTransport::always_ok());
+        let tokens = Arc::new(InMemoryTokenStore::default());
+        tokens.insert_voip(user(39), 2, "voip-token");
+
+        let scheduler = PushScheduler::start_with_voip(
+            cfg,
+            transport.clone(),
+            tokens,
+            Arc::new(NoopStatePersistence),
+            Some(ring.clone()),
+        );
+        let call = |scheduler: &PushScheduler| {
+            scheduler.on_undelivered(
+                user(39),
+                2,
+                Some(MessagePriority::High),
+                Some(WakeHint::IncomingCall),
+            )
+        };
+
+        call(&scheduler);
+        wait_for(|| !ring.sent_rings().is_empty()).await;
+        call(&scheduler);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(ring.sent_rings().len(), 1, "дубль внутри окна подавлен");
+
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        call(&scheduler);
+        wait_for(|| ring.sent_rings().len() == 2).await;
+        assert_eq!(ring.sent_rings().len(), 2, "после окна звонок проходит");
+        assert!(transport.sent_payloads().is_empty());
+    }
+
+    /// Транспорт, который считает одновременные отправки — всего и по
+    /// токену. Токен `slow` отвечает долго, остальные — с `latency`.
+    struct TrackingTransport {
+        latency: Duration,
+        in_flight: std::sync::atomic::AtomicUsize,
+        max_in_flight: std::sync::atomic::AtomicUsize,
+        per_token: std::sync::Mutex<HashMap<String, usize>>,
+        max_per_token: std::sync::atomic::AtomicUsize,
+        sent: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl TrackingTransport {
+        fn new(latency: Duration) -> Self {
+            Self {
+                latency,
+                in_flight: Default::default(),
+                max_in_flight: Default::default(),
+                per_token: Default::default(),
+                max_per_token: Default::default(),
+                sent: Default::default(),
+            }
+        }
+
+        fn sent(&self) -> Vec<String> {
+            self.sent.lock().unwrap().clone()
+        }
+    }
+
+    impl PushTransport for TrackingTransport {
+        async fn send(&self, payload: PushPayload) -> SendOutcome {
+            use std::sync::atomic::Ordering::SeqCst;
+
+            let now_in_flight = self.in_flight.fetch_add(1, SeqCst) + 1;
+            self.max_in_flight.fetch_max(now_in_flight, SeqCst);
+            {
+                let mut per_token = self.per_token.lock().unwrap();
+                let count = per_token.entry(payload.token.clone()).or_default();
+                *count += 1;
+                self.max_per_token.fetch_max(*count, SeqCst);
+            }
+
+            let latency = if payload.token == "slow" {
+                Duration::from_secs(5)
+            } else {
+                self.latency
+            };
+            tokio::time::sleep(latency).await;
+
+            *self
+                .per_token
+                .lock()
+                .unwrap()
+                .get_mut(&payload.token)
+                .unwrap() -= 1;
+            self.in_flight.fetch_sub(1, SeqCst);
+            self.sent.lock().unwrap().push(payload.token);
+            SendOutcome::Ok
+        }
+    }
+
+    fn start_tracking(
+        transport: Arc<TrackingTransport>,
+        tokens: Arc<InMemoryTokenStore>,
+        send_concurrency: usize,
+    ) -> PushScheduler {
+        PushScheduler::spawn::<_, _, NoVoipRingTransport>(
+            fast_cfg(),
+            transport,
+            tokens,
+            Arc::new(NoopStatePersistence),
+            None,
+            send_concurrency,
+        )
+    }
+
+    /// Повисшая отправка одному получателю не задерживает остальных: раньше
+    /// единственный воркер ждал её таймаут, и канал вставал для всех.
+    #[tokio::test]
+    async fn slow_recipient_does_not_block_others() {
+        let transport = Arc::new(TrackingTransport::new(Duration::ZERO));
+        let tokens = Arc::new(InMemoryTokenStore::default());
+        tokens.insert(user(40), 1, "slow");
+        tokens.insert(user(41), 1, "fast");
+
+        let scheduler = start_tracking(transport.clone(), tokens, 4);
+        scheduler.on_undelivered(user(40), 1, Some(MessagePriority::High), None);
+        scheduler.on_undelivered(user(41), 1, Some(MessagePriority::High), None);
+
+        wait_for(|| !transport.sent().is_empty()).await;
+        assert_eq!(transport.sent(), vec!["fast".to_string()]);
+    }
+
+    /// Отправки одному получателю никогда не идут внахлёст — переходы его
+    /// состояния последовательны, и ни одно сообщение не теряется.
+    #[tokio::test]
+    async fn sends_to_one_recipient_never_overlap() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let transport = Arc::new(TrackingTransport::new(Duration::from_millis(20)));
+        let tokens = Arc::new(InMemoryTokenStore::default());
+        tokens.insert(user(42), 1, "one");
+
+        let scheduler = start_tracking(transport.clone(), tokens, 8);
+        for _ in 0..5 {
+            scheduler.on_undelivered(user(42), 1, Some(MessagePriority::High), None);
+        }
+
+        for _ in 0..100 {
+            if transport.sent().len() == 5 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(transport.sent().len(), 5);
+        assert_eq!(transport.max_per_token.load(SeqCst), 1);
+    }
+
+    /// Одновременных обращений к провайдеру не больше заданного предела.
+    #[tokio::test]
+    async fn provider_calls_are_bounded() {
+        use std::sync::atomic::Ordering::SeqCst;
+
+        let transport = Arc::new(TrackingTransport::new(Duration::from_millis(30)));
+        let tokens = Arc::new(InMemoryTokenStore::default());
+        for seed in 50..56u8 {
+            tokens.insert(user(seed), 1, format!("tok-{seed}"));
+        }
+
+        let scheduler = start_tracking(transport.clone(), tokens, 2);
+        for seed in 50..56u8 {
+            scheduler.on_undelivered(user(seed), 1, Some(MessagePriority::High), None);
+        }
+
+        for _ in 0..100 {
+            if transport.sent().len() == 6 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(transport.sent().len(), 6);
+        assert_eq!(transport.max_in_flight.load(SeqCst), 2);
     }
 }

@@ -20,10 +20,27 @@ pub enum SendOutcome {
     /// Provider overload: 5xx, quota exceeded, unavailable. For wakes the
     /// scheduler applies exponential backoff (`suppress_initial` →
     /// `suppress_max`); a failed ring falls back to an FCM wake instead.
-    Backoff(BackoffReason),
+    Backoff {
+        reason: BackoffReason,
+        /// Пауза, которую провайдер назвал сам (`Retry-After`). Планировщик
+        /// не повторит раньше неё, даже если собственный шаг backoff'а
+        /// короче. `None` — провайдер ничего не назвал.
+        retry_after: Option<Duration>,
+    },
     /// Network / unexpected error. Treated like `Backoff` but counted
     /// separately in metrics.
     TransientError,
+}
+
+impl SendOutcome {
+    /// `Backoff` без подсказки провайдера — так отвечают все транспорты,
+    /// кроме FCM с заголовком `Retry-After`.
+    pub const fn backoff(reason: BackoffReason) -> Self {
+        Self::Backoff {
+            reason,
+            retry_after: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -31,6 +48,25 @@ pub enum BackoffReason {
     Quota,
     ServerError,
     Unavailable,
+}
+
+/// Ошибка reqwest, пригодная для лога.
+///
+/// `Display` у `reqwest::Error` печатает URL запроса, а у APNs токен
+/// устройства — часть пути (`/3/device/<token>`). Токен — это и есть
+/// capability на пробуждение устройства, в логах ему не место.
+pub(crate) fn loggable(err: reqwest::Error) -> reqwest::Error {
+    err.without_url()
+}
+
+/// Токен в отладочном выводе: только длина. Сам токен — capability на
+/// пробуждение устройства, а `Debug` нагрузки легко оказывается в логе.
+struct RedactedToken<'a>(&'a str);
+
+impl std::fmt::Debug for RedactedToken<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "<redacted, {} bytes>", self.0.len())
+    }
 }
 
 /// Kind of push being dispatched. `Wake` is the default fan-out used by the
@@ -47,7 +83,7 @@ pub enum PushKind {
 /// Data passed to the transport when the scheduler decides to send. The
 /// transport serializes it into its own wire format (FCM v1 envelope, gateway
 /// protobuf).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct PushPayload {
     pub user_id: UserId,
     pub device_id: DeviceId,
@@ -75,6 +111,21 @@ pub struct PushPayload {
     pub wake_hint: Option<WakeHint>,
 }
 
+impl std::fmt::Debug for PushPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PushPayload")
+            .field("user_id", &hex::encode(self.user_id))
+            .field("device_id", &self.device_id)
+            .field("token", &RedactedToken(&self.token))
+            .field("pending", &self.pending)
+            .field("max_priority", &self.max_priority)
+            .field("server_ts_secs", &self.server_ts_secs)
+            .field("kind", &self.kind)
+            .field("wake_hint", &self.wake_hint)
+            .finish()
+    }
+}
+
 /// Pluggable wake transport: FCM HTTP v1, the push gateway, or a mock in
 /// tests. The returned future must be `Send` so the worker can run on the
 /// multi-threaded runtime.
@@ -86,7 +137,7 @@ pub trait PushTransport: Send + Sync + 'static {
 /// `wakeHint = incomingCall`, у устройства зарегистрирован PushKit-токен.
 /// Payload на проводе content-free (E2E-инвариант) — вся идентификация
 /// звонящего происходит на клиенте после дренажа mailbox'а.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct RingPayload {
     pub user_id: UserId,
     pub device_id: DeviceId,
@@ -94,6 +145,17 @@ pub struct RingPayload {
     pub token: String,
     /// Server "now" (unix seconds) — клиент оценивает свежесть ring'а.
     pub server_ts_secs: u64,
+}
+
+impl std::fmt::Debug for RingPayload {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RingPayload")
+            .field("user_id", &hex::encode(self.user_id))
+            .field("device_id", &self.device_id)
+            .field("token", &RedactedToken(&self.token))
+            .field("server_ts_secs", &self.server_ts_secs)
+            .finish()
+    }
 }
 
 /// Транспорт APNs voip-пушей (`apns-push-type: voip`). Отдельный от
@@ -151,7 +213,7 @@ impl VoipRingTransport for MockRingTransport {
         let outcome = match &self.outcome {
             OutcomeStrategy::AlwaysOk => SendOutcome::Ok,
             OutcomeStrategy::AlwaysInvalidToken => SendOutcome::InvalidToken,
-            OutcomeStrategy::AlwaysBackoff(reason) => SendOutcome::Backoff(*reason),
+            OutcomeStrategy::AlwaysBackoff(reason) => SendOutcome::backoff(*reason),
             OutcomeStrategy::Scripted(queue) => {
                 queue.lock().unwrap().pop_front().unwrap_or(SendOutcome::Ok)
             }
@@ -293,7 +355,7 @@ impl PushTransport for MockTransport {
         let outcome = match &self.outcome {
             OutcomeStrategy::AlwaysOk => SendOutcome::Ok,
             OutcomeStrategy::AlwaysInvalidToken => SendOutcome::InvalidToken,
-            OutcomeStrategy::AlwaysBackoff(reason) => SendOutcome::Backoff(*reason),
+            OutcomeStrategy::AlwaysBackoff(reason) => SendOutcome::backoff(*reason),
             OutcomeStrategy::Scripted(queue) => {
                 queue.lock().unwrap().pop_front().unwrap_or(SendOutcome::Ok)
             }
@@ -306,5 +368,58 @@ impl PushTransport for MockTransport {
             }
             outcome
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SECRET: &str = "a1b2c3d4e5f6-device-token";
+
+    /// reqwest печатает URL в `Display` ошибки — проверяется и сама утечка
+    /// (иначе тест молча устареет вместе с reqwest), и то, что `loggable`
+    /// её закрывает.
+    #[tokio::test]
+    async fn loggable_error_does_not_carry_the_url() {
+        // Порт 1 закрыт: запрос падает на соединении, и ошибка несёт URL.
+        let err = reqwest::Client::new()
+            .post(format!("http://127.0.0.1:1/3/device/{SECRET}"))
+            .send()
+            .await
+            .expect_err("port 1 must refuse the connection");
+        assert!(
+            err.to_string().contains(SECRET),
+            "reqwest больше не печатает URL — проверку можно упростить"
+        );
+
+        let shown = loggable(err).to_string();
+        assert!(!shown.contains(SECRET), "token leaked: {shown}");
+    }
+
+    #[test]
+    fn payload_debug_never_prints_the_token() {
+        let wake = PushPayload {
+            user_id: [3; 32],
+            device_id: 4,
+            token: SECRET.to_string(),
+            pending: 1,
+            max_priority: None,
+            server_ts_secs: 1,
+            kind: PushKind::Wake,
+            wake_hint: None,
+        };
+        let shown = format!("{wake:?}");
+        assert!(!shown.contains(SECRET), "token leaked: {shown}");
+        assert!(shown.contains(&hex::encode([3u8; 32])));
+
+        let ring = RingPayload {
+            user_id: [3; 32],
+            device_id: 4,
+            token: SECRET.to_string(),
+            server_ts_secs: 1,
+        };
+        let shown = format!("{ring:?}");
+        assert!(!shown.contains(SECRET), "token leaked: {shown}");
     }
 }

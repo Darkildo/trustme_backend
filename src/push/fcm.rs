@@ -4,10 +4,14 @@
 //! tokens (RS256-signed JWTs exchanged for bearer tokens) and dispatches one
 //! message per call: a data-only wake or a visible welcome. Error mapping
 //! matches the contract laid out in `push::transport::SendOutcome`:
-//! - `NOT_FOUND` / `UNREGISTERED`, or `INVALID_ARGUMENT` blaming the token
-//!   field → `InvalidToken`
+//! - `details[].errorCode` (`google.firebase.fcm.v1.FcmError`) =
+//!   `UNREGISTERED` (404) or `SENDER_ID_MISMATCH` (403), or
+//!   `INVALID_ARGUMENT` blaming the token field → `InvalidToken`
+//! - any other 404 / 403 (wrong project, disabled API, missing IAM role) →
+//!   `TransientError`: the token is not at fault and must not be evicted
 //! - 429 (quota exceeded) → `Backoff(Quota)`
-//! - 503 → `Backoff(Unavailable)`, other 5xx → `Backoff(ServerError)`
+//! - 503 → `Backoff(Unavailable)`, other 5xx → `Backoff(ServerError)`;
+//!   a `Retry-After` header (delay-seconds) travels along as the minimum pause
 //! - 401 → cached access token dropped, `TransientError`
 //! - other 4xx, network / timeout / unexpected → `TransientError`
 //!
@@ -29,7 +33,9 @@ use tracing::{debug, warn};
 
 use crate::domain::priority::MessagePriority;
 use crate::domain::wake::WakeHint;
-use crate::push::transport::{BackoffReason, PushKind, PushPayload, PushTransport, SendOutcome};
+use crate::push::transport::{
+    BackoffReason, PushKind, PushPayload, PushTransport, SendOutcome, loggable,
+};
 
 /// Greeting shown when a brand-new user registers their first push token.
 const WELCOME_TITLE: &str = "Welcome!";
@@ -43,11 +49,28 @@ const WAKE_HINT_CALL: &str = "call";
 const GOOGLE_TOKEN_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
 const ACCESS_TOKEN_SKEW: Duration = Duration::from_secs(60);
 
-#[derive(Debug, Clone, Deserialize)]
+/// `@type` деталей ошибки, в которых FCM HTTP v1 кладёт машинный
+/// `errorCode`.
+const FCM_ERROR_TYPE: &str = "type.googleapis.com/google.firebase.fcm.v1.FcmError";
+
+#[derive(Clone, Deserialize)]
 struct ServiceAccount {
     client_email: String,
     private_key: String,
     token_uri: String,
+}
+
+/// Вручную, а не `derive`: `private_key` — ключ подписи всего проекта
+/// Firebase, и `{:?}` где-нибудь в логе или в тексте ошибки выложил бы его
+/// целиком.
+impl std::fmt::Debug for ServiceAccount {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServiceAccount")
+            .field("client_email", &self.client_email)
+            .field("private_key", &"<redacted>")
+            .field("token_uri", &self.token_uri)
+            .finish()
+    }
 }
 
 /// Concrete FCM v1 transport. Cheap to clone — wraps an `Arc` over the
@@ -169,12 +192,13 @@ impl FcmHttpV1Client {
         {
             Ok(resp) => resp,
             Err(err) => {
-                warn!(error = %err, "FCM request failed at transport layer");
+                warn!(error = %loggable(err), "FCM request failed at transport layer");
                 return SendOutcome::TransientError;
             }
         };
 
         let status = response.status();
+        let retry_after = retry_after(response.headers());
         let body = response.text().await.unwrap_or_default();
 
         match status {
@@ -187,16 +211,39 @@ impl FcmHttpV1Client {
                 self.invalidate_bearer().await;
                 SendOutcome::TransientError
             }
-            StatusCode::TOO_MANY_REQUESTS => SendOutcome::Backoff(BackoffReason::Quota),
-            StatusCode::SERVICE_UNAVAILABLE => SendOutcome::Backoff(BackoffReason::Unavailable),
-            s if s.is_server_error() => SendOutcome::Backoff(BackoffReason::ServerError),
-            s if s.is_client_error() => classify_client_error(&body),
+            StatusCode::TOO_MANY_REQUESTS => SendOutcome::Backoff {
+                reason: BackoffReason::Quota,
+                retry_after,
+            },
+            StatusCode::SERVICE_UNAVAILABLE => SendOutcome::Backoff {
+                reason: BackoffReason::Unavailable,
+                retry_after,
+            },
+            s if s.is_server_error() => SendOutcome::Backoff {
+                reason: BackoffReason::ServerError,
+                retry_after,
+            },
+            s if s.is_client_error() => classify_client_error(status, &body),
             _ => {
                 warn!(status = %status, body = %body, "FCM returned unexpected status");
                 SendOutcome::TransientError
             }
         }
     }
+}
+
+/// `Retry-After` в форме delay-seconds — так его отдаёт FCM на 429 и 503.
+/// Форма HTTP-date не разбирается: FCM её не использует, а без подсказки
+/// планировщик всё равно отступит по собственной экспоненте.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    headers
+        .get(reqwest::header::RETRY_AFTER)?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(Duration::from_secs)
 }
 
 impl PushTransport for FcmHttpV1Client {
@@ -322,11 +369,25 @@ fn priority_routing(p: Option<MessagePriority>) -> (&'static str, &'static str) 
     }
 }
 
-fn classify_client_error(body: &str) -> SendOutcome {
+/// Классификация 4xx-ответа (кроме 401 и 429, разобранных выше).
+///
+/// Решение о смерти токена принимается только по машинному `errorCode` из
+/// `details[]` (`google.firebase.fcm.v1.FcmError`), а не по HTTP-статусу или
+/// `error.status`: тот же 404 `NOT_FOUND` FCM отдаёт и на неверный project
+/// id, и тогда эвикция по статусу стёрла бы токены всех устройств ноды за
+/// один проход. Ошибиться в сторону ретрая дешевле: лишний запрос против
+/// устройства, молчащего до следующей регистрации.
+///
+/// Справочник кодов:
+/// https://firebase.google.com/docs/reference/fcm/rest/v1/ErrorCode
+fn classify_client_error(http_status: StatusCode, body: &str) -> SendOutcome {
     // FCM v1 error body shape: { "error": { "status": "...", "details": [...] } }
     let parsed: Value = match serde_json::from_str(body) {
         Ok(value) => value,
-        Err(_) => return SendOutcome::TransientError,
+        Err(_) => {
+            warn!(status = %http_status, body = %body, "FCM client error with a non-JSON body");
+            return SendOutcome::TransientError;
+        }
     };
 
     let status = parsed
@@ -340,10 +401,13 @@ fn classify_client_error(body: &str) -> SendOutcome {
         .and_then(|m| m.as_str())
         .unwrap_or("");
 
-    // Token-fatal statuses per
-    // https://firebase.google.com/docs/cloud-messaging/send-message#rest
-    if status == "NOT_FOUND" || status == "UNREGISTERED" {
-        return SendOutcome::InvalidToken;
+    match fcm_error_code(&parsed) {
+        // Токен отозван: приложение удалено, токен протух или перевыпущен.
+        Some("UNREGISTERED") => return SendOutcome::InvalidToken,
+        // Токен выписан другому Firebase-проекту. Ретрай его не оживит —
+        // он не наш, и держать его значит вечно ретраить в пустоту.
+        Some("SENDER_ID_MISMATCH") => return SendOutcome::InvalidToken,
+        _ => {}
     }
 
     if status == "INVALID_ARGUMENT" && invalid_argument_blames_token(&parsed, message) {
@@ -356,12 +420,26 @@ fn classify_client_error(body: &str) -> SendOutcome {
     // the human-readable `message` for INVALID_ARGUMENT is generic ("Request
     // contains an invalid argument.") and hides which field FCM rejected.
     warn!(
+        http_status = %http_status,
         status = %status,
         message = %message,
         body = %body,
         "FCM client error treated as transient"
     );
     SendOutcome::TransientError
+}
+
+/// `errorCode` из деталей типа `google.firebase.fcm.v1.FcmError`, если FCM
+/// его прислал. Детали других типов (`google.rpc.BadRequest` и т. п.) не
+/// смотрятся: поле с тем же именем в них значило бы другое.
+fn fcm_error_code(parsed: &Value) -> Option<&str> {
+    parsed
+        .get("error")?
+        .get("details")?
+        .as_array()?
+        .iter()
+        .filter(|detail| detail.get("@type").and_then(Value::as_str) == Some(FCM_ERROR_TYPE))
+        .find_map(|detail| detail.get("errorCode")?.as_str())
 }
 
 /// Виноват ли в `INVALID_ARGUMENT` именно registration token.
@@ -589,20 +667,88 @@ mod tests {
         assert_eq!(none["message"]["apns"]["headers"]["apns-priority"], "5");
     }
 
+    /// Ответ FCM на отозванный токен: 404 `NOT_FOUND` с `errorCode =
+    /// UNREGISTERED` в деталях `FcmError`.
     #[test]
-    fn classify_unregistered_status_as_invalid_token() {
-        let body =
-            r#"{"error":{"status":"NOT_FOUND","message":"Requested entity was not found."}}"#;
-        assert!(matches!(
-            classify_client_error(body),
+    fn classify_unregistered_error_code_as_invalid_token() {
+        let body = r#"{
+          "error": {
+            "code": 404,
+            "message": "Requested entity was not found.",
+            "status": "NOT_FOUND",
+            "details": [
+              {"@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError",
+               "errorCode": "UNREGISTERED"}
+            ]
+          }
+        }"#;
+        assert_eq!(
+            classify_client_error(StatusCode::NOT_FOUND, body),
             SendOutcome::InvalidToken
-        ));
+        );
+    }
 
-        let body2 = r#"{"error":{"status":"UNREGISTERED","message":""}}"#;
-        assert!(matches!(
-            classify_client_error(body2),
+    /// 404 без `errorCode = UNREGISTERED` — это не про токен: так FCM
+    /// отвечает, например, на неверный project id. Стирать по нему токен
+    /// значило бы за один проход вычистить все устройства ноды.
+    #[test]
+    fn other_not_found_never_evicts_the_token() {
+        let wrong_project = r#"{"error":{"code":404,"status":"NOT_FOUND","message":"Requested entity was not found."}}"#;
+        assert_eq!(
+            classify_client_error(StatusCode::NOT_FOUND, wrong_project),
+            SendOutcome::TransientError
+        );
+
+        let html = "<html><body>404 Not Found</body></html>";
+        assert_eq!(
+            classify_client_error(StatusCode::NOT_FOUND, html),
+            SendOutcome::TransientError
+        );
+
+        // `errorCode` с тем же значением, но в деталях чужого типа, — не
+        // сигнал FCM о токене.
+        let foreign_detail = r#"{
+          "error": {
+            "status": "NOT_FOUND",
+            "details": [{"@type": "type.googleapis.com/google.rpc.ErrorInfo",
+                         "errorCode": "UNREGISTERED"}]
+          }
+        }"#;
+        assert_eq!(
+            classify_client_error(StatusCode::NOT_FOUND, foreign_detail),
+            SendOutcome::TransientError
+        );
+    }
+
+    /// Токен чужого Firebase-проекта не оживёт никаким ретраем.
+    #[test]
+    fn sender_id_mismatch_evicts_the_token() {
+        let body = r#"{
+          "error": {
+            "code": 403,
+            "message": "SenderId mismatch",
+            "status": "PERMISSION_DENIED",
+            "details": [
+              {"@type": "type.googleapis.com/google.firebase.fcm.v1.FcmError",
+               "errorCode": "SENDER_ID_MISMATCH"}
+            ]
+          }
+        }"#;
+        assert_eq!(
+            classify_client_error(StatusCode::FORBIDDEN, body),
             SendOutcome::InvalidToken
-        ));
+        );
+    }
+
+    /// Прочие 403 — вопрос прав сервисного аккаунта или выключенного API,
+    /// а не токена.
+    #[test]
+    fn permission_denied_without_error_code_keeps_the_token() {
+        let body = r#"{"error":{"code":403,"status":"PERMISSION_DENIED","message":"Firebase Cloud Messaging API has not been used in project"}}"#;
+        assert_eq!(
+            classify_client_error(StatusCode::FORBIDDEN, body),
+            SendOutcome::TransientError
+        );
     }
 
     #[test]
@@ -610,16 +756,54 @@ mod tests {
         let token_err =
             r#"{"error":{"status":"INVALID_ARGUMENT","message":"Invalid registration token"}}"#;
         assert!(matches!(
-            classify_client_error(token_err),
+            classify_client_error(StatusCode::BAD_REQUEST, token_err),
             SendOutcome::InvalidToken
         ));
 
         let payload_err =
             r#"{"error":{"status":"INVALID_ARGUMENT","message":"Invalid value at message.data"}}"#;
         assert!(matches!(
-            classify_client_error(payload_err),
+            classify_client_error(StatusCode::BAD_REQUEST, payload_err),
             SendOutcome::TransientError
         ));
+    }
+
+    #[test]
+    fn retry_after_reads_delay_seconds_only() {
+        use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
+
+        let mut headers = HeaderMap::new();
+        assert_eq!(retry_after(&headers), None);
+
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("120"));
+        assert_eq!(retry_after(&headers), Some(Duration::from_secs(120)));
+
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"),
+        );
+        assert_eq!(retry_after(&headers), None);
+    }
+
+    /// `private_key` — ключ подписи всего проекта: `{:?}` не должен его
+    /// показывать ни целиком, ни частично.
+    #[test]
+    fn service_account_debug_redacts_the_private_key() {
+        // PEM-обёртка собирается из частей: целиком она выглядела бы для
+        // сканеров секретов как настоящий ключ в репозитории.
+        let pem_label = ["PRIVATE", "KEY"].join(" ");
+        let account = ServiceAccount {
+            client_email: "push@project.iam.gserviceaccount.com".into(),
+            private_key: format!(
+                "-----BEGIN {pem_label}-----\nMIIEsecretmaterial\n-----END {pem_label}-----\n"
+            ),
+            token_uri: "https://oauth2.googleapis.com/token".into(),
+        };
+        let shown = format!("{account:?}");
+        assert!(!shown.contains("secretmaterial"), "key leaked: {shown}");
+        assert!(!shown.contains("BEGIN PRIVATE KEY"), "key leaked: {shown}");
+        assert!(shown.contains("push@project.iam.gserviceaccount.com"));
+        assert!(shown.contains("<redacted>"));
     }
 
     /// Типичный ответ FCM HTTP v1: `message` generic, причина — в
@@ -644,7 +828,7 @@ mod tests {
           }
         }"#;
         assert!(matches!(
-            classify_client_error(token_err),
+            classify_client_error(StatusCode::BAD_REQUEST, token_err),
             SendOutcome::InvalidToken
         ));
 
@@ -664,7 +848,7 @@ mod tests {
           }
         }"#;
         assert!(matches!(
-            classify_client_error(payload_err),
+            classify_client_error(StatusCode::BAD_REQUEST, payload_err),
             SendOutcome::TransientError
         ));
     }
@@ -693,7 +877,7 @@ mod tests {
     #[test]
     fn classify_unparseable_body_falls_back_to_transient() {
         assert!(matches!(
-            classify_client_error("not json"),
+            classify_client_error(StatusCode::BAD_REQUEST, "not json"),
             SendOutcome::TransientError
         ));
     }

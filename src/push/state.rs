@@ -42,6 +42,35 @@ impl PushState {
     pub fn set_highest_priority(&mut self, priority: Option<MessagePriority>) {
         self.highest_pending_priority = MessagePriority::as_storage_byte(priority);
     }
+
+    /// Состояние больше ни на что не влияет: накопленного нет, backoff
+    /// истёк, и отметка последнего пуша старше самого длинного интервала
+    /// (`DecisionConfig::longest_gap_secs`). Следующее решение для такой
+    /// записи совпадёт с решением для `PushState::default()`, поэтому её
+    /// можно не хранить вовсе — иначе карта и дерево `push_state` копят
+    /// по строке на каждую пару, которой хоть раз слали пуш.
+    ///
+    /// Шаг backoff'а (`current_backoff_secs`) при этом теряется намеренно:
+    /// после затишья следующая неудача и так должна начинать с начального
+    /// шага.
+    pub fn is_idle(&self, now_secs: u64, longest_gap_secs: u64) -> bool {
+        self.pending_since_last_push == 0
+            && self.suppressed_until_secs <= now_secs
+            && self.last_push_at_secs.saturating_add(longest_gap_secs) <= now_secs
+    }
+}
+
+/// Длительность, округлённая вверх до целых секунд.
+///
+/// Отметки времени в `PushState` — целые unix-секунды, а интервалы в
+/// конфиге — миллисекунды. `Duration::as_secs` округляет вниз, и 500 мс
+/// превращались в ноль: коалесинг и cooldown молча отключались. Округление
+/// вверх, потому что интервал из конфига — нижняя граница: пуш не должен
+/// уйти раньше.
+pub fn ceil_secs(duration: Duration) -> u64 {
+    duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_nanos() > 0))
 }
 
 /// Tunable thresholds for the push decision machine. Mirrors `crate::config::PushConfig`
@@ -86,6 +115,23 @@ impl DecisionConfig {
             Some(MessagePriority::Low) => self.burst_low,
             None => self.burst_none,
         }
+    }
+
+    /// Сколько секунд после пуша его отметка ещё может изменить решение.
+    /// Приоритет следующего сообщения заранее неизвестен, поэтому берётся
+    /// самый длинный из интервалов, которые вообще истекают по времени.
+    pub fn longest_gap_secs(&self) -> u64 {
+        [
+            Some(MessagePriority::High),
+            Some(MessagePriority::Medium),
+            Some(MessagePriority::Low),
+            None,
+        ]
+        .into_iter()
+        .filter_map(|priority| self.min_gap_for(priority))
+        .map(ceil_secs)
+        .max()
+        .unwrap_or(0)
     }
 }
 
@@ -173,7 +219,7 @@ pub fn decide(
     let gap_satisfied = match gap {
         Some(min_gap) => {
             let elapsed = now_secs.saturating_sub(state.last_push_at_secs);
-            state.last_push_at_secs == 0 || elapsed >= min_gap.as_secs()
+            state.last_push_at_secs == 0 || elapsed >= ceil_secs(min_gap)
         }
         // Приоритет не будит по времени: сколько ни жди, интервал не
         // истечёт. Окно закрывает только накопление (burst) или сообщение
@@ -203,7 +249,7 @@ pub fn decide(
             // computed from the "never sent" sentinel.
             Some(min_gap) => Decision {
                 action: DecisionAction::WaitUntil(
-                    state.last_push_at_secs.saturating_add(min_gap.as_secs()),
+                    state.last_push_at_secs.saturating_add(ceil_secs(min_gap)),
                 ),
                 state,
             },
@@ -225,16 +271,53 @@ pub fn on_send_success(state: &mut PushState) {
 
 /// Apply a transient send failure: exponentially increase backoff and set
 /// `suppressed_until_secs`. The next `decide` call will short-circuit until then.
-pub fn on_send_backoff(state: &mut PushState, now_secs: u64, cfg: &DecisionConfig) {
-    let initial = cfg.suppress_initial.as_secs().max(1);
-    let max = cfg.suppress_max.as_secs().max(initial);
+///
+/// `retry_after` — пауза, которую назвал сам провайдер (`Retry-After`).
+/// Она поднимает только текущее окно подавления, но не шаг экспоненты:
+/// провайдер говорит о своём состоянии сейчас, а не о том, как быстро нам
+/// наращивать паузу дальше. Ограничена `suppress_max`, чтобы абсурдное
+/// значение заголовка не заглушило устройство на сутки.
+pub fn on_send_backoff(
+    state: &mut PushState,
+    now_secs: u64,
+    cfg: &DecisionConfig,
+    retry_after: Option<Duration>,
+) {
+    let initial = ceil_secs(cfg.suppress_initial).max(1);
+    let max = ceil_secs(cfg.suppress_max).max(initial);
     let next = if state.current_backoff_secs == 0 {
         initial
     } else {
         state.current_backoff_secs.saturating_mul(2).min(max)
     };
     state.current_backoff_secs = next;
-    state.suppressed_until_secs = now_secs.saturating_add(next);
+    let hinted = retry_after.map(ceil_secs).unwrap_or(0).min(max);
+    state.suppressed_until_secs = now_secs.saturating_add(next.max(hinted));
+}
+
+/// Когда перепроверить состояние, пережившее рестарт.
+///
+/// Таймеры живут только в памяти, и без этого накопленное до рестарта
+/// ждало бы следующего сообщения тому же устройству — то есть, возможно,
+/// никогда. `None` — будить по времени нечего: накопленного нет, либо его
+/// приоритет не будит по времени и backoff не активен (такое окно закроет
+/// только новое сообщение).
+pub fn resume_deadline(state: &PushState, cfg: &DecisionConfig) -> Option<u64> {
+    if state.pending_since_last_push == 0 {
+        return None;
+    }
+    match cfg.min_gap_for(state.highest_priority()) {
+        Some(gap) => Some(
+            state
+                .last_push_at_secs
+                .saturating_add(ceil_secs(gap))
+                .max(state.suppressed_until_secs),
+        ),
+        // Порог burst мог быть достигнут ещё до рестарта, а отправку
+        // отложил backoff: по его истечении `decide` её и выполнит.
+        None if state.suppressed_until_secs > 0 => Some(state.suppressed_until_secs),
+        None => None,
+    }
 }
 
 #[cfg(test)]
@@ -561,19 +644,59 @@ mod tests {
         let mut s = PushState::default();
         let c = cfg();
 
-        on_send_backoff(&mut s, 100, &c);
+        on_send_backoff(&mut s, 100, &c, None);
         assert_eq!(s.current_backoff_secs, 30);
         assert_eq!(s.suppressed_until_secs, 130);
 
-        on_send_backoff(&mut s, 200, &c);
+        on_send_backoff(&mut s, 200, &c, None);
         assert_eq!(s.current_backoff_secs, 60);
         assert_eq!(s.suppressed_until_secs, 260);
 
         // Walk it up to the cap.
         for _ in 0..20 {
-            on_send_backoff(&mut s, 1000, &c);
+            on_send_backoff(&mut s, 1000, &c, None);
         }
         assert_eq!(s.current_backoff_secs, 3600);
+    }
+
+    /// `Retry-After` провайдера удлиняет текущее окно, но не разгоняет
+    /// экспоненту: следующий шаг считается от собственного шага.
+    #[test]
+    fn retry_after_extends_only_the_current_window() {
+        let mut s = PushState::default();
+        let c = cfg();
+
+        on_send_backoff(&mut s, 100, &c, Some(Duration::from_secs(300)));
+        assert_eq!(s.suppressed_until_secs, 400);
+        assert_eq!(s.current_backoff_secs, 30);
+
+        // Подсказка короче собственного шага ничего не сокращает.
+        on_send_backoff(&mut s, 1000, &c, Some(Duration::from_secs(5)));
+        assert_eq!(s.suppressed_until_secs, 1060);
+        assert_eq!(s.current_backoff_secs, 60);
+    }
+
+    /// Абсурдный `Retry-After` не глушит устройство дольше `suppress_max`.
+    #[test]
+    fn retry_after_is_capped_by_suppress_max() {
+        let mut s = PushState::default();
+        let c = cfg();
+
+        on_send_backoff(&mut s, 100, &c, Some(Duration::from_secs(86_400 * 30)));
+        assert_eq!(s.suppressed_until_secs, 100 + 3600);
+    }
+
+    /// Миллисекундный backoff не укорачивается округлением вниз.
+    #[test]
+    fn sub_second_backoff_rounds_up() {
+        let mut s = PushState::default();
+        let mut c = cfg();
+        c.suppress_initial = Duration::from_millis(1500);
+        c.suppress_max = Duration::from_millis(1500);
+
+        on_send_backoff(&mut s, 100, &c, None);
+        assert_eq!(s.current_backoff_secs, 2);
+        assert_eq!(s.suppressed_until_secs, 102);
     }
 
     #[test]
@@ -586,5 +709,179 @@ mod tests {
         on_send_success(&mut s);
         assert_eq!(s.suppressed_until_secs, 0);
         assert_eq!(s.current_backoff_secs, 0);
+    }
+
+    #[test]
+    fn ceil_secs_rounds_partial_seconds_up() {
+        assert_eq!(ceil_secs(Duration::ZERO), 0);
+        assert_eq!(ceil_secs(Duration::from_millis(1)), 1);
+        assert_eq!(ceil_secs(Duration::from_millis(500)), 1);
+        assert_eq!(ceil_secs(Duration::from_millis(1000)), 1);
+        assert_eq!(ceil_secs(Duration::from_millis(1001)), 2);
+        assert_eq!(ceil_secs(Duration::from_secs(10)), 10);
+    }
+
+    /// Интервал меньше секунды раньше округлялся до нуля через `as_secs()`
+    /// и молча отключал коалесинг: второе Medium-сообщение в ту же секунду
+    /// уходило отдельным пушем. Теперь оно ждёт ближайшей целой секунды.
+    #[test]
+    fn sub_second_gap_still_coalesces() {
+        let mut c = cfg();
+        c.min_gap_medium = Duration::from_millis(500);
+        c.burst_medium = 100;
+
+        let s = PushState {
+            last_push_at_secs: 100,
+            ..Default::default()
+        };
+        let d = decide(
+            s,
+            DecisionInput::NewMessage(Some(MessagePriority::Medium)),
+            100,
+            &c,
+        );
+        assert_eq!(d.action, DecisionAction::WaitUntil(101));
+
+        let d = decide(d.state, DecisionInput::TimerTick, 101, &c);
+        assert_eq!(
+            d.action,
+            DecisionAction::SendNow {
+                pending: 1,
+                max_priority: Some(MessagePriority::Medium),
+            }
+        );
+    }
+
+    /// Нулевой интервал по-прежнему значит «сразу».
+    #[test]
+    fn zero_gap_still_sends_immediately() {
+        let s = PushState {
+            last_push_at_secs: 100,
+            ..Default::default()
+        };
+        let d = decide(
+            s,
+            DecisionInput::NewMessage(Some(MessagePriority::High)),
+            100,
+            &cfg(),
+        );
+        assert!(matches!(d.action, DecisionAction::SendNow { .. }));
+    }
+
+    #[test]
+    fn longest_gap_ignores_priorities_that_never_wake_by_time() {
+        let mut c = cfg();
+        assert_eq!(c.longest_gap_secs(), 120);
+
+        c.wake_on_unspecified = false;
+        assert_eq!(c.longest_gap_secs(), 60);
+
+        c.min_gap_low = Duration::from_millis(60_001);
+        assert_eq!(c.longest_gap_secs(), 61);
+    }
+
+    #[test]
+    fn idle_state_is_one_that_no_longer_affects_decisions() {
+        let longest = cfg().longest_gap_secs();
+        let now = 10_000;
+
+        assert!(PushState::default().is_idle(now, longest));
+
+        let recent_push = PushState {
+            last_push_at_secs: now - 10,
+            ..Default::default()
+        };
+        assert!(
+            !recent_push.is_idle(now, longest),
+            "свежая отметка пуша ещё держит окно коалесинга"
+        );
+
+        let old_push = PushState {
+            last_push_at_secs: now - longest,
+            current_backoff_secs: 60,
+            ..Default::default()
+        };
+        assert!(old_push.is_idle(now, longest));
+
+        let pending = PushState {
+            pending_since_last_push: 1,
+            ..Default::default()
+        };
+        assert!(!pending.is_idle(now, longest));
+
+        let suppressed = PushState {
+            suppressed_until_secs: now + 1,
+            ..Default::default()
+        };
+        assert!(!suppressed.is_idle(now, longest));
+    }
+
+    /// Удалённое «пустое» состояние решает так же, как хранившееся: иначе
+    /// вычистка меняла бы поведение коалесинга.
+    #[test]
+    fn idle_state_decides_like_default() {
+        let c = cfg();
+        let now = 10_000;
+        let idle = PushState {
+            last_push_at_secs: now - c.longest_gap_secs(),
+            ..Default::default()
+        };
+        assert!(idle.is_idle(now, c.longest_gap_secs()));
+
+        for priority in [
+            Some(MessagePriority::High),
+            Some(MessagePriority::Medium),
+            Some(MessagePriority::Low),
+            None,
+        ] {
+            let input = DecisionInput::NewMessage(priority);
+            assert_eq!(
+                decide(idle, input, now, &c).action,
+                decide(PushState::default(), input, now, &c).action,
+                "priority {priority:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn resume_deadline_waits_for_both_gap_and_backoff() {
+        let c = cfg();
+        let medium = MessagePriority::as_storage_byte(Some(MessagePriority::Medium));
+
+        assert_eq!(resume_deadline(&PushState::default(), &c), None);
+
+        let coalescing = PushState {
+            last_push_at_secs: 100,
+            pending_since_last_push: 2,
+            highest_pending_priority: medium,
+            ..Default::default()
+        };
+        assert_eq!(resume_deadline(&coalescing, &c), Some(110));
+
+        let suppressed = PushState {
+            suppressed_until_secs: 500,
+            ..coalescing
+        };
+        assert_eq!(resume_deadline(&suppressed, &c), Some(500));
+    }
+
+    #[test]
+    fn resume_deadline_for_priorities_that_never_wake_by_time() {
+        let mut c = cfg();
+        c.wake_on_unspecified = false;
+
+        let silent = PushState {
+            last_push_at_secs: 100,
+            pending_since_last_push: 3,
+            ..Default::default()
+        };
+        assert_eq!(resume_deadline(&silent, &c), None);
+
+        // Отправку по порогу отложил backoff — проверить по его истечении.
+        let deferred_burst = PushState {
+            suppressed_until_secs: 700,
+            ..silent
+        };
+        assert_eq!(resume_deadline(&deferred_burst, &c), Some(700));
     }
 }
