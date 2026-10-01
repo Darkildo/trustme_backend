@@ -10,7 +10,7 @@ mod common;
 
 use anyhow::{Result, bail};
 use common::{
-    FRAME_MAX, connect, connect_as, decode, expect_auth_ok, next_frame, send_and_read_ack,
+    Conn, FRAME_MAX, connect, connect_as, decode, expect_auth_ok, next_frame, send_and_read_ack,
     spawn_server,
 };
 use ed25519_dalek::SigningKey;
@@ -19,10 +19,7 @@ use trust_message_tcp::config::LimitsConfig;
 use trust_message_tcp::wire::frame;
 
 /// Собрать все входящие, которые нода отдаст за отведённое окно.
-async fn drain_incoming(
-    conn: &mut trust_message_tcp::net::noise::NoiseFramed<tokio::net::TcpStream>,
-    window: Duration,
-) -> Result<Vec<Vec<u8>>> {
+async fn drain_incoming(conn: &mut Conn, window: Duration) -> Result<Vec<Vec<u8>>> {
     let mut bodies = Vec::new();
     loop {
         match timeout(window, conn.next_frame()).await {

@@ -1,5 +1,8 @@
 use anyhow::{Result, bail};
+use bytes::BytesMut;
 use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::{net::TcpStream, select, sync::mpsc};
 use tracing::{debug, error, info, warn};
 
@@ -20,7 +23,7 @@ use crate::observability::{self, ConnectionMetricsGuard};
 use crate::push::PushScheduler;
 use crate::state::queues::QueueError;
 use crate::state::{
-    push_tokens::PushTokenStore,
+    push_tokens::{PushTokenStore, RegisterOutcome},
     registry::{ConnRegistry, DeviceId, OutboundFrame, UserId},
     storage::{EnqueueResult, QueueQuotaCeilings, Storage, StoredMessage},
 };
@@ -108,18 +111,13 @@ pub async fn handle_conn(
         }
     };
 
-    // Хендшейк позади — место на входе освобождается немедленно, дальше
-    // сессия учитывается лимитом сессий на пользователя.
-    drop(admission_guard);
-
     let user_id = identity.user_id;
     let device_id = identity.device_id;
     let protocol_version = identity.protocol_version;
     let scope = identity.scope;
     let cert_not_after = identity.cert_not_after;
 
-    observability::observe_connection_auth("ok");
-    info!(
+    debug!(
         user = %hex::encode(user_id),
         ?device_id,
         protocol_version,
@@ -128,24 +126,9 @@ pub async fn handle_conn(
         "noise session established"
     );
 
-    // Лимит одновременных сессий на ключ. Проверяется до AuthOk и
-    // регистрации; отказ приходит по уже установленному каналу. Гонка двух
-    // параллельных подключений через порог допустима — лимит best-effort,
-    // см. `ConnRegistry::session_count`.
-    if limits.cfg.max_sessions_per_user > 0
-        && registry.session_count(&user_id) >= limits.cfg.max_sessions_per_user
-    {
-        observability::observe_reject("session_limit");
-        observability::observe_connection_auth("limit");
-        let err_frame = encode_auth_error(401, "session limit exceeded");
-        framed.send_frame(&err_frame).await?;
-        warn!(
-            user = %hex::encode(user_id),
-            limit = limits.cfg.max_sessions_per_user,
-            "connection rejected: session limit exceeded"
-        );
-        bail!("session limit exceeded");
-    }
+    // Лимит одновременных сессий на ключ. Проверяется до AuthOk; отказ
+    // приходит по уже установленному каналу.
+    refuse_over_session_limit(&mut framed, &registry, &limits, &user_id).await?;
 
     let ok_bytes = encode_auth_ok(user_id)?;
     framed.send_frame(&ok_bytes).await?;
@@ -156,8 +139,46 @@ pub async fn handle_conn(
         "sent auth ok to client"
     );
 
+    // Сессия начинается с первого кадра клиента, а не с хендшейка. msg1 IK
+    // можно записать и переиграть: нода ответит на повтор msg2 и `AuthOk`,
+    // но транспортные ключи зависят от свежего эфемерала ноды, и прислать
+    // расшифровываемый кадр может только владелец эфемерного ключа клиента.
+    // До этого кадра соединение не регистрируется, не поднимает доставку,
+    // не трогает офлайн-очередь и ничего не получает.
+    //
+    // Место на входе держится до подтверждения: неподтверждённое соединение
+    // ещё не учтено лимитом сессий, и без входа повторы не ограничивало бы
+    // ничто.
+    let confirm_timeout = Duration::from_secs(limits.cfg.session_confirm_timeout_secs);
+    let Some(confirming_frame) =
+        await_session_confirmation(&mut framed, &user_id, device_id, confirm_timeout).await?
+    else {
+        return Ok(());
+    };
+    drop(admission_guard);
+
+    if cert_not_after.is_some_and(|not_after| unix_now_secs() >= not_after) {
+        info!(
+            user = %hex::encode(user_id),
+            ?device_id,
+            "device certificate expired; closing delegated session"
+        );
+        return Ok(());
+    }
+
+    // Пока клиент подтверждал сессию, лимит могли выбрать другие его
+    // сессии. Проверка и регистрация не атомарны, так что гонка двух
+    // подтверждений через порог остаётся — лимит best-effort, см.
+    // `ConnRegistry::session_count`.
+    refuse_over_session_limit(&mut framed, &registry, &limits, &user_id).await?;
+    observability::observe_connection_auth("ok");
+
+    // Отправитель канала живёт только в реестре. Выписка из реестра —
+    // например, за то, что сессия не успевает читать, — закрывает канал, и
+    // сессия, отдав уже принятое, завершается, а не остаётся живой, но
+    // недостижимой для новых сообщений.
     let (tx_to_client, mut rx_to_client) = mpsc::channel::<OutboundFrame>(1024);
-    let registration = registry.insert(user_id, device_id, tx_to_client.clone());
+    let registration = registry.insert(user_id, device_id, tx_to_client);
     let _registry_cleanup = RegistryCleanup {
         registry: registry.clone(),
         delivery_backend: delivery_backend.clone(),
@@ -227,7 +248,7 @@ pub async fn handle_conn(
                 }
             };
             if !inbox_messages.is_empty() {
-                info!(
+                debug!(
                     user = %hex::encode(user_id),
                     ?device_id,
                     count = inbox_messages.len(),
@@ -259,7 +280,7 @@ pub async fn handle_conn(
                     }
                 };
             if !inbox_messages.is_empty() {
-                info!(
+                debug!(
                     user = %hex::encode(user_id),
                     device_id = current_device_id,
                     count = inbox_messages.len(),
@@ -279,9 +300,20 @@ pub async fn handle_conn(
         }
     }
 
+    // Срок сертификата закрывает и молчащую сессию: проверка на входящем
+    // кадре одна не сработала бы, пока клиент ничего не шлёт.
+    let cert_expiry = async move {
+        match cert_not_after {
+            Some(not_after) => tokio::time::sleep_until(instant_at_unix_secs(not_after)).await,
+            None => std::future::pending().await,
+        }
+    };
+    tokio::pin!(cert_expiry);
+    let mut confirming_frame = Some(confirming_frame);
+
     loop {
         select! {
-          maybe_in = framed.next_frame() => {
+          maybe_in = next_client_frame(&mut framed, &mut confirming_frame) => {
               let maybe_in = match maybe_in {
                   Ok(value) => value,
                   Err(err) => {
@@ -518,7 +550,7 @@ pub async fn handle_conn(
                           bail!("clientSend carries neither a routable queueId nor a recipientId");
                       };
 
-                      info!(
+                      debug!(
                           sender = %hex::encode(user_id),
                           ?device_id,
                           recipient = %hex::encode(recipient),
@@ -600,7 +632,7 @@ pub async fn handle_conn(
                               Some(_) => "jetstream_publish_device",
                               None => "jetstream_publish",
                           });
-                          info!(
+                          debug!(
                               sender = %hex::encode(user_id),
                               recipient = %hex::encode(recipient),
                               ?recipient_device_id,
@@ -635,18 +667,35 @@ pub async fn handle_conn(
                           let route_targets = registry.route_targets(&recipient, recipient_device_id);
                           let mut delivered_count = 0usize;
 
+                          // Канал получателя не ждём: отправитель не должен
+                          // висеть на чужом медленном сокете. Переполненный
+                          // канал значит, что сессия не успевает читать, —
+                          // она выписывается из реестра (и этим закрывается,
+                          // см. регистрацию), а сообщение, не принятое ни
+                          // одной целью, уходит в офлайн-очередь.
                           for target in route_targets {
-                              match target.tx.send(OutboundFrame {
+                              let outgoing = OutboundFrame {
                                   bytes: incoming.clone(),
                                   message_id: None,
                                   close_after_send: false,
                                   sender_user_id: Some(user_id),
                                   sender_device_id: device_id,
-                              }).await {
+                              };
+                              match target.tx.try_send(outgoing) {
                                   Ok(()) => {
                                       delivered_count += 1;
                                   }
-                                  Err(_) => {
+                                  Err(TrySendError::Full(_)) => {
+                                      registry.remove(&recipient, target.id);
+                                      warn!(
+                                          recipient = %hex::encode(recipient),
+                                          ?recipient_device_id,
+                                          lagging_connection_id = target.id,
+                                          ?target.device_id,
+                                          "recipient session is not keeping up; evicted from the registry"
+                                      );
+                                  }
+                                  Err(TrySendError::Closed(_)) => {
                                       registry.remove(&recipient, target.id);
                                       warn!(
                                           sender = %hex::encode(user_id),
@@ -669,7 +718,7 @@ pub async fn handle_conn(
                                   Some(_) => "online_device",
                                   None => "online",
                               });
-                              info!(
+                              debug!(
                                   sender = %hex::encode(user_id),
                                   recipient = %hex::encode(recipient),
                                   ?recipient_device_id,
@@ -788,7 +837,7 @@ pub async fn handle_conn(
                           .ack_delivery(user_id, device_id, message_id)
                           .await?;
                       if acked {
-                          info!(
+                          debug!(
                               user = %hex::encode(user_id),
                               ?device_id,
                               message_id,
@@ -845,64 +894,15 @@ pub async fn handle_conn(
                               "device_id is required to register a push token",
                           ),
                           (_, None) => encode_push_token_ack(false, "unknown push platform"),
-                          (Some(current_device_id), Some(platform)) => {
-                              // Snapshot whether this user had any prior push
-                              // token row, *before* we insert: the transition
-                              // empty → non-empty gates the welcome push. On
-                              // read error assume "had some" so no welcome is
-                              // sent. A VoIP registration (the second token of
-                              // an iOS device) never triggers a welcome: the
-                              // welcome is sent over the alert channel only.
-                              let was_first_registration = platform
-                                  != PushPlatform::IosVoip
-                                  && match push_tokens.has_any_for_user(&user_id) {
-                                      Ok(has_any) => !has_any,
-                                      Err(err) => {
-                                          warn!(
-                                              user = %hex::encode(user_id),
-                                              error = %err,
-                                              "could not check prior push tokens; skipping welcome push"
-                                          );
-                                          false
-                                      }
-                                  };
-
-                              match push_tokens.add(
-                                  &user_id,
-                                  current_device_id,
-                                  platform,
-                                  &token,
-                              ) {
-                                  Ok(true) => {
-                                      info!(
-                                          user = %hex::encode(user_id),
-                                          device_id = current_device_id,
-                                          ?platform,
-                                          "push token registered"
-                                      );
-                                      if was_first_registration {
-                                          info!(
-                                              user = %hex::encode(user_id),
-                                              device_id = current_device_id,
-                                              "first push token for user; firing welcome push"
-                                          );
-                                          push_scheduler
-                                              .send_welcome(user_id, current_device_id);
-                                      }
-                                      encode_push_token_ack(true, "")
-                                  }
-                                  Ok(false) => encode_push_token_ack(false, "invalid token"),
-                                  Err(err) => {
-                                      warn!(
-                                          user = %hex::encode(user_id),
-                                          device_id = current_device_id,
-                                          error = %err,
-                                          "push token registration failed"
-                                      );
-                                      encode_push_token_ack(false, "internal error")
-                                  }
-                              }
-                          }
+                          (Some(current_device_id), Some(platform)) => register_push_token(
+                              &push_tokens,
+                              &push_scheduler,
+                              limits.cfg.max_push_devices_per_user,
+                              &user_id,
+                              current_device_id,
+                              platform,
+                              &token,
+                          ),
                       };
                       framed.send_frame(&ack).await?;
                   }
@@ -918,7 +918,7 @@ pub async fn handle_conn(
                               // продолжит звонить на мёртвую сессию.
                               match push_tokens.remove_all(&user_id, current_device_id) {
                                   Ok(removed) => {
-                                      info!(
+                                      debug!(
                                           user = %hex::encode(user_id),
                                           device_id = current_device_id,
                                           removed,
@@ -956,7 +956,7 @@ pub async fn handle_conn(
                       } else {
                           match queues.allocate(&user_id, queue_id, unix_now_secs(), max_queues) {
                               Ok(Ok(record)) => {
-                                  info!(
+                                  debug!(
                                       user = %hex::encode(user_id),
                                       queue_id = %hex::encode(record.queue_id),
                                       "queue allocated"
@@ -994,7 +994,7 @@ pub async fn handle_conn(
                           None => encode_queue_ack(false, None, WireQueueRejectReason::NotFound),
                           Some(queue_id) => match queues.revoke(&user_id, &queue_id) {
                               Ok(Ok(())) => {
-                                  info!(
+                                  debug!(
                                       user = %hex::encode(user_id),
                                       queue_id = %hex::encode(queue_id),
                                       "queue revoked"
@@ -1043,10 +1043,23 @@ pub async fn handle_conn(
               }
           }
 
-          Some(outgoing) = rx_to_client.recv() => {
+          outgoing = rx_to_client.recv() => {
+              // Отправитель канала есть только у реестра, поэтому `None` —
+              // это выписка сессии из реестра: новых сообщений в неё не
+              // будет, а всё принятое в канал уже отдано. Разрыв заставит
+              // клиента переподключиться и забрать остальное из офлайн-очереди.
+              let Some(outgoing) = outgoing else {
+                  warn!(
+                      user = %hex::encode(user_id),
+                      ?device_id,
+                      connection_id = registration.connection_id,
+                      "closing session: it was evicted from the connection registry"
+                  );
+                  break;
+              };
               let size = outgoing.bytes.len();
               let sender_hex = outgoing.sender_user_id.map(hex::encode);
-              info!(
+              debug!(
                   recipient = %hex::encode(user_id),
                   recipient_device_id = ?device_id,
                   sender = ?sender_hex,
@@ -1072,7 +1085,7 @@ pub async fn handle_conn(
               }
               messages_sent += 1;
               observability::observe_message_route("server_push");
-              info!(
+              debug!(
                   recipient = %hex::encode(user_id),
                   recipient_device_id = ?device_id,
                   sender = ?sender_hex,
@@ -1093,6 +1106,15 @@ pub async fn handle_conn(
                   );
                   break;
               }
+          }
+
+          () = &mut cert_expiry => {
+              info!(
+                  user = %hex::encode(user_id),
+                  ?device_id,
+                  "device certificate expired; closing delegated session"
+              );
+              break;
           }
         }
     }
@@ -1251,6 +1273,204 @@ struct QuotaVerdict {
     depth_before: Option<u64>,
 }
 
+/// Регистрация push-токена устройства сессии; возвращает готовый
+/// `PushTokenAck`.
+///
+/// Приветственный пуш — один на всё время жизни аккаунта: его выдаёт
+/// [`PushTokenStore::claim_welcome`], а не переход «токенов не было → есть»,
+/// иначе цикл Register/Unregister будил бы приветствием на каждом круге.
+/// Отметку получает и аккаунт, у которого токены уже были до появления
+/// отметок, — но без приветствия: своё он уже получил. Регистрация
+/// VoIP-токена (второго токена iOS-устройства) приветствия не трогает: оно
+/// уходит только по alert-каналу.
+fn register_push_token(
+    push_tokens: &PushTokenStore,
+    push_scheduler: &PushScheduler,
+    max_devices: usize,
+    user_id: &UserId,
+    device_id: DeviceId,
+    platform: PushPlatform,
+    token: &str,
+) -> Vec<u8> {
+    // Снимок до записи. Не прочитался — приветствие пропускается: лишнее
+    // хуже пропущенного.
+    let had_tokens = if platform == PushPlatform::IosVoip {
+        None
+    } else {
+        match push_tokens.has_any_for_user(user_id) {
+            Ok(has_any) => Some(has_any),
+            Err(err) => {
+                warn!(
+                    user = %hex::encode(user_id),
+                    error = %err,
+                    "could not check prior push tokens; skipping welcome push"
+                );
+                None
+            }
+        }
+    };
+
+    match push_tokens.register(user_id, device_id, platform, token, max_devices) {
+        Ok(RegisterOutcome::Stored) => {
+            debug!(
+                user = %hex::encode(user_id),
+                device_id,
+                ?platform,
+                "push token registered"
+            );
+            if let Some(had_tokens) = had_tokens {
+                match push_tokens.claim_welcome(user_id) {
+                    Ok(true) if !had_tokens => {
+                        debug!(
+                            user = %hex::encode(user_id),
+                            device_id,
+                            "first push token of the account; firing welcome push"
+                        );
+                        push_scheduler.send_welcome(*user_id, device_id);
+                    }
+                    Ok(_) => {}
+                    Err(err) => warn!(
+                        user = %hex::encode(user_id),
+                        error = %err,
+                        "could not claim the welcome push; skipping it"
+                    ),
+                }
+            }
+            encode_push_token_ack(true, "")
+        }
+        Ok(RegisterOutcome::InvalidToken) => encode_push_token_ack(false, "invalid token"),
+        Ok(RegisterOutcome::DeviceLimit) => {
+            warn!(
+                user = %hex::encode(user_id),
+                device_id,
+                limit = max_devices,
+                "push token registration rejected: device limit reached"
+            );
+            encode_push_token_ack(false, "push device limit reached")
+        }
+        Err(err) => {
+            warn!(
+                user = %hex::encode(user_id),
+                device_id,
+                error = %err,
+                "push token registration failed"
+            );
+            encode_push_token_ack(false, "internal error")
+        }
+    }
+}
+
+/// Лимит одновременных сессий на ключ: исчерпан — клиенту уходит
+/// `AuthError(401)`, и соединение закрывается ошибкой.
+///
+/// Проверяется дважды: до `AuthOk` (основной случай — отказ вместо него) и
+/// перед регистрацией подтверждённой сессии. Во втором случае 401 приходит
+/// уже после `AuthOk`: пока клиент подтверждал сессию, лимит выбрали другие
+/// его сессии.
+async fn refuse_over_session_limit(
+    framed: &mut NoiseFramed<TcpStream>,
+    registry: &ConnRegistry,
+    limits: &SessionLimits,
+    user_id: &UserId,
+) -> Result<()> {
+    let limit = limits.cfg.max_sessions_per_user;
+    if limit == 0 || registry.session_count(user_id) < limit {
+        return Ok(());
+    }
+    observability::observe_reject("session_limit");
+    observability::observe_connection_auth("limit");
+    let err_frame = encode_auth_error(401, "session limit exceeded");
+    framed.send_frame(&err_frame).await?;
+    warn!(
+        user = %hex::encode(user_id),
+        limit,
+        "connection rejected: session limit exceeded"
+    );
+    bail!("session limit exceeded")
+}
+
+/// Дождаться кадра, которым клиент подтверждает сессию. `Some` — кадр
+/// расшифрован и разобран; обработать его ещё предстоит, первым в цикле
+/// сессии. `None` — подтверждения не будет (таймаут, разрыв, кадр не
+/// расшифровался): соединение закрывается, не оставив следа ни в реестре,
+/// ни в очередях.
+///
+/// Неподтверждённая сессия — отказ, а не сбой ноды (именно так кончается
+/// повтор записанного msg1), поэтому наверх уходит `Ok`, как и при отказе
+/// на хендшейке.
+async fn await_session_confirmation(
+    framed: &mut NoiseFramed<TcpStream>,
+    user_id: &UserId,
+    device_id: Option<DeviceId>,
+    within: Duration,
+) -> Result<Option<BytesMut>> {
+    let (reason, error) = match tokio::time::timeout(within, framed.next_frame()).await {
+        Ok(Ok(Some(bytes))) => {
+            // Кадр расшифровался — ключи сессии у клиента есть. Неразбираемый
+            // кадр — уже не повтор, а сломанный клиент, и с ним поступаем
+            // так же, как цикл сессии.
+            if let Err(err) = decode_frame(bytes.as_ref()) {
+                observability::observe_frame_decode_error();
+                warn!(
+                    user = %hex::encode(user_id),
+                    size = bytes.len(),
+                    error = %err,
+                    "failed to decode frame"
+                );
+                return Err(err);
+            }
+            return Ok(Some(bytes));
+        }
+        Ok(Ok(None)) => ("closed", None),
+        Ok(Err(err)) => {
+            if is_connection_reset(&err) {
+                observability::observe_connection_reset_by_peer();
+            }
+            ("unreadable", Some(err))
+        }
+        Err(_) => ("timeout", None),
+    };
+    observability::observe_connection_auth("unconfirmed");
+    let error = error.as_ref().map(tracing::field::display);
+    info!(
+        user = %hex::encode(user_id),
+        ?device_id,
+        reason,
+        error,
+        "session not confirmed by the client; closing"
+    );
+    Ok(None)
+}
+
+/// Следующий кадр клиента. Подтвердивший сессию кадр прочитан ещё до
+/// регистрации и отдаётся первым, дальше — чтение из канала.
+///
+/// Cancel-safe, как и `NoiseFramed::next_frame`: отложенный кадр забирается
+/// только при первом опросе, который сразу же и завершается.
+async fn next_client_frame(
+    framed: &mut NoiseFramed<TcpStream>,
+    confirming_frame: &mut Option<BytesMut>,
+) -> std::io::Result<Option<BytesMut>> {
+    match confirming_frame.take() {
+        Some(frame) => Ok(Some(frame)),
+        None => framed.next_frame().await,
+    }
+}
+
+/// Момент `unix_secs` на монотонных часах рантайма. Прошедший момент —
+/// «сейчас»; недостижимо далёкий ограничивается сверху, чтобы не
+/// переполнить `Instant`.
+fn instant_at_unix_secs(unix_secs: u64) -> tokio::time::Instant {
+    const FAR: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
+    let remaining = match UNIX_EPOCH.checked_add(Duration::from_secs(unix_secs)) {
+        Some(at) => at
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+        None => FAR,
+    };
+    tokio::time::Instant::now() + remaining.min(FAR)
+}
+
 /// Хранилище не отвечает на входе сессии — прочитать офлайн-очередь нечем.
 ///
 /// Просто оборвать соединение нельзя: разрыв неотличим от сетевого сбоя, и
@@ -1313,7 +1533,7 @@ async fn handle_offline_enqueue_result(
             SendRejectReason::Unspecified,
         );
         framed.send_frame(&ack).await?;
-        info!(
+        debug!(
             sender = %hex::encode(sender_user_id),
             recipient = %hex::encode(recipient),
             ?recipient_device_id,
@@ -1389,7 +1609,7 @@ async fn replay_messages(
                     ReplayScope::Account => "offline_replay",
                     ReplayScope::Device(_) => "offline_replay_device",
                 });
-                info!(
+                debug!(
                     user = %hex::encode(user_id),
                     sender = %hex::encode(message.sender_id),
                     message_id = message.id,
@@ -1953,5 +2173,184 @@ mod tests {
 
         drop(storage);
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    // ---- регистрация push-токенов ----
+
+    fn welcome_count(transport: &MockTransport) -> usize {
+        transport
+            .sent_payloads()
+            .iter()
+            .filter(|payload| payload.kind == crate::push::PushKind::Welcome)
+            .count()
+    }
+
+    fn ack_of(bytes: &[u8]) -> crate::wire::PushTokenAck {
+        match decode_frame(bytes).unwrap().payload {
+            Some(frame::Payload::PushTokenAck(ack)) => ack,
+            other => panic!("expected PushTokenAck, got {other:?}"),
+        }
+    }
+
+    /// Welcome — один на аккаунт: Register → Unregister → Register второго
+    /// не даёт, как и регистрация с другого устройства.
+    #[tokio::test]
+    async fn welcome_push_is_sent_once_per_account() {
+        let user = [21u8; 32];
+        let tokens = token_store_with(&user, &[]);
+        let transport = Arc::new(MockTransport::always_ok());
+        let scheduler = PushScheduler::start(
+            fast_cfg(),
+            transport.clone(),
+            tokens.clone(),
+            Arc::new(NoopStatePersistence),
+        );
+        let register = |device: DeviceId, platform: PushPlatform, token: &str| {
+            ack_of(&register_push_token(
+                &tokens, &scheduler, 32, &user, device, platform, token,
+            ))
+        };
+
+        assert!(register(1, PushPlatform::AndroidFcm, "tok-1").ok);
+        // Токен разрешается в момент отправки: снимать его до неё нельзя,
+        // иначе первое приветствие потерялось бы и тест ничего не доказал.
+        collect_sent(&transport, 1).await;
+        assert_eq!(welcome_count(&transport), 1);
+
+        tokens.remove_all(&user, 1).unwrap();
+        assert!(!tokens.has_any_for_user(&user).unwrap());
+        assert!(register(1, PushPlatform::AndroidFcm, "tok-1b").ok);
+        tokens.remove_all(&user, 1).unwrap();
+        assert!(register(2, PushPlatform::IosFcm, "tok-2").ok);
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(welcome_count(&transport), 1, "welcome must not repeat");
+    }
+
+    /// Аккаунт, у которого токены были до появления отметок, приветствия
+    /// не получает — ни сразу, ни после круга Unregister/Register.
+    #[tokio::test]
+    async fn account_with_prior_tokens_is_marked_without_welcome() {
+        let user = [22u8; 32];
+        let tokens = token_store_with(&user, &[(1, "legacy")]);
+        let transport = Arc::new(MockTransport::always_ok());
+        let scheduler = PushScheduler::start(
+            fast_cfg(),
+            transport.clone(),
+            tokens.clone(),
+            Arc::new(NoopStatePersistence),
+        );
+
+        let ack = register_push_token(
+            &tokens,
+            &scheduler,
+            32,
+            &user,
+            1,
+            PushPlatform::AndroidFcm,
+            "refreshed",
+        );
+        assert!(ack_of(&ack).ok);
+        tokens.remove_all(&user, 1).unwrap();
+        let ack = register_push_token(
+            &tokens,
+            &scheduler,
+            32,
+            &user,
+            1,
+            PushPlatform::AndroidFcm,
+            "again",
+        );
+        assert!(ack_of(&ack).ok);
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(welcome_count(&transport), 0);
+    }
+
+    /// VoIP-регистрация приветствия не трогает: ни не шлёт его, ни не
+    /// расходует отметку.
+    #[tokio::test]
+    async fn voip_registration_does_not_consume_the_welcome() {
+        let user = [23u8; 32];
+        let tokens = token_store_with(&user, &[]);
+        let transport = Arc::new(MockTransport::always_ok());
+        let scheduler = PushScheduler::start(
+            fast_cfg(),
+            transport.clone(),
+            tokens.clone(),
+            Arc::new(NoopStatePersistence),
+        );
+
+        let ack = register_push_token(
+            &tokens,
+            &scheduler,
+            32,
+            &user,
+            1,
+            PushPlatform::IosVoip,
+            "0a1b2c3d",
+        );
+        assert!(ack_of(&ack).ok);
+        tokens.remove_all(&user, 1).unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(welcome_count(&transport), 0);
+
+        assert!(tokens.claim_welcome(&[24u8; 32]).unwrap());
+        assert!(
+            tokens.claim_welcome(&user).unwrap(),
+            "voip registration must not have claimed the welcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn push_registration_acks_device_limit_and_bad_voip_token() {
+        let user = [25u8; 32];
+        let tokens = token_store_with(&user, &[]);
+        let scheduler = PushScheduler::start(
+            fast_cfg(),
+            Arc::new(MockTransport::always_ok()),
+            tokens.clone(),
+            Arc::new(NoopStatePersistence),
+        );
+        let register = |device: DeviceId, platform: PushPlatform, token: &str| {
+            ack_of(&register_push_token(
+                &tokens, &scheduler, 2, &user, device, platform, token,
+            ))
+        };
+
+        assert!(register(1, PushPlatform::AndroidFcm, "a").ok);
+        assert!(register(2, PushPlatform::AndroidFcm, "b").ok);
+        let refused = register(3, PushPlatform::AndroidFcm, "c");
+        assert!(!refused.ok);
+        assert_eq!(refused.message, "push device limit reached");
+        assert!(register(2, PushPlatform::AndroidFcm, "b2").ok);
+
+        let bad = register(1, PushPlatform::IosVoip, "../evil");
+        assert!(!bad.ok);
+        assert_eq!(bad.message, "invalid token");
+        assert!(tokens.get_voip(&user, 1).unwrap().is_none());
+    }
+
+    #[test]
+    fn instant_at_unix_secs_tracks_the_wall_clock() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let base = tokio::time::Instant::now();
+
+        let past = instant_at_unix_secs(now.saturating_sub(10));
+        assert!(past <= tokio::time::Instant::now());
+
+        let soon = instant_at_unix_secs(now + 5);
+        let ahead = soon.saturating_duration_since(base);
+        assert!(
+            ahead > Duration::from_secs(3) && ahead <= Duration::from_secs(5),
+            "{ahead:?}"
+        );
+
+        // Далёкое и непредставимое будущее не паникует.
+        let far = instant_at_unix_secs(u64::MAX);
+        assert!(far.saturating_duration_since(base) > Duration::from_secs(365 * 24 * 3600));
     }
 }

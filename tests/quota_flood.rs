@@ -27,8 +27,10 @@ fn open_limits() -> LimitsConfig {
         send_msgs_per_sec: 0,
         send_bytes_per_day: 0,
         max_sessions_per_user: 0,
+        session_confirm_timeout_secs: LimitsConfig::default().session_confirm_timeout_secs,
         ping_per_sec: 0,
         max_queues_per_user: 0,
+        max_push_devices_per_user: 0,
         // Вход не ограничиваем: тест меряет квоты сообщений, а не admission.
         handshake_max_inflight: 0,
         handshake_max_inflight_per_ip: 0,

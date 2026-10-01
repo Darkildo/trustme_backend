@@ -9,15 +9,13 @@ mod common;
 
 use anyhow::{Result, bail};
 use common::{
-    connect, decode, expect_auth_ok, next_frame, send_raw_and_read_ack, spawn_server,
+    Conn, connect, decode, expect_auth_ok, next_frame, send_raw_and_read_ack, spawn_server,
     spawn_server_with_queue_addressing,
 };
 use ed25519_dalek::SigningKey;
 use prost::Message;
-use tokio::net::TcpStream;
 use trust_message_tcp::config::LimitsConfig;
 use trust_message_tcp::domain::reject::SendRejectReason;
-use trust_message_tcp::net::noise::NoiseFramed;
 use trust_message_tcp::wire::{self, Frame, frame};
 
 const PROTO_VERSION: u32 = 1;
@@ -57,7 +55,7 @@ fn send_by_recipient(recipient: [u8; 32], queue_id: Vec<u8>, body: &str) -> Vec<
     }))
 }
 
-async fn allocate_queue(conn: &mut NoiseFramed<TcpStream>) -> Result<Vec<u8>> {
+async fn allocate_queue(conn: &mut Conn) -> Result<Vec<u8>> {
     conn.send_frame(&wrap(frame::Payload::AllocateQueue(wire::AllocateQueue {})))
         .await?;
     match decode(&next_frame(conn).await?)? {
@@ -66,7 +64,7 @@ async fn allocate_queue(conn: &mut NoiseFramed<TcpStream>) -> Result<Vec<u8>> {
     }
 }
 
-async fn expect_incoming(conn: &mut NoiseFramed<TcpStream>) -> Result<wire::IncomingMessage> {
+async fn expect_incoming(conn: &mut Conn) -> Result<wire::IncomingMessage> {
     match decode(&next_frame(conn).await?)? {
         frame::Payload::Incoming(msg) => Ok(msg),
         other => bail!("expected IncomingMessage, got {other:?}"),

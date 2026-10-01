@@ -6,8 +6,9 @@ use tracing::warn;
 use crate::domain::push::PushPlatform;
 use crate::state::registry::{DeviceId, UserId};
 
-/// Sanity cap on a stored token. Tokens are not validated beyond being
+/// Sanity cap on a stored token. FCM tokens are not validated beyond being
 /// non-empty and under this cap; real FCM tokens are a few hundred bytes.
+/// VoIP tokens must additionally be hex (see [`normalize_token`]).
 const MAX_TOKEN_LEN: usize = 4096;
 const VALUE_HEADER_LEN: usize = 1 + 8;
 const VOIP_KEY_SUFFIX: u8 = 0x01;
@@ -38,6 +39,21 @@ pub struct StoredPushToken {
 #[derive(Clone)]
 pub struct PushTokenStore {
     tree: Tree,
+    /// Дерево `push_welcome_claims`: `user_id(32)` → `claimed_at_secs(u64 BE)`.
+    /// Отдельное, а не префикс в `device_push_tokens`: скан токенов по
+    /// префиксу `user_id` не должен натыкаться на ключи другого формата.
+    welcome_claims: Tree,
+}
+
+/// Исход [`PushTokenStore::register`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RegisterOutcome {
+    /// Токен записан — новый или поверх прежнего того же слота.
+    Stored,
+    /// Токен не прошёл проверку формата.
+    InvalidToken,
+    /// Устройство новое, а потолок устройств с токенами уже выбран.
+    DeviceLimit,
 }
 
 impl PushTokenStore {
@@ -45,14 +61,19 @@ impl PushTokenStore {
         let tree = db
             .open_tree("device_push_tokens")
             .context("failed to open `device_push_tokens` tree")?;
-        Ok(Self { tree })
+        let welcome_claims = db
+            .open_tree("push_welcome_claims")
+            .context("failed to open `push_welcome_claims` tree")?;
+        Ok(Self {
+            tree,
+            welcome_claims,
+        })
     }
 
     /// Insert or replace the token for `(user, device)`. `IosVoip` goes to the
     /// VoIP slot, every other platform to the alert slot. Returns `Ok(false)`
-    /// if the token is invalid (empty after trimming / longer than
-    /// `MAX_TOKEN_LEN`); the caller answers the client with a negative
-    /// push-token ack.
+    /// if the token is invalid (see [`normalize_token`]); the caller answers
+    /// the client with a negative push-token ack.
     pub fn add(
         &self,
         user: &UserId,
@@ -60,13 +81,9 @@ impl PushTokenStore {
         platform: PushPlatform,
         token: &str,
     ) -> Result<bool> {
-        let token = token.trim();
-        if token.is_empty() {
+        let Some(token) = normalize_token(platform, token) else {
             return Ok(false);
-        }
-        if token.len() > MAX_TOKEN_LEN {
-            return Ok(false);
-        }
+        };
 
         let key = match platform {
             PushPlatform::IosVoip => make_voip_key(user, device),
@@ -77,6 +94,79 @@ impl PushTokenStore {
             .insert(key, value)
             .context("failed to write push token row")?;
         Ok(true)
+    }
+
+    /// Регистрация токена с клиентского соединения: [`Self::add`] плюс
+    /// потолок устройств с токенами на пользователя (`max_devices`, `0` — без
+    /// потолка). Устройство, у которого уже есть токен в любом из слотов,
+    /// потолком не ограничено: смена токена — обычная жизнь клиента.
+    ///
+    /// Подсчёт и запись не атомарны: две параллельные регистрации новых
+    /// устройств могут превысить потолок на одно. Как и прочие лимиты ноды,
+    /// это защита ресурса, а не бухгалтерия.
+    pub fn register(
+        &self,
+        user: &UserId,
+        device: DeviceId,
+        platform: PushPlatform,
+        token: &str,
+        max_devices: usize,
+    ) -> Result<RegisterOutcome> {
+        if normalize_token(platform, token).is_none() {
+            return Ok(RegisterOutcome::InvalidToken);
+        }
+        if max_devices > 0 {
+            let census = self.device_census(user, device)?;
+            if !census.includes_device && census.devices >= max_devices {
+                return Ok(RegisterOutcome::DeviceLimit);
+            }
+        }
+        if self.add(user, device, platform, token)? {
+            Ok(RegisterOutcome::Stored)
+        } else {
+            Ok(RegisterOutcome::InvalidToken)
+        }
+    }
+
+    /// Сколько разных устройств пользователя держат хотя бы один токен и
+    /// есть ли среди них `device`. Ключи обоих слотов одного устройства
+    /// лежат в дереве подряд (`user || device` и `user || device || 0x01`),
+    /// поэтому новое устройство видно по смене `device` между соседними
+    /// ключами.
+    fn device_census(&self, user: &UserId, device: DeviceId) -> Result<DeviceCensus> {
+        let prefix = user.as_slice();
+        let mut census = DeviceCensus {
+            devices: 0,
+            includes_device: false,
+        };
+        let mut previous: Option<DeviceId> = None;
+        for key in self.tree.scan_prefix(prefix).keys() {
+            let key = key.context("failed to scan push token tree")?;
+            let Some(&[high, low]) = key.get(prefix.len()..prefix.len() + 2) else {
+                continue;
+            };
+            let current = u16::from_be_bytes([high, low]);
+            if previous != Some(current) {
+                census.devices += 1;
+                previous = Some(current);
+            }
+            census.includes_device |= current == device;
+        }
+        Ok(census)
+    }
+
+    /// Отметить, что аккаунту положено приветствие. `true` возвращается
+    /// ровно один раз за всё время жизни аккаунта — первому вызову, дальше
+    /// всегда `false`. Отметка живёт отдельно от токенов и переживает их
+    /// снятие: иначе цикл Register/Unregister выдавал бы приветствие на
+    /// каждом круге.
+    pub fn claim_welcome(&self, user: &UserId) -> Result<bool> {
+        let claimed_at = now_secs()?.to_be_bytes();
+        let swapped = self
+            .welcome_claims
+            .compare_and_swap(user, None::<&[u8]>, Some(&claimed_at[..]))
+            .context("failed to write welcome claim")?;
+        Ok(swapped.is_ok())
     }
 
     /// Idempotent — returns `Ok(true)` if a row was removed, `Ok(false)` if no
@@ -127,9 +217,10 @@ impl PushTokenStore {
         decode_value(device, value.as_ref()).map(Some)
     }
 
-    /// Does this user have any push token row (either slot)? Used to detect
-    /// the first registration for the one-shot welcome push; stops at the
-    /// first row without decoding it.
+    /// Does this user have any push token row (either slot)? Stops at the
+    /// first row without decoding it. Together with [`Self::claim_welcome`]
+    /// it gates the one-shot welcome push: an account that held tokens before
+    /// welcome claims existed gets its claim without being greeted.
     pub fn has_any_for_user(&self, user: &UserId) -> Result<bool> {
         let prefix = user.as_slice();
         match self.tree.scan_prefix(prefix).next() {
@@ -205,6 +296,16 @@ impl crate::push::TokenStore for PushTokenStore {
 
     fn resolve_voip(&self, user: &UserId, device: DeviceId) -> Option<String> {
         match self.get_voip(user, device) {
+            // Строка могла быть записана до проверки формата: не-hex токен в
+            // путь запроса APNs не отдаётся.
+            Ok(Some(stored)) if !is_hex_token(&stored.token) => {
+                warn!(
+                    user = %hex::encode(user),
+                    device,
+                    "stored voip push token is not hex; treating as missing"
+                );
+                None
+            }
             Ok(Some(stored)) => Some(stored.token),
             Ok(None) => None,
             Err(err) => {
@@ -229,6 +330,34 @@ impl crate::push::TokenStore for PushTokenStore {
             );
         }
     }
+}
+
+/// Результат [`PushTokenStore::device_census`].
+struct DeviceCensus {
+    devices: usize,
+    includes_device: bool,
+}
+
+/// Токен, пригодный к записи: без пробелов по краям, непустой, не длиннее
+/// `MAX_TOKEN_LEN`. VoIP-токен APNs подставляется в путь запроса
+/// (`/3/device/{token}`), поэтому для него допустим только hex — иначе `/`,
+/// `?` или `#` в токене меняли бы адрес запроса.
+fn normalize_token(platform: PushPlatform, token: &str) -> Option<&str> {
+    let token = token.trim();
+    if token.is_empty() || token.len() > MAX_TOKEN_LEN {
+        return None;
+    }
+    if platform == PushPlatform::IosVoip && !is_hex_token(token) {
+        return None;
+    }
+    Some(token)
+}
+
+/// Hex-запись байтов: непустая, чётной длины, только `[0-9a-fA-F]`.
+fn is_hex_token(token: &str) -> bool {
+    !token.is_empty()
+        && token.len().is_multiple_of(2)
+        && token.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 fn make_key(user: &UserId, device: DeviceId) -> Vec<u8> {
@@ -428,20 +557,20 @@ mod tests {
             .add(&user(1), 7, PushPlatform::IosFcm, "fcm-tok")
             .unwrap();
         store
-            .add(&user(1), 7, PushPlatform::IosVoip, "voip-tok")
+            .add(&user(1), 7, PushPlatform::IosVoip, "a0b1c2d3")
             .unwrap();
 
         // Оба слота живут одновременно, не перетирая друг друга.
         assert_eq!(store.get(&user(1), 7).unwrap().unwrap().token, "fcm-tok");
         let voip = store.get_voip(&user(1), 7).unwrap().unwrap();
-        assert_eq!(voip.token, "voip-tok");
+        assert_eq!(voip.token, "a0b1c2d3");
         assert_eq!(voip.platform, PushPlatform::IosVoip);
 
         // Снятие alert-слота не трогает voip и наоборот.
         assert!(store.remove(&user(1), 7).unwrap());
         assert_eq!(
             store.get_voip(&user(1), 7).unwrap().unwrap().token,
-            "voip-tok"
+            "a0b1c2d3"
         );
         assert!(store.remove_voip(&user(1), 7).unwrap());
         assert!(store.get_voip(&user(1), 7).unwrap().is_none());
@@ -453,10 +582,10 @@ mod tests {
         let (_db, store, path) = open_store("list_skips_voip");
         store.add(&user(1), 1, PushPlatform::IosFcm, "fcm").unwrap();
         store
-            .add(&user(1), 1, PushPlatform::IosVoip, "voip")
+            .add(&user(1), 1, PushPlatform::IosVoip, "beef")
             .unwrap();
         store
-            .add(&user(1), 2, PushPlatform::IosVoip, "voip-only")
+            .add(&user(1), 2, PushPlatform::IosVoip, "c0ffee")
             .unwrap();
 
         // Fan-out видит только alert-слоты; voip-only девайс не попадает в
@@ -474,7 +603,7 @@ mod tests {
 
         store.add(&user(1), 9, PushPlatform::IosFcm, "fcm").unwrap();
         store
-            .add(&user(1), 9, PushPlatform::IosVoip, "voip")
+            .add(&user(1), 9, PushPlatform::IosVoip, "beef")
             .unwrap();
         assert!(store.remove_all(&user(1), 9).unwrap());
         assert!(store.get(&user(1), 9).unwrap().is_none());
@@ -487,13 +616,204 @@ mod tests {
         use crate::push::TokenStore as _;
         let (_db, store, path) = open_store("trait_voip");
         store
-            .add(&user(1), 4, PushPlatform::IosVoip, "vtok")
+            .add(&user(1), 4, PushPlatform::IosVoip, "0f1e2d3c")
             .unwrap();
 
-        assert_eq!(store.resolve_voip(&user(1), 4), Some("vtok".to_string()));
+        assert_eq!(
+            store.resolve_voip(&user(1), 4),
+            Some("0f1e2d3c".to_string())
+        );
         assert_eq!(store.resolve(&user(1), 4), None);
         <PushTokenStore as crate::push::TokenStore>::remove_voip(&store, &user(1), 4);
         assert_eq!(store.resolve_voip(&user(1), 4), None);
+        cleanup(&path);
+    }
+
+    /// VoIP-токен уходит в путь запроса APNs: всё, что не hex, — отказ, а
+    /// не запись. Alert-слот (FCM) этим правилом не ограничен.
+    #[test]
+    fn voip_token_must_be_hex() {
+        let (_db, store, path) = open_store("voip_hex");
+        for bad in [
+            "../../3/device/x",
+            "abc?x=1",
+            "beef#",
+            "not-hex",
+            "abc",
+            "ab cd",
+        ] {
+            assert!(
+                !store.add(&user(1), 1, PushPlatform::IosVoip, bad).unwrap(),
+                "{bad:?} must be rejected"
+            );
+        }
+        assert!(store.get_voip(&user(1), 1).unwrap().is_none());
+
+        assert!(
+            store
+                .add(
+                    &user(1),
+                    1,
+                    PushPlatform::IosVoip,
+                    " 0123456789abcdefABCDEF00 "
+                )
+                .unwrap()
+        );
+        assert_eq!(
+            store.get_voip(&user(1), 1).unwrap().unwrap().token,
+            "0123456789abcdefABCDEF00"
+        );
+        assert!(
+            store
+                .add(
+                    &user(1),
+                    1,
+                    PushPlatform::IosFcm,
+                    "fcm:token/with-slashes_ok"
+                )
+                .unwrap()
+        );
+        cleanup(&path);
+    }
+
+    /// Строка, записанная до проверки формата, в путь APNs не попадает.
+    #[test]
+    fn resolve_voip_skips_legacy_non_hex_rows() {
+        use crate::push::TokenStore as _;
+        let (_db, store, path) = open_store("voip_legacy");
+        store
+            .tree
+            .insert(
+                make_voip_key(&user(1), 2),
+                encode_value(PushPlatform::IosVoip, 1, "x/../evil"),
+            )
+            .unwrap();
+        assert_eq!(store.resolve_voip(&user(1), 2), None);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn register_enforces_device_ceiling_but_allows_updates() {
+        let (_db, store, path) = open_store("device_ceiling");
+        let max = 2;
+        assert_eq!(
+            store
+                .register(&user(1), 1, PushPlatform::AndroidFcm, "a", max)
+                .unwrap(),
+            RegisterOutcome::Stored
+        );
+        // Второй слот того же устройства — не новое устройство.
+        assert_eq!(
+            store
+                .register(&user(1), 1, PushPlatform::IosVoip, "beef", max)
+                .unwrap(),
+            RegisterOutcome::Stored
+        );
+        // VoIP-only устройство считается наравне с прочими.
+        assert_eq!(
+            store
+                .register(&user(1), 2, PushPlatform::IosVoip, "c0ffee", max)
+                .unwrap(),
+            RegisterOutcome::Stored
+        );
+        assert_eq!(
+            store
+                .register(&user(1), 3, PushPlatform::AndroidFcm, "c", max)
+                .unwrap(),
+            RegisterOutcome::DeviceLimit
+        );
+        assert!(store.get(&user(1), 3).unwrap().is_none());
+
+        // Обновление известного устройства проходит и на выбранном потолке.
+        assert_eq!(
+            store
+                .register(&user(1), 2, PushPlatform::IosFcm, "b2", max)
+                .unwrap(),
+            RegisterOutcome::Stored
+        );
+        assert_eq!(
+            store
+                .register(&user(1), 1, PushPlatform::AndroidFcm, "a2", max)
+                .unwrap(),
+            RegisterOutcome::Stored
+        );
+        assert_eq!(store.get(&user(1), 1).unwrap().unwrap().token, "a2");
+
+        // Чужой аккаунт потолок не делит.
+        assert_eq!(
+            store
+                .register(&user(2), 3, PushPlatform::AndroidFcm, "z", max)
+                .unwrap(),
+            RegisterOutcome::Stored
+        );
+
+        // Снятое устройство освобождает место.
+        store.remove_all(&user(1), 2).unwrap();
+        assert_eq!(
+            store
+                .register(&user(1), 3, PushPlatform::AndroidFcm, "c", max)
+                .unwrap(),
+            RegisterOutcome::Stored
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn register_without_ceiling_and_with_invalid_token() {
+        let (_db, store, path) = open_store("register_misc");
+        for device in 0..50u16 {
+            assert_eq!(
+                store
+                    .register(&user(1), device, PushPlatform::AndroidFcm, "t", 0)
+                    .unwrap(),
+                RegisterOutcome::Stored
+            );
+        }
+        assert_eq!(
+            store
+                .register(&user(1), 99, PushPlatform::IosVoip, "not-hex", 0)
+                .unwrap(),
+            RegisterOutcome::InvalidToken
+        );
+        assert_eq!(
+            store
+                .register(&user(1), 99, PushPlatform::AndroidFcm, "  ", 0)
+                .unwrap(),
+            RegisterOutcome::InvalidToken
+        );
+        cleanup(&path);
+    }
+
+    /// Приветствие — одно на аккаунт навсегда: снятие токенов отметку не
+    /// сбрасывает, и она переживает переоткрытие базы.
+    #[test]
+    fn claim_welcome_is_granted_once_per_account() {
+        let path = temp_path("welcome_claim");
+        {
+            let db = sled::open(&path).unwrap();
+            let store = PushTokenStore::open(&db).unwrap();
+            assert!(store.claim_welcome(&user(1)).unwrap());
+            assert!(!store.claim_welcome(&user(1)).unwrap());
+
+            store
+                .add(&user(1), 1, PushPlatform::AndroidFcm, "t")
+                .unwrap();
+            store.remove_all(&user(1), 1).unwrap();
+            assert!(!store.claim_welcome(&user(1)).unwrap());
+
+            // Отметка не попадает в дерево токенов.
+            assert!(!store.has_any_for_user(&user(1)).unwrap());
+            assert!(store.list_user(&user(1)).unwrap().is_empty());
+
+            assert!(store.claim_welcome(&user(2)).unwrap());
+            db.flush().unwrap();
+        }
+        let db = sled::open(&path).unwrap();
+        let store = PushTokenStore::open(&db).unwrap();
+        assert!(!store.claim_welcome(&user(1)).unwrap());
+        assert!(!store.claim_welcome(&user(2)).unwrap());
+        drop(store);
+        drop(db);
         cleanup(&path);
     }
 }

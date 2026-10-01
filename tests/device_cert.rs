@@ -7,13 +7,13 @@
 
 mod common;
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use common::{
-    HANDSHAKE_TIMEOUT, ServerHandle, connect, decode, encode_delivery_ack, expect_auth_ok,
-    expect_connection_gone, next_frame, next_incoming_within, random_identity, send_and_read_ack,
-    spawn_server, unix_now_secs, user_id_of,
+    Conn, HANDSHAKE_TIMEOUT, ServerHandle, confirm, connect, decode, encode_delivery_ack,
+    expect_auth_ok, expect_connection_gone, next_frame, next_incoming_within, random_identity,
+    send_and_read_ack, spawn_server, unix_now_secs, user_id_of,
 };
 use ed25519_dalek::{Signer, SigningKey};
 use prost::Message;
@@ -75,15 +75,17 @@ fn issue(
     }
 }
 
+/// Делегированный вход с подтверждением сессии — так, как это делает
+/// клиент (см. `common::confirm`).
 async fn connect_delegated(
     server: &ServerHandle,
     account_id: &[u8; 32],
     device: &DeviceKey,
     device_id: u16,
     cert: wire::DeviceCertificate,
-) -> Result<NoiseFramed<TcpStream>> {
+) -> Result<Conn> {
     let stream = TcpStream::connect(server.addr).await?;
-    NoiseFramed::connect_delegated(
+    let raw = NoiseFramed::connect_delegated(
         stream,
         &server.node_public,
         &device.secret,
@@ -93,7 +95,8 @@ async fn connect_delegated(
         HANDSHAKE_TIMEOUT,
         FRAME_MAX,
     )
-    .await
+    .await?;
+    confirm(raw).await
 }
 
 fn wrap(payload: frame::Payload) -> Vec<u8> {
@@ -218,6 +221,34 @@ async fn receive_only_certificate_cannot_send() -> Result<()> {
     let ack = send_and_read_ack(&mut conn, &user_id_of(&random_identity()), b"x", 0).await?;
     assert!(!ack.ok);
     assert_eq!(ack.reason, SendRejectReason::Forbidden);
+    Ok(())
+}
+
+/// Сессия не переживает сертификат, даже если клиент молчит: закрывает её
+/// срок, а не очередной входящий кадр.
+#[tokio::test]
+async fn silent_delegated_session_closes_when_the_certificate_expires() -> Result<()> {
+    let server = spawn_server("device_cert_expiry", LimitsConfig::default()).await?;
+    let account = random_identity();
+    let account_id = user_id_of(&account);
+    let device = device_key();
+    let now = unix_now_secs();
+    let cert = issue(&account, DEVICE, &device.public, SCOPE_SEND, now, now + 2);
+    let mut conn = connect_delegated(&server, &account_id, &device, DEVICE, cert).await?;
+    expect_auth_ok(&next_frame(&mut conn).await?, &account_id)?;
+    let confirmed_at = Instant::now();
+
+    // С этого момента клиент не шлёт ничего; `expect_connection_gone`
+    // ждёт до 5 с, сертификату осталось не больше 2 с.
+    assert!(
+        expect_connection_gone(&mut conn).await,
+        "the node kept a silent session past its certificate"
+    );
+    assert!(
+        confirmed_at.elapsed() < Duration::from_secs(4),
+        "a certificate with at most 2 s left kept the session for {:?}",
+        confirmed_at.elapsed()
+    );
     Ok(())
 }
 

@@ -166,7 +166,7 @@ async fn open_session(args: &Args, key: &SigningKey) -> Result<NoiseFramed<TcpSt
         .context("read AuthOk")?
         .ok_or_else(|| anyhow!("connection closed before AuthOk"))?;
     match Frame::decode(bytes.as_ref())?.payload {
-        Some(frame::Payload::AuthOk(_)) => Ok(conn),
+        Some(frame::Payload::AuthOk(_)) => {}
         Some(frame::Payload::AuthError(err)) => {
             bail!(
                 "session rejected: code={} message={}",
@@ -176,6 +176,18 @@ async fn open_session(args: &Args, key: &SigningKey) -> Result<NoiseFramed<TcpSt
         }
         _ => bail!("expected AuthOk"),
     }
+
+    // Сессия начинается с первого кадра клиента: до него нода не
+    // доставляет ничего. `Pong` в ответ цикл клиента просто пропустит.
+    let ping = Frame {
+        proto_version: PROTO_VERSION,
+        payload: Some(frame::Payload::Ping(wire::Ping {})),
+    }
+    .encode_to_vec();
+    conn.send_frame(&ping)
+        .await
+        .context("send the confirming Ping")?;
+    Ok(conn)
 }
 
 /// Один клиент: шлёт с заданной частотой и читает всё, что приходит.

@@ -58,7 +58,8 @@ pub struct Config {
 }
 
 /// Лимиты и квоты. Все значения `0` означают «не ограничено», кроме
-/// `ttl_min_seconds`, где 0 отключает проверку пола. Квоты очередей
+/// `ttl_min_seconds`, где 0 отключает проверку пола, и
+/// `session_confirm_timeout_secs`, где 0 недопустим. Квоты очередей
 /// (`max_messages_per_queue`, `max_bytes_per_queue`,
 /// `max_messages_sender_pair`) действуют только в прямом (sled) бэкенде:
 /// брокерный ограничен лимитами самого потока JetStream. Остальные лимиты
@@ -85,6 +86,15 @@ pub struct LimitsConfig {
     /// Максимум одновременных сессий одного пользователя; лишние отклоняются
     /// AuthError до AuthOk. Default: 64.
     pub max_sessions_per_user: usize,
+    /// Сколько нода ждёт первый кадр клиента после `AuthOk`, сек
+    /// (`SESSION_CONFIRM_TIMEOUT_SECS`). Default: 30; `0` недопустим.
+    ///
+    /// Сессия считается подтверждённой только этим кадром: msg1 IK можно
+    /// переиграть, а расшифровать `AuthOk` и ответить может лишь владелец
+    /// эфемерного ключа. До подтверждения сессия не регистрируется и ничего
+    /// не получает, но держит место на входе (`handshake_max_inflight*`) —
+    /// таймаут ограничивает, сколько его занимает чужой повтор.
+    pub session_confirm_timeout_secs: u64,
     /// Максимум Ping/с на соединение; сверх — pong не отправляется.
     /// Default: 50.
     pub ping_per_sec: u32,
@@ -95,6 +105,14 @@ pub struct LimitsConfig {
     /// сути потолок списка контактов; занижать его больно, а не ставить
     /// вовсе нельзя: аллокация дёшева для клиента и вечна для ноды.
     pub max_queues_per_user: usize,
+    /// Потолок устройств с push-токенами на пользователя, штук
+    /// (`MAX_PUSH_DEVICES_PER_USER`). Default: 32, `0` = без ограничения.
+    ///
+    /// `deviceId` выбирает сам клиент, и без потолка один аккаунт заводил
+    /// бы токены без счёта. Новое устройство сверх потолка получает
+    /// `PushTokenAck { ok: false }`; смена токена уже известного устройства
+    /// проходит всегда.
+    pub max_push_devices_per_user: usize,
     /// Максимум одновременных Noise-хендшейков на ноду. Крипта IK платится
     /// до аутентификации, поэтому вход считается отдельно от сессий.
     /// Default: 256.
@@ -150,8 +168,10 @@ impl Default for LimitsConfig {
             send_msgs_per_sec: 100,
             send_bytes_per_day: 256 * 1024 * 1024,
             max_sessions_per_user: 64,
+            session_confirm_timeout_secs: 30,
             ping_per_sec: 50,
             max_queues_per_user: 1024,
+            max_push_devices_per_user: 32,
             handshake_max_inflight: 256,
             handshake_max_inflight_per_ip: 32,
             max_connections: 4096,
@@ -585,9 +605,13 @@ struct RawConfig {
     #[serde(default)]
     limit_max_sessions_per_user: Option<usize>,
     #[serde(default)]
+    session_confirm_timeout_secs: Option<u64>,
+    #[serde(default)]
     limit_ping_per_sec: Option<u32>,
     #[serde(default)]
     max_queues_per_user: Option<usize>,
+    #[serde(default)]
+    max_push_devices_per_user: Option<usize>,
     #[serde(default)]
     queue_addressing_enabled: Option<bool>,
     #[serde(default)]
@@ -677,8 +701,10 @@ pub fn load() -> anyhow::Result<Config> {
         rate_limit_send_msgs_per_sec,
         rate_limit_send_bytes_per_day,
         limit_max_sessions_per_user,
+        session_confirm_timeout_secs,
         limit_ping_per_sec,
         max_queues_per_user,
+        max_push_devices_per_user,
         queue_addressing_enabled,
         device_cert_max_ttl_seconds,
         limit_handshake_inflight,
@@ -755,6 +781,14 @@ pub fn load() -> anyhow::Result<Config> {
     })?;
 
     let defaults = LimitsConfig::default();
+    let session_confirm_timeout_secs = match session_confirm_timeout_secs {
+        None => defaults.session_confirm_timeout_secs,
+        Some(0) => bail!(
+            "SESSION_CONFIRM_TIMEOUT_SECS must be greater than zero: an unconfirmed session \
+             would hold its handshake admission slot forever"
+        ),
+        Some(seconds) => seconds,
+    };
     let limits = LimitsConfig {
         ttl_min_seconds: ttl_min_seconds.unwrap_or(defaults.ttl_min_seconds),
         max_messages_per_queue: quota_max_messages_per_queue
@@ -766,8 +800,11 @@ pub fn load() -> anyhow::Result<Config> {
         send_bytes_per_day: rate_limit_send_bytes_per_day.unwrap_or(defaults.send_bytes_per_day),
         max_sessions_per_user: limit_max_sessions_per_user
             .unwrap_or(defaults.max_sessions_per_user),
+        session_confirm_timeout_secs,
         ping_per_sec: limit_ping_per_sec.unwrap_or(defaults.ping_per_sec),
         max_queues_per_user: max_queues_per_user.unwrap_or(defaults.max_queues_per_user),
+        max_push_devices_per_user: max_push_devices_per_user
+            .unwrap_or(defaults.max_push_devices_per_user),
         handshake_max_inflight: limit_handshake_inflight.unwrap_or(defaults.handshake_max_inflight),
         handshake_max_inflight_per_ip: limit_handshake_inflight_per_ip
             .unwrap_or(defaults.handshake_max_inflight_per_ip),

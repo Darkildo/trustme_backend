@@ -28,10 +28,12 @@
 //!
 //! Generates fresh Ed25519 keypairs each run, so userIds are unique per invocation.
 
+use std::collections::VecDeque;
 use std::io::Read;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
+use bytes::BytesMut;
 use ed25519_dalek::SigningKey;
 use prost::Message;
 use tokio::net::TcpStream;
@@ -207,19 +209,16 @@ fn decode_payload(bytes: &[u8]) -> Result<frame::Payload> {
         .context("message server sent a frame without payload")
 }
 
-/// Открыть сессию: Noise IK + `AuthOk`, который нода шлёт сама. Токена
-/// нет — identity доказана статиком, выведенным из ключа клиента.
-async fn login(
-    args: &Args,
-    identity: &SigningKey,
-    device_id: Option<u16>,
-) -> Result<NoiseFramed<TcpStream>> {
+/// Открыть сессию: Noise IK, `AuthOk`, который нода шлёт сама, и
+/// подтверждение сессии. Токена нет — identity доказана статиком,
+/// выведенным из ключа клиента.
+async fn login(args: &Args, identity: &SigningKey, device_id: Option<u16>) -> Result<Session> {
     let stream = TcpStream::connect(&args.message_addr)
         .await
         .with_context(|| format!("connect to message server at {}", args.message_addr))?;
     stream.set_nodelay(true).ok();
 
-    let mut conn = NoiseFramed::connect(
+    let conn = NoiseFramed::connect(
         stream,
         &args.node_key()?,
         identity,
@@ -230,6 +229,38 @@ async fn login(
     .await
     .context("noise handshake failed")?;
 
+    confirm_session(conn, &identity.verifying_key().to_bytes()).await
+}
+
+/// Установленная сессия смоук-клиента.
+///
+/// Нода считает сессию своей только после первого кадра клиента, поэтому
+/// вход сразу отвечает на `AuthOk` пингом и ждёт `Pong`. Кадры, пришедшие
+/// раньше `Pong` (офлайн-реплей), сохраняются и отдаются сценарию первыми,
+/// так что для него это обычный канал.
+struct Session {
+    conn: NoiseFramed<TcpStream>,
+    early: VecDeque<BytesMut>,
+}
+
+impl Session {
+    async fn next_frame(&mut self) -> std::io::Result<Option<BytesMut>> {
+        match self.early.pop_front() {
+            Some(frame) => Ok(Some(frame)),
+            None => self.conn.next_frame().await,
+        }
+    }
+
+    async fn send_frame(&mut self, payload: &[u8]) -> std::io::Result<()> {
+        self.conn.send_frame(payload).await
+    }
+}
+
+/// Принять `AuthOk` и подтвердить сессию первым кадром (`Ping`).
+async fn confirm_session(
+    mut conn: NoiseFramed<TcpStream>,
+    expected_user: &[u8; 32],
+) -> Result<Session> {
     let bytes = timeout(Duration::from_secs(10), conn.next_frame())
         .await
         .context("waiting for AuthOk timed out")?
@@ -238,7 +269,7 @@ async fn login(
 
     match decode_payload(bytes.as_ref())? {
         frame::Payload::AuthOk(ok) => {
-            if ok.user_id != identity.verifying_key().to_bytes() {
+            if ok.user_id != expected_user {
                 bail!("AuthOk returned wrong user_id");
             }
         }
@@ -251,7 +282,30 @@ async fn login(
         }
         _ => bail!("expected AuthOk right after the noise handshake"),
     }
-    Ok(conn)
+
+    conn.send_frame(&wrap(frame::Payload::Ping(wire::Ping {})))
+        .await
+        .context("send the confirming Ping")?;
+    let mut early = VecDeque::new();
+    loop {
+        let bytes = timeout(Duration::from_secs(10), conn.next_frame())
+            .await
+            .context("waiting for Pong timed out")?
+            .context("read Pong")?
+            .ok_or_else(|| anyhow!("connection closed before Pong"))?;
+        match decode_payload(bytes.as_ref())? {
+            frame::Payload::Pong(_) => break,
+            frame::Payload::AuthError(err) => {
+                bail!(
+                    "session rejected on confirmation: code={} message={}",
+                    err.code,
+                    err.message
+                );
+            }
+            _ => early.push_back(bytes),
+        }
+    }
+    Ok(Session { conn, early })
 }
 
 #[derive(Debug)]
@@ -503,7 +557,7 @@ async fn run_offline_then_online(args: &Args) -> Result<()> {
 }
 
 async fn drain_until_incoming(
-    framed: &mut NoiseFramed<TcpStream>,
+    framed: &mut Session,
     expect_from: &[u8; 32],
     expect_body: &[u8],
     deadline: Duration,
@@ -533,10 +587,7 @@ async fn drain_until_incoming(
     Ok(None)
 }
 
-async fn expect_send_ack(
-    framed: &mut NoiseFramed<TcpStream>,
-    deadline: Duration,
-) -> Result<ReceivedSendAck> {
+async fn expect_send_ack(framed: &mut Session, deadline: Duration) -> Result<ReceivedSendAck> {
     let started = Instant::now();
     while started.elapsed() < deadline {
         match timeout(Duration::from_millis(500), framed.next_frame()).await {
@@ -900,7 +951,7 @@ async fn run_queue_lifecycle(args: &Args) -> Result<()> {
     Ok(())
 }
 
-async fn expect_queue_ack(conn: &mut NoiseFramed<TcpStream>) -> Result<wire::QueueAck> {
+async fn expect_queue_ack(conn: &mut Session) -> Result<wire::QueueAck> {
     let bytes = read_frame(conn, "QueueAck").await?;
     match decode_payload(bytes.as_ref())? {
         frame::Payload::QueueAck(ack) => Ok(ack),
@@ -908,7 +959,7 @@ async fn expect_queue_ack(conn: &mut NoiseFramed<TcpStream>) -> Result<wire::Que
     }
 }
 
-async fn read_frame(conn: &mut NoiseFramed<TcpStream>, what: &str) -> Result<bytes::BytesMut> {
+async fn read_frame(conn: &mut Session, what: &str) -> Result<BytesMut> {
     match timeout(Duration::from_secs(5), conn.next_frame()).await {
         Ok(Ok(Some(bytes))) => Ok(bytes),
         Ok(Ok(None)) => bail!("server closed the session while waiting for {what}"),
@@ -991,7 +1042,7 @@ async fn run_probe_tofu(args: &Args) -> Result<()> {
         "==> opening a TOFU session to {} (no pin)",
         args.message_addr
     );
-    let (mut conn, learned) = NoiseFramed::connect_unpinned(
+    let (conn, learned) = NoiseFramed::connect_unpinned(
         stream,
         &key,
         None,
@@ -1004,24 +1055,7 @@ async fn run_probe_tofu(args: &Args) -> Result<()> {
     )
     .await
     .context("tofu handshake failed (is NOISE_ALLOW_TOFU disabled?)")?;
-
-    // AuthOk нода шлёт сама.
-    let bytes = timeout(Duration::from_secs(10), conn.next_frame())
-        .await
-        .context("waiting for AuthOk timed out")?
-        .context("read AuthOk")?
-        .ok_or_else(|| anyhow!("connection closed before AuthOk"))?;
-    match decode_payload(bytes.as_ref())? {
-        frame::Payload::AuthOk(_) => {}
-        frame::Payload::AuthError(err) => {
-            bail!(
-                "session rejected: code={} message={}",
-                err.code,
-                err.message
-            )
-        }
-        _ => bail!("expected AuthOk right after the noise handshake"),
-    }
+    let mut conn = confirm_session(conn, &key.verifying_key().to_bytes()).await?;
 
     // Подпись конфига проверяется против только что узнанного ключа: это и
     // есть проверка, что снапшот выдала та нода, с которой мы говорим.
