@@ -730,6 +730,14 @@ where
         device_id: Option<DeviceId>,
         device_cert: Option<crate::wire::DeviceCertificate>,
     ) -> Result<TransportState> {
+        // Пин малого порядка — не ключ ноды: DH с такой точкой не зависит
+        // от секрета, и хендшейк с клиентом прошёл бы кто угодно. snow
+        // нулевой DH-выход не отвергает, поэтому отказ здесь — до первого
+        // байта, пока клиент ещё ничего о себе не сказал.
+        if is_small_order_x25519(node_public) {
+            bail!("node static key has small order");
+        }
+
         write_client_prologue(stream, NoisePattern::Ik).await?;
 
         let prologue = build_prologue(PROTO_VERSION, NoisePattern::Ik);
@@ -796,6 +804,14 @@ where
             .ok_or_else(|| anyhow::anyhow!("noise handshake produced no node static key"))?;
         let node_public = to_fixed_32(node_public, "node static key")?;
 
+        // Статик малого порядка до решения о доверии не доходит: такой
+        // «ключ» ничего не аутентифицирует, а запиненный, он пускал бы к
+        // клиенту любого при каждом следующем подключении. Отказ — до msg3,
+        // identity клиента не раскрыта.
+        if is_small_order_x25519(&node_public) {
+            bail!("node static key has small order");
+        }
+
         // Точка решения. Дальше клиент раскроет свой статик, поэтому отказ
         // здесь оставляет собеседника без identity клиента.
         if !accept_key(&node_public) {
@@ -814,17 +830,17 @@ where
         Ok((transport, node_public))
     }
 
+    /// Потолок логического кадра этой сессии — и на приём, и на отправку.
+    pub fn max_frame_len(&self) -> usize {
+        self.assembler.max_frame_len()
+    }
+
     /// Прочитать следующий логический кадр.
     ///
     /// Cancel-safe: единственная точка ожидания — чтение очередного
     /// Noise-сообщения из `Framed` (сам по себе cancel-safe), а расшифровка
     /// и накопление происходят синхронно и оседают в `self`. Это условие
     /// обязательное: метод вызывается из ветки `select!`.
-    /// Потолок логического кадра этой сессии — и на приём, и на отправку.
-    pub fn max_frame_len(&self) -> usize {
-        self.assembler.max_frame_len()
-    }
-
     pub async fn next_frame(&mut self) -> io::Result<Option<BytesMut>> {
         loop {
             if let Some(frame) = self.assembler.take_frame()? {
@@ -1852,28 +1868,37 @@ mod tests {
     }
 
     /// Кодировки точек малого порядка — на кривой, на twist'е и в
-    /// неканонической записи. Нормальные ключи проверку проходят.
+    /// неканонической записи.
+    const LOW_ORDER_HEX: [&str; 8] = [
+        // u = 0 (сюда же конвертируется нейтральный элемент Ed25519)
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        // u = 1
+        "0100000000000000000000000000000000000000000000000000000000000000",
+        // точки порядка 8
+        "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
+        "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
+        // u = p − 1
+        "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        // u = p и u = p + 1 — неканонические 0 и 1
+        "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
+        // u = 0 с выставленным старшим битом: X25519 его игнорирует
+        "0000000000000000000000000000000000000000000000000000000000000080",
+    ];
+
+    fn low_order_points() -> Vec<[u8; 32]> {
+        LOW_ORDER_HEX
+            .iter()
+            .map(|encoded| hex::decode(encoded).unwrap().try_into().unwrap())
+            .collect()
+    }
+
+    /// Точки малого порядка распознаются во всех кодировках. Нормальные
+    /// ключи проверку проходят.
     #[test]
     fn small_order_x25519_points_are_detected() {
-        let low_order_hex = [
-            // u = 0 (сюда же конвертируется нейтральный элемент Ed25519)
-            "0000000000000000000000000000000000000000000000000000000000000000",
-            // u = 1
-            "0100000000000000000000000000000000000000000000000000000000000000",
-            // точки порядка 8
-            "e0eb7a7c3b41b8ae1656e3faf19fc46ada098deb9c32b1fd866205165f49b800",
-            "5f9c95bca3508c24b1d0b1559c83ef5b04445cc4581c8e86d8224eddd09f1157",
-            // u = p − 1
-            "ecffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
-            // u = p и u = p + 1 — неканонические 0 и 1
-            "edffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
-            "eeffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff7f",
-            // u = 0 с выставленным старшим битом: X25519 его игнорирует
-            "0000000000000000000000000000000000000000000000000000000000000080",
-        ];
-        for encoded in low_order_hex {
-            let point: [u8; 32] = hex::decode(encoded).unwrap().try_into().unwrap();
-            assert!(is_small_order_x25519(&point), "{encoded} has small order");
+        for (point, encoded) in low_order_points().iter().zip(LOW_ORDER_HEX) {
+            assert!(is_small_order_x25519(point), "{encoded} has small order");
         }
 
         assert!(!is_small_order_x25519(&node().public()));
@@ -1933,6 +1958,264 @@ mod tests {
         assert!(
             err.contains("small order"),
             "weak identity must be refused, got: {err}"
+        );
+    }
+
+    /// Центральная сверка identity, путь IK: клиент проходит хендшейк своим
+    /// статиком, а в hello заявляет чужой `user_id`. Статик доказан DH, а
+    /// заявка — нет, и нода обязана отказать именно по несовпадению: без
+    /// этой сверки сессию от имени любого пользователя открыл бы кто угодно.
+    #[tokio::test]
+    async fn ik_login_under_a_foreign_identity_is_refused() {
+        let node = node();
+        let node_public = node.public();
+        let attacker = client_key(21);
+        let victim_id = client_key(22).verifying_key().to_bytes();
+
+        let (server_stream, mut client_stream) = loopback().await;
+        let server =
+            tokio::spawn(
+                async move { NoiseFramed::accept(server_stream, &node, test_policy()).await },
+            );
+
+        // msg2 нода пишет до сверки, поэтому сам хендшейк у клиента
+        // сходится; отказ виден только на стороне ноды.
+        NoiseFramed::<TcpStream>::connect_ik(
+            &mut client_stream,
+            &node_public,
+            &attacker.to_scalar_bytes(),
+            &victim_id,
+            None,
+            None,
+        )
+        .await
+        .expect("handshake itself completes on the client side");
+
+        let err = server.await.unwrap().map(|_| ()).unwrap_err().to_string();
+        assert!(
+            err.contains("client identity key does not match the authenticated noise static key"),
+            "foreign identity must be refused as a mismatch, got: {err}"
+        );
+    }
+
+    /// Та же сверка на пути XX: статик и заявка едут в msg3, и чужой
+    /// `user_id` в ней отвергается так же, как в IK.
+    #[tokio::test]
+    async fn xx_login_under_a_foreign_identity_is_refused() {
+        let node = node();
+        let attacker = client_key(23);
+        let victim_id = client_key(24).verifying_key().to_bytes();
+
+        let (server_stream, mut client_stream) = loopback().await;
+        let server =
+            tokio::spawn(
+                async move { NoiseFramed::accept(server_stream, &node, test_policy()).await },
+            );
+
+        write_client_prologue(&mut client_stream, NoisePattern::Xx)
+            .await
+            .unwrap();
+        let mut handshake = Builder::new(NOISE_PARAMS_XX.parse().unwrap())
+            .prologue(&build_prologue(PROTO_VERSION, NoisePattern::Xx))
+            .unwrap()
+            .local_private_key(&attacker.to_scalar_bytes())
+            .unwrap()
+            .build_initiator()
+            .unwrap();
+        let mut message = vec![0u8; NOISE_MAX_MESSAGE_LEN];
+        let mut payload = vec![0u8; NOISE_MAX_MESSAGE_LEN];
+
+        let len = handshake.write_message(&[], &mut message).unwrap();
+        write_handshake_message(&mut client_stream, &message[..len])
+            .await
+            .unwrap();
+        let response = read_handshake_message(&mut client_stream).await.unwrap();
+        handshake.read_message(&response, &mut payload).unwrap();
+
+        let hello = encode_client_hello(&victim_id, None, None).unwrap();
+        let len = handshake.write_message(&hello, &mut message).unwrap();
+        write_handshake_message(&mut client_stream, &message[..len])
+            .await
+            .unwrap();
+
+        let err = server.await.unwrap().map(|_| ()).unwrap_err().to_string();
+        assert!(
+            err.contains("client identity key does not match the authenticated noise static key"),
+            "foreign identity must be refused as a mismatch, got: {err}"
+        );
+    }
+
+    /// Делегированный вход: сертификат настоящий и действующий, но выписан
+    /// на другой транспортный ключ, чем тот, которым пройден хендшейк.
+    /// Сертификат — не предъявительский токен: без секрета его
+    /// `transport_key` сессию он не открывает.
+    #[tokio::test]
+    async fn certificate_for_another_transport_key_is_refused() {
+        const DEVICE: DeviceId = 7;
+        let node = node();
+        let node_public = node.public();
+        let account = client_key(25);
+        let account_id = account.verifying_key().to_bytes();
+        // Ключ устройства, которому выписан сертификат, и ключ того, кто
+        // сертификат предъявляет: оба настоящие X25519-пары, но разные.
+        let device_public = client_key(26).verifying_key().to_montgomery().to_bytes();
+        let bearer = client_key(27);
+
+        let now = unix_now_secs();
+        let (not_before, not_after) = (now - 10, now + 3600);
+        let signing_key = [0x33u8; 32];
+        let scope = crate::wire::DeviceCertScope::Send as u32;
+        let signed = device_cert::signed_bytes(
+            &account_id,
+            DEVICE,
+            &device_public,
+            &signing_key,
+            scope,
+            not_before,
+            not_after,
+        );
+        let cert = crate::wire::DeviceCertificate {
+            transport_key: device_public.to_vec(),
+            signing_key: signing_key.to_vec(),
+            scope,
+            not_before,
+            not_after,
+            signature: account.sign(&signed).to_bytes().to_vec(),
+            device_id: u32::from(DEVICE),
+        };
+
+        let (server_stream, mut client_stream) = loopback().await;
+        let server =
+            tokio::spawn(
+                async move { NoiseFramed::accept(server_stream, &node, test_policy()).await },
+            );
+
+        NoiseFramed::<TcpStream>::connect_ik(
+            &mut client_stream,
+            &node_public,
+            &bearer.to_scalar_bytes(),
+            &account_id,
+            Some(DEVICE),
+            Some(cert),
+        )
+        .await
+        .expect("handshake itself completes on the client side");
+
+        let err = server.await.unwrap().map(|_| ()).unwrap_err().to_string();
+        assert!(
+            err.contains("device certificate does not match the authenticated noise static key"),
+            "a certificate presented with a foreign static must be refused, got: {err}"
+        );
+    }
+
+    /// Подставная нода без единого секрета: её статик — точка u = 0, и DH с
+    /// ним даёт нули у обеих сторон. Отрабатывает роль респондера и
+    /// возвращает hello клиента, если тот его прислал.
+    async fn forged_node(mut stream: TcpStream) -> Result<Vec<u8>> {
+        let mut prologue = [0u8; NOISE_MAGIC.len() + 3];
+        stream.read_exact(&mut prologue).await?;
+        let pattern = NoisePattern::from_wire(prologue[prologue.len() - 1])?;
+
+        let mut handshake =
+            Builder::with_resolver(pattern.params().parse()?, Box::new(forged_static::Resolver))
+                .prologue(&prologue)
+                .map_err(|err| anyhow::anyhow!("prologue: {err}"))?
+                .local_private_key(&forged_static::MARKER)
+                .map_err(|err| anyhow::anyhow!("static: {err}"))?
+                .build_responder()
+                .map_err(|err| anyhow::anyhow!("responder: {err}"))?;
+        let mut payload = vec![0u8; NOISE_MAX_MESSAGE_LEN];
+        let mut response = vec![0u8; NOISE_MAX_MESSAGE_LEN];
+
+        let message = read_handshake_message(&mut stream).await?;
+        let mut hello_len = handshake
+            .read_message(&message, &mut payload)
+            .map_err(|err| anyhow::anyhow!("message 1: {err}"))?;
+        let len = handshake
+            .write_message(&[], &mut response)
+            .map_err(|err| anyhow::anyhow!("message 2: {err}"))?;
+        write_handshake_message(&mut stream, &response[..len]).await?;
+
+        if matches!(pattern, NoisePattern::Xx) {
+            let message = read_handshake_message(&mut stream).await?;
+            hello_len = handshake
+                .read_message(&message, &mut payload)
+                .map_err(|err| anyhow::anyhow!("message 3: {err}"))?;
+        }
+        Ok(payload[..hello_len].to_vec())
+    }
+
+    /// Клиент с пином обязан отвергнуть статик ноды малого порядка до
+    /// первого байта. DH с такой точкой не зависит ни от чьего секрета,
+    /// поэтому «нодой» для такого пина становится кто угодно: подставной
+    /// респондер ниже не знает ни одного секрета, и без проверки клиент
+    /// отдал бы ему свой `user_id` и открыл с ним сессию.
+    #[tokio::test]
+    async fn pinned_small_order_node_key_is_refused_by_the_client() {
+        for node_public in low_order_points() {
+            let (server_stream, client_stream) = loopback().await;
+            let forged = tokio::spawn(forged_node(server_stream));
+
+            let err = NoiseFramed::connect(
+                client_stream,
+                &node_public,
+                &client_key(31),
+                Some(1),
+                TEST_TIMEOUT,
+                TEST_FRAME_MAX,
+            )
+            .await
+            .map(|_| ())
+            .unwrap_err()
+            .to_string();
+            assert!(
+                err.contains("small order"),
+                "pin {} must be refused, got: {err}",
+                hex::encode(node_public)
+            );
+            assert!(
+                forged.await.unwrap().is_err(),
+                "client must not send anything to a node pinned by {}",
+                hex::encode(node_public)
+            );
+        }
+    }
+
+    /// Первый контакт: нода предъявляет статик малого порядка. Клиент
+    /// обязан отказаться сам, до колбэка: вопрос «доверять ли этому
+    /// ключу» к такому ключу неприменим, а принятый однажды, он пускал бы
+    /// к клиенту кого угодно при каждом следующем подключении. msg3 с
+    /// identity клиента при этом не уходит.
+    #[tokio::test]
+    async fn tofu_small_order_node_key_is_refused_before_the_decision() {
+        let (server_stream, client_stream) = loopback().await;
+        let forged = tokio::spawn(forged_node(server_stream));
+
+        let mut asked = false;
+        let err = NoiseFramed::connect_unpinned(
+            client_stream,
+            &client_key(32),
+            Some(1),
+            TEST_TIMEOUT,
+            TEST_FRAME_MAX,
+            |_| {
+                asked = true;
+                true
+            },
+        )
+        .await
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            err.contains("small order"),
+            "node key must be refused, got: {err}"
+        );
+        assert!(!asked, "the trust decision must not be offered such a key");
+        assert!(
+            forged.await.unwrap().is_err(),
+            "client identity must not reach a node with a small-order static"
         );
     }
 
