@@ -820,6 +820,11 @@ where
     /// Noise-сообщения из `Framed` (сам по себе cancel-safe), а расшифровка
     /// и накопление происходят синхронно и оседают в `self`. Это условие
     /// обязательное: метод вызывается из ветки `select!`.
+    /// Потолок логического кадра этой сессии — и на приём, и на отправку.
+    pub fn max_frame_len(&self) -> usize {
+        self.assembler.max_frame_len()
+    }
+
     pub async fn next_frame(&mut self) -> io::Result<Option<BytesMut>> {
         loop {
             if let Some(frame) = self.assembler.take_frame()? {
