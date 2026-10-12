@@ -137,7 +137,11 @@ fn every_payload_variant_roundtrips() {
             ok: true,
             message: String::new(),
         }),
-        frame::Payload::AllocateQueue(AllocateQueue::default()),
+        frame::Payload::AllocateQueue(AllocateQueue {
+            tag: vec![11u8; 32],
+            expires_at: 1_700_086_400,
+            revoked: true,
+        }),
         frame::Payload::RevokeQueue(RevokeQueue {
             queue_id: vec![8u8; 32],
         }),
@@ -148,10 +152,20 @@ fn every_payload_variant_roundtrips() {
             reason: QueueRejectReason::Limit as i32,
         }),
         frame::Payload::QueueList(QueueList {
-            queues: vec![QueueRecord {
-                queue_id: vec![10u8; 32],
-                created_at: 1_700_000_000,
-            }],
+            queues: vec![
+                QueueRecord {
+                    queue_id: vec![10u8; 32],
+                    created_at: 1_700_000_000,
+                    revoked_at: 0,
+                    expires_at: 1_700_086_400,
+                },
+                QueueRecord {
+                    queue_id: vec![12u8; 32],
+                    created_at: 0,
+                    revoked_at: 1_700_000_500,
+                    expires_at: 0,
+                },
+            ],
             queue_only: true,
         }),
         frame::Payload::SetQueueOnly(SetQueueOnly { enabled: true }),
@@ -262,6 +276,32 @@ fn zero_values_are_unspecified() {
     assert_eq!(QueueRejectReason::Unspecified as i32, 0);
 }
 
+/// Номера полей N-2′ (выделение по тегу, надгробия, срок).
+#[test]
+fn derived_queue_wire_numbers_are_pinned() {
+    assert_eq!(QueueRejectReason::Invalid as i32, 6);
+    assert_eq!(QueueRejectReason::Revoked as i32, 7);
+
+    let allocate = AllocateQueue {
+        tag: vec![0xAB],
+        expires_at: 5,
+        revoked: true,
+    };
+    // tag = 1 (bytes), expires_at = 2 (varint), revoked = 3 (varint).
+    assert_eq!(
+        allocate.encode_to_vec(),
+        [0x0a, 0x01, 0xab, 0x10, 0x05, 0x18, 0x01]
+    );
+
+    let record = QueueRecord {
+        revoked_at: 7,
+        expires_at: 9,
+        ..QueueRecord::default()
+    };
+    // revoked_at = 3, expires_at = 4.
+    assert_eq!(record.encode_to_vec(), [0x18, 0x07, 0x20, 0x09]);
+}
+
 /// Номера на проводе, которые клиенты держат в своих копиях схемы. Тест
 /// ловит перенумерацию, которую `buf breaking` пропустил бы на ветке без
 /// базы для сравнения.
@@ -277,8 +317,8 @@ fn queue_only_wire_numbers_are_pinned() {
     );
 
     let list = QueueList {
-        queues: Vec::new(),
         queue_only: true,
+        ..QueueList::default()
     };
     assert_eq!(list.encode_to_vec(), [0x10, 0x01]);
 

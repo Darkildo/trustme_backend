@@ -119,7 +119,7 @@ rate(handshake_admission_rejected_total[5m]) > 0
 | `rate_limited` | `SendAck` c `RATE_LIMITED` | Лимит msg/s или байт/сутки |
 | `too_large` | `SendAck` c `TOO_LARGE` | Тело длиннее `MAX_FRAME_LEN − 128` байт. Постоянный рост — клиент режет медиа на куски крупнее потолка ноды |
 | `invalid_ttl` | `SendAck` c `INVALID_TTL` | ttl ниже пола ноды |
-| `no_permit` | `SendAck` c `NO_PERMIT` | Депозит в неизвестную или отозванную очередь либо кадр по `recipientId` аккаунту в режиме «только по очередям» (только при `QUEUE_ADDRESSING_ENABLED=true`); различаются метриками раздела «Очереди» |
+| `no_permit` | `SendAck` c `NO_PERMIT` | Депозит в неизвестную, отозванную или истёкшую очередь либо кадр по `recipientId` аккаунту в режиме «только по очередям» (только при `QUEUE_ADDRESSING_ENABLED=true`); различаются метриками раздела «Очереди» |
 | `forbidden` | `SendAck` c `FORBIDDEN` | Сессия по сертификату устройства без права отправки |
 | `internal` | `SendAck` c `INTERNAL` | Ошибка хранилища или брокера. **Ненулевое значение — всегда авария**, смотреть `storage_operation_total{result="error"}`, `broker_publish_timeout_total` и логи |
 | `unspecified` / `expired` | одноимённые | Зарезервированы, сейчас не выдаются |
@@ -222,7 +222,7 @@ error `envelope does not fit max_frame_len; terminating it` с отправит�
 | Метрика | О чём |
 |---|---|
 | `queue_addressed_send_total` | Депозитов, доставленных по `queueId`, а не по `recipientId` |
-| `queue_addressed_reject_total` | Депозитов в неизвестную или отозванную очередь |
+| `queue_addressed_reject_total` | Депозитов в неизвестную, отозванную или истёкшую очередь |
 | `queue_only_reject_total` | Кадров по `recipientId`, отвергнутых режимом «только по очередям» получателя (контракт §6.9) |
 
 Считаются отдельно от `message_route_total`: тот отвечает на вопрос «куда

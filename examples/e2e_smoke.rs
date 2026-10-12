@@ -875,9 +875,11 @@ async fn run_queue_lifecycle(args: &Args) -> Result<()> {
     let mut conn = login(args, &owner, None).await?;
 
     println!("==> AllocateQueue");
-    conn.send_frame(&wrap(frame::Payload::AllocateQueue(wire::AllocateQueue {})))
-        .await
-        .context("send AllocateQueue")?;
+    conn.send_frame(&wrap(frame::Payload::AllocateQueue(
+        wire::AllocateQueue::default(),
+    )))
+    .await
+    .context("send AllocateQueue")?;
     let ack = expect_queue_ack(&mut conn).await?;
     if !ack.ok || ack.queue_id.len() != 32 {
         bail!(

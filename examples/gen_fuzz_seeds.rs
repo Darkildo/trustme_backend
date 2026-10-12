@@ -141,7 +141,7 @@ fn main() -> Result<()> {
     write(
         &dir,
         "allocate_queue.bin",
-        &wrap(frame::Payload::AllocateQueue(wire::AllocateQueue {})),
+        &wrap(frame::Payload::AllocateQueue(wire::AllocateQueue::default())),
     )?;
     write(
         &dir,
@@ -173,14 +173,27 @@ fn main() -> Result<()> {
                 QueueRecord {
                     queue_id: [6u8; 32],
                     created_at_secs: 1_700_000_000,
+                    revoked_at_secs: 0,
+                    expires_at_secs: 1_700_086_400,
                 },
                 QueueRecord {
                     queue_id: [8u8; 32],
-                    created_at_secs: 1_700_086_400,
+                    created_at_secs: 0,
+                    revoked_at_secs: 1_700_086_400,
+                    expires_at_secs: 0,
                 },
             ],
             true,
         ),
+    )?;
+    write(
+        &dir,
+        "allocate_queue_derived.bin",
+        &wrap(frame::Payload::AllocateQueue(wire::AllocateQueue {
+            tag: vec![9u8; 32],
+            expires_at: 1_700_086_400,
+            revoked: false,
+        })),
     )?;
     write(
         &dir,
