@@ -25,6 +25,22 @@ DEFAULT_MIN = 70.0
 EXEMPT_SUFFIXES = ("src/main.rs", "build.rs")
 
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
+# Строки без исполняемого кода: объявление модуля, пустая, комментарий.
+# Файл из одних таких строк (`state/mod.rs`) в профиль покрытия не
+# попадает вовсе, и его отсутствие в отчёте — не дыра в замере.
+DECLARATION = re.compile(r"^\s*(?:(?:pub(?:\([^)]*\))?\s+)?mod\s+\w+\s*;|//.*)?\s*$")
+
+
+def only_declarations(root: Path, path: str, lines: set[int]) -> bool:
+    """Все добавленные строки файла — объявления модулей или комментарии."""
+    try:
+        text = (root / path).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    return all(
+        0 < number <= len(text) and DECLARATION.match(text[number - 1])
+        for number in lines
+    )
 
 
 def repo_root() -> Path:
@@ -163,8 +179,10 @@ def main() -> int:
         if path not in coverage:
             # Файл не попал в отчёт: он не собирается в профиль покрытия.
             # Промолчать здесь значит показать зелёный гейт там, где он
-            # ничего не проверил.
-            missing.append(path)
+            # ничего не проверил, — кроме файла, где добавлены одни
+            # объявления модулей: исполнять в нём нечего.
+            if not only_declarations(root, path, added[path]):
+                missing.append(path)
             continue
         executable, covered = coverage[path]
         added_executable = added[path] & executable
