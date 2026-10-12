@@ -502,6 +502,12 @@ impl Config {
 }
 
 impl ServerConfigSnapshot {
+    /// Режим «только по очередям» действует только вместе с адресацией по
+    /// очередям: без неё аккаунт с поднятым флагом был бы недостижим вовсе.
+    pub fn supports_queue_only(&self) -> bool {
+        self.supports_queue_addressing
+    }
+
     pub fn supports_offline_messages(&self) -> bool {
         !self.offline_messages_retention.is_immediate()
     }

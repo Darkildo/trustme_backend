@@ -378,6 +378,9 @@ pub async fn handle_conn(
                       queue_id: Vec<u8>,
                   },
                   ListQueues,
+                  SetQueueOnly {
+                      enabled: bool,
+                  },
                   Ignore,
               }
 
@@ -423,6 +426,9 @@ pub async fn handle_conn(
                       queue_id: cmd.queue_id,
                   },
                   Some(frame::Payload::ListQueues(_)) => ClientFrame::ListQueues,
+                  Some(frame::Payload::SetQueueOnly(cmd)) => ClientFrame::SetQueueOnly {
+                      enabled: cmd.enabled,
+                  },
                   _ => ClientFrame::Ignore,
               };
 
@@ -457,6 +463,7 @@ pub async fn handle_conn(
                   ClientFrame::AllocateQueue
                   | ClientFrame::RevokeQueue { .. }
                   | ClientFrame::ListQueues
+                  | ClientFrame::SetQueueOnly { .. }
                       if !scope.can_manage_queues() =>
                   {
                       Some(encode_queue_ack(false, None, WireQueueRejectReason::Forbidden))
@@ -495,6 +502,10 @@ pub async fn handle_conn(
                       // знание идентификатора и есть право в неё писать.
                       let mut resolved = recipient;
                       let mut recipient_device_id = recipient_device_id;
+                      // Определён ли получатель очередью. `false` — по
+                      // `recipientId`: очереди в кадре нет либо нода её
+                      // проигнорировала (адресация по очередям снята).
+                      let mut addressed_by_queue = false;
                       if let Some(id) = queue_id {
                           if !queue_addressing {
                               debug!(
@@ -511,6 +522,7 @@ pub async fn handle_conn(
                                       // `recipientDeviceId` сбрасывается.
                                       resolved = Some(owner);
                                       recipient_device_id = None;
+                                      addressed_by_queue = true;
                                       observability::observe_queue_addressed_send();
                                   }
                                   Ok(None) => {
@@ -549,6 +561,44 @@ pub async fn handle_conn(
                       let Some(recipient) = resolved else {
                           bail!("clientSend carries neither a routable queueId nor a recipientId");
                       };
+
+                      // Режим «только по очередям» получателя (§6.9
+                      // контракта): кадр, адресованный по `recipientId`,
+                      // отвергается так же, как депозит в отозванную
+                      // очередь, — иначе отзыв очереди не блокировал бы
+                      // контакт, знающий `user_id`. Свои устройства пишут
+                      // себе свободно. Со снятой адресацией по очередям
+                      // флаг не действует: аккаунт был бы недостижим вовсе.
+                      //
+                      // Проверка стоит до лимитов (бюджет rate-limit отказ
+                      // не расходует) и до развилки бэкендов: в брокер и
+                      // офлайн-очередь отвергнутое не попадает, пушей нет.
+                      if queue_addressing && !addressed_by_queue && recipient != user_id {
+                          match queues.is_queue_only(&recipient) {
+                              Ok(false) => {}
+                              Ok(true) => {
+                                  debug!(
+                                      sender = %hex::encode(user_id),
+                                      recipient = %hex::encode(recipient),
+                                      "clientSend by recipientId refused: recipient accepts queue-addressed deposits only"
+                                  );
+                                  observability::observe_queue_only_reject();
+                                  reject_send(&mut framed, SendRejectReason::NoPermit).await?;
+                                  messages_rejected += 1;
+                                  continue;
+                              }
+                              Err(err) => {
+                                  warn!(
+                                      sender = %hex::encode(user_id),
+                                      error = %err,
+                                      "failed to read the recipient's queue-only flag"
+                                  );
+                                  reject_send(&mut framed, SendRejectReason::Internal).await?;
+                                  messages_rejected += 1;
+                                  continue;
+                              }
+                          }
+                      }
 
                       debug!(
                           sender = %hex::encode(user_id),
@@ -1041,8 +1091,11 @@ pub async fn handle_conn(
                       framed.send_frame(&ack).await?;
                   }
                   ClientFrame::ListQueues => {
-                      let response = match queues.list(&user_id) {
-                          Ok(records) => encode_queue_list(&records),
+                      let listed = queues
+                          .list(&user_id)
+                          .and_then(|records| Ok((records, queues.is_queue_only(&user_id)?)));
+                      let response = match listed {
+                          Ok((records, queue_only)) => encode_queue_list(&records, queue_only),
                           Err(err) => {
                               warn!(
                                   user = %hex::encode(user_id),
@@ -1057,6 +1110,35 @@ pub async fn handle_conn(
                           }
                       };
                       framed.send_frame(&response).await?;
+                  }
+                  ClientFrame::SetQueueOnly { enabled } => {
+                      // Со снятой адресацией по очередям режим не действовал
+                      // бы, а клиент считал бы себя защищённым. Честнее
+                      // отказать и не трогать флаг.
+                      let ack = if !server_config.supports_queue_only() {
+                          encode_queue_ack(false, None, WireQueueRejectReason::Unsupported)
+                      } else {
+                          match queues.set_queue_only(&user_id, enabled, unix_now_secs()) {
+                              Ok(()) => {
+                                  debug!(
+                                      user = %hex::encode(user_id),
+                                      ?device_id,
+                                      enabled,
+                                      "queue-only mode changed"
+                                  );
+                                  encode_queue_ack(true, None, WireQueueRejectReason::Unspecified)
+                              }
+                              Err(err) => {
+                                  warn!(
+                                      user = %hex::encode(user_id),
+                                      error = %err,
+                                      "failed to change the queue-only mode"
+                                  );
+                                  encode_queue_ack(false, None, WireQueueRejectReason::Internal)
+                              }
+                          }
+                      };
+                      framed.send_frame(&ack).await?;
                   }
                   ClientFrame::Ignore => {
                       debug!(user = %hex::encode(user_id), "ignoring unsupported frame");

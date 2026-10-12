@@ -11,8 +11,8 @@ use trust_message_tcp::wire::{
     AllocateQueue, AuthError, AuthOk, ClientSend, DeliveryAck, Frame, GetServerConfig,
     IncomingMessage, ListQueues, MessagePriority, Ping, Pong, PushPlatform, PushTokenAck, QueueAck,
     QueueList, QueueRecord, QueueRejectReason, RegisterPushToken, RetentionConfig, RetentionMode,
-    RevokeQueue, SendAck, SendRejectReason, ServerConfig, SignedServerConfig, UnregisterPushToken,
-    WakeHint, frame,
+    RevokeQueue, SendAck, SendRejectReason, ServerConfig, SetQueueOnly, SignedServerConfig,
+    UnregisterPushToken, WakeHint, frame,
 };
 
 const PROTO_VERSION: u32 = 1;
@@ -30,7 +30,7 @@ fn roundtrip(frame: &Frame) -> Frame {
 }
 
 /// Число вариантов `Frame.payload`. Обновляется вместе с `variant_index`.
-const PAYLOAD_VARIANTS: usize = 18;
+const PAYLOAD_VARIANTS: usize = 19;
 
 /// Порядковый номер варианта. `match` без `_`: новый вариант oneof в схеме
 /// ломает компиляцию теста, а не проходит мимо него.
@@ -55,6 +55,7 @@ fn variant_index(payload: &frame::Payload) -> usize {
         P::ListQueues(_) => 15,
         P::QueueAck(_) => 16,
         P::QueueList(_) => 17,
+        P::SetQueueOnly(_) => 18,
     }
 }
 
@@ -100,7 +101,8 @@ fn every_payload_variant_roundtrips() {
         frame::Payload::GetServerConfig(GetServerConfig {}),
         frame::Payload::SignedServerConfig(SignedServerConfig {
             config: ServerConfig {
-                supports_queue_addressing: false,
+                supports_queue_addressing: true,
+                supports_queue_only: true,
                 device_cert_max_ttl_secs: 2_592_000,
                 proto_version: PROTO_VERSION,
                 max_frame_len: 8 * 1024 * 1024,
@@ -135,7 +137,7 @@ fn every_payload_variant_roundtrips() {
             ok: true,
             message: String::new(),
         }),
-        frame::Payload::AllocateQueue(AllocateQueue {}),
+        frame::Payload::AllocateQueue(AllocateQueue::default()),
         frame::Payload::RevokeQueue(RevokeQueue {
             queue_id: vec![8u8; 32],
         }),
@@ -150,7 +152,9 @@ fn every_payload_variant_roundtrips() {
                 queue_id: vec![10u8; 32],
                 created_at: 1_700_000_000,
             }],
+            queue_only: true,
         }),
+        frame::Payload::SetQueueOnly(SetQueueOnly { enabled: true }),
     ];
 
     let mut seen = [false; PAYLOAD_VARIANTS];
@@ -255,4 +259,33 @@ fn zero_values_are_unspecified() {
     assert_eq!(RetentionMode::Unspecified as i32, 0);
     assert_eq!(SendRejectReason::Unspecified as i32, 0);
     assert_eq!(PushPlatform::Unspecified as i32, 0);
+    assert_eq!(QueueRejectReason::Unspecified as i32, 0);
+}
+
+/// Номера на проводе, которые клиенты держат в своих копиях схемы. Тест
+/// ловит перенумерацию, которую `buf breaking` пропустил бы на ветке без
+/// базы для сравнения.
+#[test]
+fn queue_only_wire_numbers_are_pinned() {
+    assert_eq!(QueueRejectReason::Unsupported as i32, 5);
+
+    let set = wrap(frame::Payload::SetQueueOnly(SetQueueOnly { enabled: true }));
+    // Frame.payload = 20 (length-delimited), SetQueueOnly.enabled = 1.
+    assert_eq!(
+        set.encode_to_vec(),
+        [0x08, 0x01, 0xa2, 0x01, 0x02, 0x08, 0x01]
+    );
+
+    let list = QueueList {
+        queues: Vec::new(),
+        queue_only: true,
+    };
+    assert_eq!(list.encode_to_vec(), [0x10, 0x01]);
+
+    let config = ServerConfig {
+        supports_queue_only: true,
+        ..ServerConfig::default()
+    };
+    // ServerConfig.supports_queue_only = 19: ключ (19 << 3) | 0 = 152.
+    assert_eq!(config.encode_to_vec(), [0x98, 0x01, 0x01]);
 }
