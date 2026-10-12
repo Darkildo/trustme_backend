@@ -96,6 +96,17 @@ pub fn derive_queue_id(owner: &UserId, tag: &QueueTag) -> QueueId {
     hasher.finalize().into()
 }
 
+/// Отпечаток очереди для логов: первые 4 байта `SHA-256(queue_id)` в hex.
+///
+/// Сам `queue_id` — право писать в очередь, и логам его доверять нельзя:
+/// у логов другой круг читателей и другой срок хранения, чем у хранилища.
+/// Отпечаток связывает строки лога об одной очереди, но права не даёт, а
+/// 32 бита не позволяют восстановить id перебором.
+pub fn queue_fingerprint(queue_id: &QueueId) -> String {
+    let digest: [u8; 32] = Sha256::digest(queue_id).into();
+    hex::encode(&digest[..4])
+}
+
 /// Запись `ListQueues`: живая очередь (`revoked_at_secs == 0`) или
 /// надгробие (`created_at_secs == 0`, `revoked_at_secs` — момент отзыва).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -862,6 +873,19 @@ mod tests {
             derive_queue_id(&ALICE, &tag),
             derive_queue_id(&ALICE, &[8u8; 32])
         );
+    }
+
+    #[test]
+    fn the_log_fingerprint_is_short_stable_and_not_the_id() {
+        let q = [0x42u8; 32];
+        let fp = queue_fingerprint(&q);
+        assert_eq!(fp.len(), 8);
+        assert_eq!(fp, queue_fingerprint(&q));
+        assert_ne!(fp, queue_fingerprint(&[0x43u8; 32]));
+        assert!(!hex::encode(q).contains(&fp));
+        // SHA-256 от 32 байт 0x42, первые 4 байта.
+        let digest: [u8; 32] = Sha256::digest(q).into();
+        assert_eq!(fp, hex::encode(&digest[..4]));
     }
 
     // ---- проверка параметров ----

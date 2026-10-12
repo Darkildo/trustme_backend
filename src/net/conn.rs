@@ -21,7 +21,7 @@ use crate::net::noise::{HandshakePolicy, NodeIdentity, NoiseFramed};
 use crate::net::rate_limit::{AdmissionGuard, PingGate, SessionLimits, unix_now_secs};
 use crate::observability::{self, ConnectionMetricsGuard};
 use crate::push::PushScheduler;
-use crate::state::queues::{AllocateParams, QueueError, derive_queue_id};
+use crate::state::queues::{AllocateParams, QueueError, derive_queue_id, queue_fingerprint};
 use crate::state::{
     push_tokens::{PushTokenStore, RegisterOutcome},
     registry::{ConnRegistry, DeviceId, OutboundFrame, UserId},
@@ -538,7 +538,7 @@ pub async fn handle_conn(
                           if !queue_addressing {
                               debug!(
                                   sender = %hex::encode(user_id),
-                                  queue_id = %hex::encode(id),
+                                  queue = %queue_fingerprint(&id),
                                   ttl_seconds,
                                   "clientSend carries v3 node-header; queueId ignored"
                               );
@@ -557,7 +557,7 @@ pub async fn handle_conn(
                                       // адреса (как и у RevokeQueue).
                                       warn!(
                                           sender = %hex::encode(user_id),
-                                          queue_id = %hex::encode(id),
+                                          queue = %queue_fingerprint(&id),
                                           "clientSend addressed to an unknown queue"
                                       );
                                       observability::observe_queue_addressed_reject();
@@ -568,7 +568,7 @@ pub async fn handle_conn(
                                   Err(err) => {
                                       warn!(
                                           sender = %hex::encode(user_id),
-                                          queue_id = %hex::encode(id),
+                                          queue = %queue_fingerprint(&id),
                                           error = %err,
                                           "failed to resolve the queue owner"
                                       );
@@ -1069,7 +1069,7 @@ pub async fn handle_conn(
                                           Ok(Ok(record)) => {
                                               debug!(
                                                   user = %hex::encode(user_id),
-                                                  queue_id = %hex::encode(record.queue_id),
+                                                  queue = %queue_fingerprint(&record.queue_id),
                                                   derived = params.tag.is_some(),
                                                   tombstone = record.is_tombstone(),
                                                   expires_at = record.expires_at_secs,
@@ -1108,7 +1108,7 @@ pub async fn handle_conn(
                               Ok(Ok(())) => {
                                   debug!(
                                       user = %hex::encode(user_id),
-                                      queue_id = %hex::encode(queue_id),
+                                      queue = %queue_fingerprint(&queue_id),
                                       "queue revoked"
                                   );
                                   encode_queue_ack(true, None, WireQueueRejectReason::Unspecified)
