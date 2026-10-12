@@ -521,6 +521,13 @@ impl ServerConfigSnapshot {
         true
     }
 
+    /// Отзыв сертификатов устройства (§6.10 контракта). Всегда `true`, в том
+    /// числе при выключенном делегированном входе: отзыв, записанный
+    /// заранее, начнёт действовать, когда вход включат.
+    pub fn supports_device_cert_revocation(&self) -> bool {
+        true
+    }
+
     pub fn supports_offline_messages(&self) -> bool {
         !self.offline_messages_retention.is_immediate()
     }

@@ -300,6 +300,9 @@ pub struct NodeOptions {
     /// принадлежит тесту: `ServerHandle` его не удаляет, поэтому ноду можно
     /// остановить и поднять на нём снова (рестарт).
     pub storage_path: Option<String>,
+    /// `Some` — потолок срока сертификата устройства вместо 30 суток
+    /// (`Duration::ZERO` выключает делегированный вход).
+    pub device_cert_max_ttl: Option<Duration>,
 }
 
 /// Нода с произвольным набором опций и её внутренности.
@@ -366,6 +369,7 @@ async fn spawn_node_with_internals(
         push,
         max_frame_len,
         storage_path: external_storage,
+        device_cert_max_ttl,
     } = options;
     let owns_storage = external_storage.is_none();
     let storage_path = external_storage.unwrap_or_else(|| temp_storage_path(label));
@@ -393,6 +397,9 @@ async fn spawn_node_with_internals(
     cfg.queue_addressing_enabled = queue_addressing;
     if let Some(max_frame_len) = max_frame_len {
         cfg.max_frame_len = max_frame_len;
+    }
+    if let Some(ttl) = device_cert_max_ttl {
+        cfg.device_cert_max_ttl = ttl;
     }
     if let Some(setup) = &jetstream {
         cfg.delivery.backend = DeliveryBackendKind::JetStream;
@@ -937,6 +944,29 @@ pub async fn connect_delegated(
     device_id: u16,
     cert: wire::DeviceCertificate,
 ) -> Result<Conn> {
+    let raw = connect_delegated_raw(server, account_id, device, device_id, cert).await?;
+    confirm(raw.inner).await
+}
+
+/// Делегированный вход без подтверждения сессии: после хендшейка ни одного
+/// кадра не отправлено и не прочитано.
+pub async fn connect_delegated_unconfirmed(
+    server: &ServerHandle,
+    account_id: &[u8; 32],
+    device: &DeviceKey,
+    device_id: u16,
+    cert: wire::DeviceCertificate,
+) -> Result<Conn> {
+    connect_delegated_raw(server, account_id, device, device_id, cert).await
+}
+
+async fn connect_delegated_raw(
+    server: &ServerHandle,
+    account_id: &[u8; 32],
+    device: &DeviceKey,
+    device_id: u16,
+    cert: wire::DeviceCertificate,
+) -> Result<Conn> {
     let stream = TcpStream::connect(server.addr).await?;
     let raw = NoiseFramed::connect_delegated(
         stream,
@@ -949,5 +979,5 @@ pub async fn connect_delegated(
         FRAME_MAX,
     )
     .await?;
-    confirm(raw).await
+    Ok(Conn::raw(raw))
 }

@@ -586,6 +586,133 @@ async fn queue_with_device_publishes_to_that_device_only() -> Result<()> {
     Ok(())
 }
 
+/// Делегированная сессия устройства по сертификату с данным `not_before`
+/// на брокерной ноде. Первым кадром в ней лежит ответ ноды.
+async fn delegated_on(
+    server: &common::ServerHandle,
+    account: &ed25519_dalek::SigningKey,
+    device: u16,
+    not_before: u64,
+) -> Result<common::Conn> {
+    let key = common::device_key();
+    let scope = trust_message_tcp::wire::DeviceCertScope::Send as u32;
+    let cert = common::issue_device_cert(
+        account,
+        device,
+        &key.public,
+        scope,
+        not_before,
+        not_before + 86_400,
+    );
+    common::connect_delegated(server, &user_id_of(account), &key, device, cert).await
+}
+
+async fn revoke_device(conn: &mut common::Conn, device: u16, issued_before: u64) -> Result<()> {
+    use trust_message_tcp::wire::{self, frame};
+    conn.send_frame(&queue_frame(frame::Payload::RevokeDeviceCerts(
+        wire::RevokeDeviceCerts {
+            device_id: u32::from(device),
+            issued_before,
+        },
+    )))
+    .await?;
+    match common::decode(&next_frame(conn).await?)? {
+        frame::Payload::QueueAck(ack) if ack.ok => Ok(()),
+        other => anyhow::bail!("revocation failed: {other:?}"),
+    }
+}
+
+async fn expect_403(conn: &mut common::Conn) -> Result<()> {
+    use trust_message_tcp::wire::frame;
+    match common::decode(&next_frame(conn).await?)? {
+        frame::Payload::AuthError(err) if err.code == 403 => {}
+        other => anyhow::bail!("expected AuthError 403, got {other:?}"),
+    }
+    assert!(common::expect_connection_gone(conn).await);
+    Ok(())
+}
+
+/// Брокерный бэкенд: делегированный вход по отозванному сертификату —
+/// `AuthError(403)` до `AuthOk`, пул устройства не поднимается, и конверт
+/// устройства остаётся в потоке для сессии ключом аккаунта.
+#[tokio::test]
+#[ignore = "требует живого NATS с JetStream"]
+async fn revoked_certificate_is_refused_and_the_stream_keeps_its_envelopes() -> Result<()> {
+    let server = spawn_jetstream_queue_node("js_rev_login").await?;
+    let account = random_identity();
+    let account_id = user_id_of(&account);
+    let sender = random_identity();
+    let now = common::unix_now_secs();
+
+    let mut sender_conn = common::connect(&server, &sender).await?;
+    expect_auth_ok(&next_frame(&mut sender_conn).await?, &user_id_of(&sender))?;
+    sender_conn
+        .send_frame(&encode_client_send(
+            &account_id,
+            Some(5),
+            b"for device 5",
+            0,
+        )?)
+        .await?;
+    let _ack = next_frame(&mut sender_conn).await?;
+
+    let mut owner = common::connect(&server, &account).await?;
+    expect_auth_ok(&next_frame(&mut owner).await?, &account_id)?;
+    revoke_device(&mut owner, 5, now).await?;
+
+    let mut thief = delegated_on(&server, &account, 5, now - 60).await?;
+    expect_403(&mut thief).await?;
+
+    let mut device = common::connect_as(&server, &account, Some(5), common::FRAME_MAX).await?;
+    expect_auth_ok(&next_frame(&mut device).await?, &account_id)?;
+    let incoming = next_incoming_within(&mut device, REDELIVERY_WINDOW)
+        .await?
+        .expect("the envelope must stay in the stream");
+    assert_eq!(incoming.body, b"for device 5");
+    Ok(())
+}
+
+/// Брокерный бэкенд: живая делегированная сессия закрывается отзывом сразу;
+/// выданный ей и не подтверждённый конверт возвращается в поток, пул
+/// закрытой сессии останавливается штатно, и конверт получает сессия
+/// ключом аккаунта того же устройства.
+#[tokio::test]
+#[ignore = "требует живого NATS с JetStream"]
+async fn revocation_closes_a_live_delegated_session_without_losing_envelopes() -> Result<()> {
+    let server = spawn_jetstream_queue_node("js_rev_live").await?;
+    let account = random_identity();
+    let account_id = user_id_of(&account);
+    let sender = random_identity();
+    let now = common::unix_now_secs();
+
+    let mut victim = delegated_on(&server, &account, 5, now - 60).await?;
+    expect_auth_ok(&next_frame(&mut victim).await?, &account_id)?;
+
+    let mut sender_conn = common::connect(&server, &sender).await?;
+    expect_auth_ok(&next_frame(&mut sender_conn).await?, &user_id_of(&sender))?;
+    sender_conn
+        .send_frame(&encode_client_send(&account_id, Some(5), b"unacked", 0)?)
+        .await?;
+    let _ack = next_frame(&mut sender_conn).await?;
+    let first = next_incoming_within(&mut victim, REDELIVERY_WINDOW)
+        .await?
+        .expect("the live session receives the envelope");
+
+    let mut owner = common::connect(&server, &account).await?;
+    expect_auth_ok(&next_frame(&mut owner).await?, &account_id)?;
+    revoke_device(&mut owner, 5, now).await?;
+    expect_403(&mut victim).await?;
+
+    let mut device = common::connect_as(&server, &account, Some(5), common::FRAME_MAX).await?;
+    expect_auth_ok(&next_frame(&mut device).await?, &account_id)?;
+    let again = next_incoming_within(&mut device, Duration::from_secs(10))
+        .await?
+        .expect("the unacked envelope must return to the stream");
+    assert_eq!(again.message_id, first.message_id);
+    assert_eq!(again.body, b"unacked");
+    Ok(())
+}
+
 fn free_port() -> Result<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     Ok(listener.local_addr()?.port())

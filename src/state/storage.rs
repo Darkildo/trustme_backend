@@ -270,6 +270,14 @@ impl Storage {
         crate::state::queues::QueueStore::open(&self.db)
     }
 
+    /// Отзывы сертификатов устройств: дерево в общей базе, наружу —
+    /// типизированный store.
+    pub fn cert_revocation_store(
+        &self,
+    ) -> Result<crate::state::cert_revocations::CertRevocationStore> {
+        crate::state::cert_revocations::CertRevocationStore::open(&self.db)
+    }
+
     /// Same as `push_token_store`, for the `push_state` tree that persists
     /// push throttling counters across restarts.
     pub fn push_state_store(&self) -> Result<crate::state::push_state::PushStateStore> {

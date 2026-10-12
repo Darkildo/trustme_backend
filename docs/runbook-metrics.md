@@ -47,7 +47,7 @@ rate(handshake_admission_rejected_total[5m]) > 0
 | `noise_handshake_total` | `result`, `pattern` | Исход хендшейка |
 | `noise_handshake_seconds` | `result`, `pattern` | Его длительность |
 | `connections_opened_total` / `connections_closed_total` / `connections_active` | — | Жизненный цикл соединений |
-| `connection_auth_total` | `result` = `ok` / `unconfirmed` / `limit` / `unavailable` | Сессия подтверждена первым кадром клиента; не подтверждена и закрыта; отбита лимитом сессий; закрыта `AuthError 503` |
+| `connection_auth_total` | `result` = `ok` / `unconfirmed` / `limit` / `unavailable` / `revoked` | Сессия подтверждена первым кадром клиента; не подтверждена и закрыта; отбита лимитом сессий; закрыта `AuthError 503`; отбита `AuthError 403` (сертификат устройства отозван) |
 | `connection_lifetime_seconds` | — | Сколько живут сессии |
 | `connection_reset_by_peer_total` | — | Клиент оборвал соединение |
 
@@ -241,6 +241,12 @@ error `envelope does not fit max_frame_len; terminating it` с отправит�
 SHA-256 от `queue_id`): сам id — право писать в очередь. Отпечаток
 клиентского `queue_id` считается так же, и по нему строки лога
 сопоставляются с жалобой пользователя.
+
+**`device_cert_revoked_reject_total{stage}`** — делегированные сессии,
+закрытые `AuthError 403` по отозванному сертификату (контракт §6.10):
+`handshake` — вместо `AuthOk`, `confirm` — при подтверждении, `live` —
+живая сессия сразу после отзыва. Рост `handshake` после отзыва значит, что
+устройство — или тот, у кого его сертификат, — продолжает стучаться.
 
 **`queue_only_reject_total`** растёт, когда кто-то пишет по `recipientId`
 аккаунту, включившему режим «только по очередям». Всплеск сразу после

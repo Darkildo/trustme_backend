@@ -13,14 +13,15 @@ use crate::domain::push::PushPlatform;
 use crate::domain::reject::SendRejectReason;
 use crate::domain::wake::WakeHint;
 use crate::net::framing::{
-    PROTO_VERSION, as_fixed_32, decode_device_id, decode_frame, encode_auth_error, encode_auth_ok,
-    encode_incoming, encode_pong, encode_push_token_ack, encode_queue_ack, encode_queue_list,
-    encode_send_ack, encode_signed_server_config, max_send_body_len,
+    PROTO_VERSION, QueueListing, as_fixed_32, decode_device_id, decode_frame, encode_auth_error,
+    encode_auth_ok, encode_incoming, encode_pong, encode_push_token_ack, encode_queue_ack,
+    encode_queue_list, encode_send_ack, encode_signed_server_config, max_send_body_len,
 };
 use crate::net::noise::{HandshakePolicy, NodeIdentity, NoiseFramed};
 use crate::net::rate_limit::{AdmissionGuard, PingGate, SessionLimits, unix_now_secs};
 use crate::observability::{self, ConnectionMetricsGuard};
 use crate::push::PushScheduler;
+use crate::state::cert_revocations::{self, CertRevocationStore, RevocationError};
 use crate::state::queues::{AllocateParams, QueueError, derive_queue_id, queue_fingerprint};
 use crate::state::{
     push_tokens::{PushTokenStore, RegisterOutcome},
@@ -70,6 +71,8 @@ pub async fn handle_conn(
     // Реестр очередей открывается здесь, а не приезжает параметром: sled-tree
     // после первого открытия — это клон Arc.
     let queues = storage.queue_store()?;
+    let cert_revocations = storage.cert_revocation_store()?;
+    let device_cert_max_ttl_secs = server_config.device_cert_max_ttl.as_secs();
     let max_queues = limits.cfg.max_queues_per_user;
     let queue_addressing = server_config.supports_queue_addressing;
 
@@ -116,6 +119,7 @@ pub async fn handle_conn(
     let protocol_version = identity.protocol_version;
     let scope = identity.scope;
     let cert_not_after = identity.cert_not_after;
+    let cert_not_before = identity.cert_not_before;
 
     debug!(
         user = %hex::encode(user_id),
@@ -129,6 +133,17 @@ pub async fn handle_conn(
     // Лимит одновременных сессий на ключ. Проверяется до AuthOk; отказ
     // приходит по уже установленному каналу.
     refuse_over_session_limit(&mut framed, &registry, &limits, &user_id).await?;
+
+    // Отзыв сертификата (§6.10 контракта): хендшейк состояния не читает,
+    // поэтому проверка здесь, до `AuthOk`. Сессии ключом аккаунта не
+    // читают ничего.
+    match is_cert_revoked(&cert_revocations, &user_id, device_id, cert_not_before) {
+        Ok(false) => {}
+        Ok(true) => {
+            return refuse_revoked_cert(&mut framed, &user_id, device_id, "handshake").await;
+        }
+        Err(err) => return refuse_storage_unavailable(&mut framed, user_id, device_id, &err).await,
+    }
 
     let ok_bytes = encode_auth_ok(user_id)?;
     framed.send_frame(&ok_bytes).await?;
@@ -171,20 +186,31 @@ pub async fn handle_conn(
     // подтверждений через порог остаётся — лимит best-effort, см.
     // `ConnRegistry::session_count`.
     refuse_over_session_limit(&mut framed, &registry, &limits, &user_id).await?;
-    observability::observe_connection_auth("ok");
 
     // Отправитель канала живёт только в реестре. Выписка из реестра —
     // например, за то, что сессия не успевает читать, — закрывает канал, и
     // сессия, отдав уже принятое, завершается, а не остаётся живой, но
     // недостижимой для новых сообщений.
     let (tx_to_client, mut rx_to_client) = mpsc::channel::<OutboundFrame>(1024);
-    let registration = registry.insert(user_id, device_id, tx_to_client);
+    let registration = registry.insert_session(user_id, device_id, cert_not_before, tx_to_client);
     let _registry_cleanup = RegistryCleanup {
         registry: registry.clone(),
         delivery_backend: delivery_backend.clone(),
         user_id,
         connection_id: registration.connection_id,
     };
+    let revocation = registration.revocation.clone();
+
+    // Отзыв мог прийти между `AuthOk` и подтверждением. Проверка стоит
+    // после регистрации, а `RevokeDeviceCerts` пишет отзыв до обхода
+    // реестра: либо обход застанет эту сессию, либо эта проверка — отзыв.
+    // Доставка, реплей и пуши к этому моменту ещё не тронуты.
+    match is_cert_revoked(&cert_revocations, &user_id, device_id, cert_not_before) {
+        Ok(false) if !revocation.is_revoked() => {}
+        Ok(_) => return refuse_revoked_cert(&mut framed, &user_id, device_id, "confirm").await,
+        Err(err) => return refuse_storage_unavailable(&mut framed, user_id, device_id, &err).await,
+    }
+    observability::observe_connection_auth("ok");
     debug!(
         user = %hex::encode(user_id),
         ?device_id,
@@ -313,6 +339,10 @@ pub async fn handle_conn(
 
     loop {
         select! {
+          () = revocation.revoked() => {
+              return refuse_revoked_cert(&mut framed, &user_id, device_id, "live").await;
+          }
+
           maybe_in = next_client_frame(&mut framed, &mut confirming_frame) => {
               let maybe_in = match maybe_in {
                   Ok(value) => value,
@@ -327,6 +357,11 @@ pub async fn handle_conn(
                   Some(bytes) => bytes,
                   None => break,
               };
+              // Отозванная сессия больше ничего не делает от имени
+              // устройства, даже если сигнал ещё не выбран `select!`.
+              if revocation.is_revoked() {
+                  return refuse_revoked_cert(&mut framed, &user_id, device_id, "live").await;
+              }
               debug!(user = %hex::encode(user_id), size = bytes.len(), "received frame from client");
               frames_received += 1;
               observability::observe_frame_received();
@@ -391,6 +426,12 @@ pub async fn handle_conn(
                       record: Vec<u8>,
                       expected_version: u64,
                   },
+                  RevokeDeviceCerts {
+                      /// Сырое wire-значение: вне u16 — `INVALID` в ack, а
+                      /// не разрыв сессии.
+                      device_id: u32,
+                      issued_before: u64,
+                  },
                   Ignore,
               }
 
@@ -447,6 +488,10 @@ pub async fn handle_conn(
                       record: cmd.record,
                       expected_version: cmd.expected_version,
                   },
+                  Some(frame::Payload::RevokeDeviceCerts(cmd)) => ClientFrame::RevokeDeviceCerts {
+                      device_id: cmd.device_id,
+                      issued_before: cmd.issued_before,
+                  },
                   _ => ClientFrame::Ignore,
               };
 
@@ -485,6 +530,12 @@ pub async fn handle_conn(
                   | ClientFrame::SetAccountRecord { .. }
                       if !scope.can_manage_queues() =>
                   {
+                      Some(encode_queue_ack(false, None, WireQueueRejectReason::Forbidden))
+                  }
+                  // Не бит, а вид сессии: отзывать сертификаты вправе только
+                  // ключ аккаунта. Иначе украденный сертификат с битом
+                  // QUEUES отзывал бы сертификаты других устройств владельца.
+                  ClientFrame::RevokeDeviceCerts { .. } if scope.is_delegated() => {
                       Some(encode_queue_ack(false, None, WireQueueRejectReason::Forbidden))
                   }
                   _ => None,
@@ -1127,15 +1178,22 @@ pub async fn handle_conn(
                       framed.send_frame(&ack).await?;
                   }
                   ClientFrame::ListQueues => {
-                      let listed = queues.list(&user_id, unix_now_secs()).and_then(|records| {
+                      let now = unix_now_secs();
+                      let listed = queues.list(&user_id, now).and_then(|records| {
                           let queue_only = queues.is_queue_only(&user_id)?;
                           let account_record = queues.account_record(&user_id)?;
-                          Ok((records, queue_only, account_record))
+                          let revocations =
+                              cert_revocations.list(&user_id, now, device_cert_max_ttl_secs)?;
+                          Ok((records, queue_only, account_record, revocations))
                       });
                       let response = match listed {
-                          Ok((records, queue_only, account_record)) => {
-                              let list =
-                                  encode_queue_list(&records, queue_only, account_record.as_ref());
+                          Ok((records, queue_only, account_record, revocations)) => {
+                              let list = encode_queue_list(&QueueListing {
+                                  records: &records,
+                                  queue_only,
+                                  account_record: account_record.as_ref(),
+                                  revocations: &revocations,
+                              });
                               // Список с надгробиями растёт до ~0,4 МБ (1024
                               // живых и 8192 надгробия). Если оператор опустил
                               // MAX_FRAME_LEN ниже, кадр не записать — отказ
@@ -1238,6 +1296,59 @@ pub async fn handle_conn(
                       };
                       framed.send_frame(&ack).await?;
                   }
+                  ClientFrame::RevokeDeviceCerts {
+                      device_id: revoked_device,
+                      issued_before,
+                  } => {
+                      let now = unix_now_secs();
+                      let ack = match cert_revocations::validate(revoked_device, issued_before, now) {
+                          Err(_) => encode_queue_ack(false, None, WireQueueRejectReason::Invalid),
+                          Ok(revocation_request) => match cert_revocations.revoke(
+                              &user_id,
+                              revocation_request,
+                              now,
+                              device_cert_max_ttl_secs,
+                          ) {
+                              Ok(Ok(())) => {
+                                  // Отзыв уже записан: сессия, которая
+                                  // зарегистрируется после обхода, увидит его
+                                  // своей проверкой.
+                                  let closed = registry.revoke_delegated(
+                                      &user_id,
+                                      revocation_request.device_id,
+                                      revocation_request.issued_before,
+                                  );
+                                  info!(
+                                      user = %hex::encode(user_id),
+                                      revoked_device_id = revocation_request.device_id,
+                                      closed_sessions = closed,
+                                      "device certificates revoked"
+                                  );
+                                  encode_queue_ack(true, None, WireQueueRejectReason::Unspecified)
+                              }
+                              Ok(Err(RevocationError::Limit)) => {
+                                  warn!(
+                                      user = %hex::encode(user_id),
+                                      revoked_device_id = revocation_request.device_id,
+                                      "device certificate revocation refused: limit reached"
+                                  );
+                                  encode_queue_ack(false, None, WireQueueRejectReason::Limit)
+                              }
+                              Ok(Err(RevocationError::Invalid)) => {
+                                  encode_queue_ack(false, None, WireQueueRejectReason::Invalid)
+                              }
+                              Err(err) => {
+                                  warn!(
+                                      user = %hex::encode(user_id),
+                                      error = %err,
+                                      "failed to store a device certificate revocation"
+                                  );
+                                  encode_queue_ack(false, None, WireQueueRejectReason::Internal)
+                              }
+                          },
+                      };
+                      framed.send_frame(&ack).await?;
+                  }
                   ClientFrame::Ignore => {
                       debug!(user = %hex::encode(user_id), "ignoring unsupported frame");
                   }
@@ -1250,6 +1361,12 @@ pub async fn handle_conn(
               // будет, а всё принятое в канал уже отдано. Разрыв заставит
               // клиента переподключиться и забрать остальное из офлайн-очереди.
               let Some(outgoing) = outgoing else {
+                  // Отзыв тоже выписывает сессию из реестра, и закрытый
+                  // канал может прийти раньше сигнала отзыва: клиент должен
+                  // узнать о 403, а не о разрыве.
+                  if revocation.is_revoked() {
+                      return refuse_revoked_cert(&mut framed, &user_id, device_id, "live").await;
+                  }
                   warn!(
                       user = %hex::encode(user_id),
                       ?device_id,
@@ -1258,6 +1375,12 @@ pub async fn handle_conn(
                   );
                   break;
               };
+              // Ни одного кадра отозванной сессии: всё, что ещё лежит в её
+              // канале, ей не отдаётся (брокерный бэкенд вернёт
+              // неподтверждённое в поток при отключении).
+              if revocation.is_revoked() {
+                  return refuse_revoked_cert(&mut framed, &user_id, device_id, "live").await;
+              }
               let size = outgoing.bytes.len();
               let sender_hex = outgoing.sender_user_id.map(hex::encode);
               debug!(
@@ -1727,6 +1850,47 @@ async fn refuse_storage_unavailable(
     let err_frame = encode_auth_error(503, "storage unavailable");
     framed.send_frame(&err_frame).await?;
     bail!("storage unavailable")
+}
+
+/// Отозван ли сертификат делегированной сессии: есть отзыв устройства с
+/// `issued_before` позже `not_before` сертификата. Сессия ключом аккаунта
+/// (`cert_not_before = None`) хранилище не читает.
+fn is_cert_revoked(
+    revocations: &CertRevocationStore,
+    user_id: &UserId,
+    device_id: Option<DeviceId>,
+    cert_not_before: Option<u64>,
+) -> Result<bool> {
+    let (Some(not_before), Some(device_id)) = (cert_not_before, device_id) else {
+        return Ok(false);
+    };
+    Ok(revocations
+        .revoked_since(user_id, device_id)?
+        .is_some_and(|issued_before| not_before < issued_before))
+}
+
+/// Сертификат сессии отозван: `AuthError(403)` и закрытие. Код говорит
+/// клиенту, что повтор с этим сертификатом бессмыслен, — в отличие от
+/// разрыва, после которого он переподключался бы по кругу.
+async fn refuse_revoked_cert(
+    framed: &mut NoiseFramed<TcpStream>,
+    user_id: &UserId,
+    device_id: Option<DeviceId>,
+    stage: &'static str,
+) -> Result<()> {
+    observability::observe_device_cert_revoked_reject(stage);
+    if stage != "live" {
+        observability::observe_connection_auth("revoked");
+    }
+    info!(
+        user = %hex::encode(user_id),
+        ?device_id,
+        stage,
+        "device certificate revoked; closing delegated session"
+    );
+    let err_frame = encode_auth_error(403, "device certificate revoked");
+    framed.send_frame(&err_frame).await?;
+    Ok(())
 }
 
 /// Отправить отказ и учесть его в `reject_total{reason=...}`. Отказ всегда

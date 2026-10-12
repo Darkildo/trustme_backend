@@ -366,9 +366,12 @@ pub struct NoiseSessionIdentity {
     /// сертификата устройства.
     pub scope: SessionScope,
     /// Когда истекает сертификат, которым открыта сессия (unix-секунды).
-    /// Сессия не должна пережить своё основание: отзыва у сертификатов
-    /// нет, и срок — единственное, что ограничивает украденный.
+    /// Сессия не должна пережить своё основание, даже если отзыва так и не
+    /// попросили.
     pub cert_not_after: Option<u64>,
+    /// Когда выписан сертификат сессии (unix-секунды). По нему
+    /// `handle_conn` сверяет сессию с отзывами (`RevokeDeviceCerts`).
+    pub cert_not_before: Option<u64>,
 }
 
 /// Кадровый транспорт поверх установленной Noise-сессии: «прочитать кадр /
@@ -1002,7 +1005,7 @@ fn verify_client_identity(
         .ok_or_else(|| anyhow::anyhow!("noise handshake produced no remote static key"))?;
     let remote_static = to_fixed_32(remote_static, "remote static key")?;
 
-    let (scope, cert_not_after) = match &hello.device_cert {
+    let (scope, cert_not_before, cert_not_after) = match &hello.device_cert {
         None => {
             let verifying = VerifyingKey::from_bytes(&hello.identity_key)
                 .context("client identity key is not a valid ed25519 public key")?;
@@ -1018,7 +1021,7 @@ fn verify_client_identity(
             if derived != remote_static {
                 bail!("client identity key does not match the authenticated noise static key");
             }
-            (SessionScope::FULL, None)
+            (SessionScope::FULL, None, None)
         }
         Some(cert) => {
             let verified = device_cert::verify(
@@ -1031,7 +1034,11 @@ fn verify_client_identity(
             if verified.transport_key != remote_static {
                 bail!("device certificate does not match the authenticated noise static key");
             }
-            (verified.scope, Some(verified.not_after))
+            (
+                verified.scope,
+                Some(verified.not_before),
+                Some(verified.not_after),
+            )
         }
     };
 
@@ -1042,6 +1049,7 @@ fn verify_client_identity(
         pattern,
         scope,
         cert_not_after,
+        cert_not_before,
     })
 }
 
