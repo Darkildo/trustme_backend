@@ -103,6 +103,16 @@ pub struct LimitsConfig {
     /// Максимум Ping/с на соединение; сверх — pong не отправляется.
     /// Default: 50.
     pub ping_per_sec: u32,
+    /// Максимум управляющих кадров очередей в секунду на соединение
+    /// (`LIMIT_CONTROL_PER_SEC`): `AllocateQueue`, `RevokeQueue`,
+    /// `ListQueues`, `SetQueueOnly`, `SetAccountRecord`, `RevokeDeviceCerts`.
+    /// Сверх — `QueueAck` с `RATE_LIMITED`. Default: 50, `0` = без
+    /// ограничения.
+    ///
+    /// Каждый такой кадр — транзакция или скан sled, а `ListQueues` —
+    /// ответ до ~0,4 МБ; без потолка одна сессия грузила бы хранилище ноды
+    /// без счёта.
+    pub control_per_sec: u32,
     /// Потолок mailbox-очередей на пользователя (`MAX_QUEUES_PER_USER`).
     /// Default: 1024, `0` = без ограничения.
     ///
@@ -175,6 +185,7 @@ impl Default for LimitsConfig {
             max_sessions_per_user: 64,
             session_confirm_timeout_secs: 30,
             ping_per_sec: 50,
+            control_per_sec: 50,
             max_queues_per_user: 1024,
             max_push_devices_per_user: 32,
             handshake_max_inflight: 256,
@@ -661,6 +672,8 @@ struct RawConfig {
     #[serde(default)]
     limit_ping_per_sec: Option<u32>,
     #[serde(default)]
+    limit_control_per_sec: Option<u32>,
+    #[serde(default)]
     max_queues_per_user: Option<usize>,
     #[serde(default)]
     max_push_devices_per_user: Option<usize>,
@@ -745,6 +758,7 @@ pub fn load() -> anyhow::Result<Config> {
         limit_max_sessions_per_user,
         session_confirm_timeout_secs,
         limit_ping_per_sec,
+        limit_control_per_sec,
         max_queues_per_user,
         max_push_devices_per_user,
         queue_addressing_enabled,
@@ -846,6 +860,7 @@ pub fn load() -> anyhow::Result<Config> {
             .unwrap_or(defaults.max_sessions_per_user),
         session_confirm_timeout_secs,
         ping_per_sec: limit_ping_per_sec.unwrap_or(defaults.ping_per_sec),
+        control_per_sec: limit_control_per_sec.unwrap_or(defaults.control_per_sec),
         max_queues_per_user: max_queues_per_user.unwrap_or(defaults.max_queues_per_user),
         max_push_devices_per_user: max_push_devices_per_user
             .unwrap_or(defaults.max_push_devices_per_user),
