@@ -613,6 +613,7 @@ async fn revoke_device(conn: &mut common::Conn, device: u16, issued_before: u64)
         wire::RevokeDeviceCerts {
             device_id: u32::from(device),
             issued_before,
+            all: false,
         },
     )))
     .await?;

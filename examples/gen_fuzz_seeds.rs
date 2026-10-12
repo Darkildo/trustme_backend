@@ -201,6 +201,7 @@ fn main() -> Result<()> {
         &wrap(frame::Payload::RevokeDeviceCerts(wire::RevokeDeviceCerts {
             device_id: 7,
             issued_before: 1_700_000_000,
+            all: false,
         })),
     )?;
     write(

@@ -431,6 +431,7 @@ pub async fn handle_conn(
                       /// не разрыв сессии.
                       device_id: u32,
                       issued_before: u64,
+                      all: bool,
                   },
                   Ignore,
               }
@@ -491,6 +492,7 @@ pub async fn handle_conn(
                   Some(frame::Payload::RevokeDeviceCerts(cmd)) => ClientFrame::RevokeDeviceCerts {
                       device_id: cmd.device_id,
                       issued_before: cmd.issued_before,
+                      all: cmd.all,
                   },
                   _ => ClientFrame::Ignore,
               };
@@ -1299,9 +1301,16 @@ pub async fn handle_conn(
                   ClientFrame::RevokeDeviceCerts {
                       device_id: revoked_device,
                       issued_before,
+                      all,
                   } => {
                       let now = unix_now_secs();
-                      let ack = match cert_revocations::validate(revoked_device, issued_before, now) {
+                      let ack = match cert_revocations::validate(
+                          revoked_device,
+                          issued_before,
+                          all,
+                          now,
+                          device_cert_max_ttl_secs,
+                      ) {
                           Err(_) => encode_queue_ack(false, None, WireQueueRejectReason::Invalid),
                           Ok(revocation_request) => match cert_revocations.revoke(
                               &user_id,

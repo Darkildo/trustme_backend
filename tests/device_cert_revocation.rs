@@ -111,6 +111,19 @@ async fn revoke(conn: &mut Conn, device_id: u32, issued_before: u64) -> Result<w
         frame::Payload::RevokeDeviceCerts(wire::RevokeDeviceCerts {
             device_id,
             issued_before,
+            all: false,
+        }),
+    )
+    .await
+}
+
+async fn revoke_all(conn: &mut Conn, device_id: u32) -> Result<wire::QueueAck> {
+    queue_ack(
+        conn,
+        frame::Payload::RevokeDeviceCerts(wire::RevokeDeviceCerts {
+            device_id,
+            issued_before: 0,
+            all: true,
         }),
     )
     .await
@@ -368,5 +381,38 @@ async fn revocation_is_always_advertised_and_accepted() -> Result<()> {
                 .ok
         );
     }
+    Ok(())
+}
+
+/// Сертификат, выписанный до отзыва, но с `not_before` в будущем (часы
+/// выписывающего устройства спешат): обычный отзыв «по сейчас» его не
+/// закрывает, отзыв `all` — закрывает, и вход по нему получает 403.
+#[tokio::test]
+async fn revoking_all_closes_certificates_dated_ahead() -> Result<()> {
+    let server = spawn_server("rev_all", LimitsConfig::default()).await?;
+    let account = random_identity();
+    let now = unix_now_secs();
+    // В пределах допуска нода такой сертификат принимает уже сейчас.
+    let ahead = now + 200;
+
+    let mut owner = full_session(&server, &account, 1).await?;
+    assert!(revoke(&mut owner, u32::from(DEVICE), now).await?.ok);
+    delegated_ok(&server, &account, DEVICE, ALL_BITS, ahead).await?;
+
+    let ack = revoke_all(&mut owner, u32::from(DEVICE)).await?;
+    assert!(ack.ok, "revocation refused: {:?}", ack.reason);
+    let mut thief = delegated(&server, &account, DEVICE, ALL_BITS, ahead).await?;
+    expect_revoked(&mut thief).await?;
+
+    // Нода поставила issued_before по своим часам на горизонт вперёд.
+    let listed = list(&mut owner).await?;
+    assert_eq!(listed.device_cert_revocations.len(), 1);
+    assert!(listed.device_cert_revocations[0].issued_before >= now + MAX_TTL);
+    // `all` игнорирует issued_before и не требует его.
+    assert!(revoke_all(&mut owner, u32::from(OTHER_DEVICE)).await?.ok);
+    assert_eq!(
+        revoke_all(&mut owner, 70_000).await?.reason,
+        QueueRejectReason::Invalid as i32
+    );
     Ok(())
 }
