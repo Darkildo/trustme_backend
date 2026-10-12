@@ -326,6 +326,7 @@ fn derived_queue_wire_numbers_are_pinned() {
 #[test]
 fn account_record_wire_numbers_are_pinned() {
     assert_eq!(QueueRejectReason::Conflict as i32, 8);
+    assert_eq!(QueueRejectReason::RateLimited as i32, 9);
 
     let set = wrap(frame::Payload::SetAccountRecord(SetAccountRecord {
         record: vec![0xCD],

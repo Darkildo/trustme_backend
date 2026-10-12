@@ -338,7 +338,11 @@ async fn derived_queues_work_without_queue_addressing() -> Result<()> {
 async fn a_list_over_the_frame_ceiling_is_refused_not_dropped() -> Result<()> {
     let (server, _internals) = spawn_node_with(
         "dq_small_frame",
-        LimitsConfig::default(),
+        // 64 выделения подряд — больше окна управляющих кадров.
+        LimitsConfig {
+            control_per_sec: 0,
+            ..LimitsConfig::default()
+        },
         NodeOptions {
             max_frame_len: Some(2048),
             ..NodeOptions::default()
@@ -512,5 +516,50 @@ async fn list_queues_reflects_the_whole_account_state() -> Result<()> {
         assert_eq!(tombstone.created_at, 0);
         assert!(tombstone.revoked_at > 0);
     }
+    Ok(())
+}
+
+/// Управляющие кадры очередей ограничены окном в секунду на соединение:
+/// сверх — `RATE_LIMITED`, сессия жива, в следующую секунду снова можно.
+#[tokio::test]
+async fn control_frames_are_rate_limited_per_connection() -> Result<()> {
+    let limits = LimitsConfig {
+        control_per_sec: 3,
+        ..LimitsConfig::default()
+    };
+    let server = spawn_server("dq_control_rate", limits).await?;
+    let owner = random_identity();
+    let mut conn = session(&server, &owner).await?;
+
+    // Кадры уходят пачкой, чтобы уложиться в одну секунду.
+    let request = wrap(frame::Payload::AllocateQueue(wire::AllocateQueue::default()));
+    for _ in 0..8 {
+        conn.send_frame(&request).await?;
+    }
+    let mut ok = 0;
+    let mut limited = 0;
+    for _ in 0..8 {
+        match decode(&next_frame(&mut conn).await?)? {
+            frame::Payload::QueueAck(ack) if ack.ok => ok += 1,
+            frame::Payload::QueueAck(ack) => {
+                assert_eq!(ack.reason, QueueRejectReason::RateLimited as i32);
+                limited += 1;
+            }
+            other => bail!("expected QueueAck, got {other:?}"),
+        }
+    }
+    // Пачка могла пересечь границу секунды — тогда проходит до 6.
+    assert!((3..=6).contains(&ok), "ok = {ok}");
+    assert_eq!(ok + limited, 8);
+
+    // Ping лимитом очередей не считается, сессия жива; через секунду окно
+    // свежее.
+    conn.send_frame(&encode_ping()).await?;
+    assert!(matches!(
+        decode(&next_frame(&mut conn).await?)?,
+        frame::Payload::Pong(_)
+    ));
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(list(&mut conn).await.is_ok());
     Ok(())
 }

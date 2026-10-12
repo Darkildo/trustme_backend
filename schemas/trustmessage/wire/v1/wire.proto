@@ -119,6 +119,9 @@ enum QueueRejectReason {
   QUEUE_REJECT_REASON_REVOKED = 7;
   // Версия записи аккаунта не совпала с `SetAccountRecord.expected_version`.
   QUEUE_REJECT_REASON_CONFLICT = 8;
+  // Превышен лимит управляющих кадров очередей на соединение
+  // (LIMIT_CONTROL_PER_SEC). Повтор через секунду осмыслен.
+  QUEUE_REJECT_REASON_RATE_LIMITED = 9;
 }
 
 // Платформа устройства, зарегистрировавшего push-токен.

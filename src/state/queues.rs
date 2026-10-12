@@ -80,6 +80,13 @@ pub const QUEUE_ID_DOMAIN: &[u8; 15] = b"tm-queue-id-v1\0";
 /// нодах одного пула значили бы разные гарантии.
 pub const MAX_QUEUE_TOMBSTONES_PER_USER: usize = 8192;
 
+/// Гистерезис вытеснения: при переполнении потолка надгробия вытесняются
+/// до `потолок − TOMBSTONE_EVICTION_SLACK`. Без запаса аккаунт на потолке
+/// сканировал бы все 8192 надгробия на каждом следующем отзыве; с ним скан
+/// случается раз на 256 отзывов. Гарантия клиенту — «нода помнит не меньше
+/// 7936 последних отзывов».
+pub const TOMBSTONE_EVICTION_SLACK: usize = 256;
+
 /// Потолок записи аккаунта, байт. Длиннее — `Invalid`.
 pub const MAX_ACCOUNT_RECORD_LEN: usize = 4096;
 
@@ -304,6 +311,7 @@ pub struct QueueStore {
     queue_only: Tree,
     account_records: Tree,
     tombstone_cap: usize,
+    tombstone_slack: usize,
 }
 
 impl QueueStore {
@@ -328,6 +336,7 @@ impl QueueStore {
                 .open_tree("account_records")
                 .context("failed to open `account_records` tree")?,
             tombstone_cap: MAX_QUEUE_TOMBSTONES_PER_USER,
+            tombstone_slack: TOMBSTONE_EVICTION_SLACK,
         })
     }
 
@@ -687,10 +696,10 @@ impl QueueStore {
         Ok(live)
     }
 
-    /// Держать надгробия владельца в пределах потолка: лишние, начиная с
-    /// наименьшего `revoked_at` (при равенстве — меньшего id), удаляются.
-    /// Число берётся из счётчика, поэтому скан нужен только при
-    /// переполнении.
+    /// Держать надгробия владельца в пределах потолка: при переполнении
+    /// удаляются старейшие (наименьший `revoked_at`, при равенстве — меньший
+    /// id) до `потолок − запас`. Число берётся из счётчика, поэтому скан
+    /// нужен только при переполнении, а запас делает его редким.
     fn enforce_tombstone_cap(&self, owner: &UserId) -> Result<()> {
         let count = self
             .tombstone_count
@@ -709,7 +718,8 @@ impl QueueStore {
                 entries.push((decode_u64(&value), queue_id, value));
             }
         }
-        let excess = entries.len().saturating_sub(self.tombstone_cap);
+        let keep = self.tombstone_cap.saturating_sub(self.tombstone_slack);
+        let excess = entries.len().saturating_sub(keep);
         if excess == 0 {
             return Ok(());
         }
@@ -735,8 +745,9 @@ impl QueueStore {
     /// отдельно, а мелкий потолок позволяет проверить порядок вытеснения
     /// без тысяч записей.
     #[cfg(test)]
-    fn with_tombstone_cap(mut self, cap: usize) -> Self {
+    fn with_tombstone_cap(mut self, cap: usize, slack: usize) -> Self {
         self.tombstone_cap = cap;
+        self.tombstone_slack = slack;
         self
     }
 }
@@ -1184,7 +1195,7 @@ mod tests {
     /// меньший id. Отзыв при этом не отказывает.
     #[test]
     fn tombstone_overflow_evicts_the_oldest_first() {
-        let store = store().with_tombstone_cap(3);
+        let store = store().with_tombstone_cap(3, 0);
         // revoked_at: [1]=10, [2]=5, [3]=5, [4]=20.
         for (id, at) in [(1u8, 10u64), (2, 5), (3, 5)] {
             store
@@ -1215,8 +1226,48 @@ mod tests {
             .unwrap();
     }
 
-    /// Настоящий потолок: 8192 надгробия держатся, 8193-е вытесняет самое
-    /// старое. Надгробия не занимают потолок живых.
+    /// Гистерезис: переполнение вытесняет до `потолок − запас`, и следующие
+    /// `запас` отзывов обходятся без вытеснения.
+    #[test]
+    fn eviction_leaves_room_for_the_next_revocations() {
+        let store = store().with_tombstone_cap(4, 2);
+        let tombstone_at = |id: u8, at: u64| {
+            store
+                .allocate(&ALICE, [id; 32], tombstone_with_tag(id), at, 0)
+                .unwrap()
+                .unwrap();
+        };
+        for id in 1..=4u8 {
+            tombstone_at(id, u64::from(id));
+        }
+        assert_eq!(store.list(&ALICE, 10).unwrap().len(), 4);
+        // Пятое — переполнение: остаются два самых свежих из пяти.
+        tombstone_at(5, 5);
+        let ids = |store: &QueueStore| -> Vec<u8> {
+            store
+                .list(&ALICE, 10)
+                .unwrap()
+                .iter()
+                .map(|record| record.queue_id[0])
+                .collect()
+        };
+        assert_eq!(ids(&store), vec![4, 5]);
+        // Ещё два — без вытеснения.
+        tombstone_at(6, 6);
+        tombstone_at(7, 7);
+        assert_eq!(ids(&store), vec![4, 5, 6, 7]);
+    }
+
+    fn tombstone_with_tag(id: u8) -> AllocateParams {
+        AllocateParams {
+            tag: Some([id; 32]),
+            expires_at_secs: 0,
+            revoked: true,
+        }
+    }
+
+    /// Настоящий потолок: 8192 надгробия держатся, 8193-е вытесняет
+    /// старейшие до 8192 − 256. Надгробия не занимают потолок живых.
     #[test]
     fn the_real_tombstone_cap_holds_8192() {
         let store = store();
@@ -1253,8 +1304,22 @@ mod tests {
             .unwrap();
 
         let listed = store.list(&ALICE, NOW + cap).unwrap();
-        assert_eq!(listed.len(), 8192);
+        let kept = MAX_QUEUE_TOMBSTONES_PER_USER - TOMBSTONE_EVICTION_SLACK;
+        assert_eq!(listed.len(), kept);
+        // Ушли 257 старейших: [0]..[256]; [257] на месте.
+        let first_kept = {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&257u64.to_be_bytes());
+            id
+        };
+        let last_gone = {
+            let mut id = [0u8; 32];
+            id[..8].copy_from_slice(&256u64.to_be_bytes());
+            id
+        };
         assert!(!listed.iter().any(|record| record.queue_id == [0u8; 32]));
+        assert!(!listed.iter().any(|record| record.queue_id == last_gone));
+        assert!(listed.iter().any(|record| record.queue_id == first_kept));
         assert!(listed.iter().any(|record| record.queue_id == [0xFF; 32]));
         // Потолок живых (1) свободен: надгробия в нём не считаются.
         store

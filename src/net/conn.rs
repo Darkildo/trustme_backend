@@ -240,6 +240,9 @@ pub async fn handle_conn(
     // Пер-соединение окно Ping: флудер перестаёт получать pong, честный
     // keepalive-клиент проверки не замечает.
     let mut ping_gate = PingGate::new(limits.cfg.ping_per_sec);
+    // То же окно для управляющих кадров очередей: каждый — транзакция или
+    // скан хранилища.
+    let mut control_gate = PingGate::new(limits.cfg.control_per_sec);
 
     if delivery_backend.is_jetstream() {
         // Always invoke; start_scope_pump dedupes via `pumps` map and revives
@@ -611,6 +614,29 @@ pub async fn handle_conn(
                       "delegated session attempted an operation outside its scope"
                   );
                   framed.send_frame(&ack).await?;
+                  continue;
+              }
+
+              let is_control = matches!(
+                  parsed,
+                  ClientFrame::AllocateQueue { .. }
+                      | ClientFrame::RevokeQueue { .. }
+                      | ClientFrame::ListQueues
+                      | ClientFrame::SetQueueOnly { .. }
+                      | ClientFrame::SetAccountRecord { .. }
+                      | ClientFrame::RevokeDeviceCerts { .. }
+              );
+              if is_control && !control_gate.allow(unix_now_secs()) {
+                  observability::observe_control_rate_limited();
+                  debug!(
+                      user = %hex::encode(user_id),
+                      ?device_id,
+                      limit = limits.cfg.control_per_sec,
+                      "control frame rate limit exceeded"
+                  );
+                  framed
+                      .send_frame(&encode_queue_ack(false, None, WireQueueRejectReason::RateLimited))
+                      .await?;
                   continue;
               }
 

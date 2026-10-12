@@ -216,13 +216,15 @@ error `envelope does not fit max_frame_len; terminating it` с отправит�
 
 ## Очереди
 
-Метрики появляются только на ноде с поднятым `QUEUE_ADDRESSING_ENABLED`;
-со снятым флагом все линии плоские, и это нормальное состояние.
+Метрики адресации появляются только на ноде с поднятым
+`QUEUE_ADDRESSING_ENABLED`; со снятым флагом их линии плоские, и это
+нормальное состояние. `control_rate_limited_total` от флага не зависит.
 
 | Метрика | О чём |
 |---|---|
 | `queue_addressed_send_total` | Депозитов, доставленных по `queueId`, а не по `recipientId` |
 | `queue_addressed_reject_total` | Депозитов в неизвестную, отозванную или истёкшую очередь |
+| `control_rate_limited_total` | Управляющих кадров очередей, отвергнутых `RATE_LIMITED` (`LIMIT_CONTROL_PER_SEC`). Устойчивый рост у честных клиентов — лимит занижен для их засева пула |
 | `queue_only_reject_total` | Кадров по `recipientId`, отвергнутых режимом «только по очередям» получателя (контракт §6.9) |
 
 Считаются отдельно от `message_route_total`: тот отвечает на вопрос «куда

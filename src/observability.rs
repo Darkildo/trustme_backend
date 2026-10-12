@@ -347,6 +347,12 @@ pub fn observe_queue_only_reject() {
 /// подтверждении сессии, `live` — живая сессия закрыта отзывом. Рост
 /// `handshake` после отзыва — устройство (или тот, у кого его сертификат)
 /// продолжает стучаться.
+/// Управляющий кадр очередей отвергнут лимитом соединения
+/// (`LIMIT_CONTROL_PER_SEC`).
+pub fn observe_control_rate_limited() {
+    counter!("trust_message_tcp_control_rate_limited_total").increment(1);
+}
+
 pub fn observe_device_cert_revoked_reject(stage: &'static str) {
     counter!("trust_message_tcp_device_cert_revoked_reject_total", "stage" => stage).increment(1);
 }
