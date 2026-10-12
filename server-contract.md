@@ -138,6 +138,7 @@ u32 LE длина логического кадра || тело кадра   ←
 | `RevokeQueue` | `queueId(32)` | Отозвать свою очередь |
 | `ListQueues` | — | Перечислить свои очереди |
 | `SetQueueOnly` | `enabled: bool` | Включить или снять режим «только по очередям» своего аккаунта (§6.9) |
+| `SetAccountRecord` | `record: bytes` (≤ 4 КиБ), `expectedVersion: uint64` | Заменить запись аккаунта по CAS версии (§6.7) |
 
 ### Сервер → клиент
 
@@ -150,8 +151,8 @@ u32 LE длина логического кадра || тело кадра   ←
 | `SignedServerConfig` | см. §4 | Ответ на `GetServerConfig` |
 | `Pong` | — | Ответ на `Ping` |
 | `PushTokenAck` | `ok: bool`, `message: string` | Результат register/unregister |
-| `QueueAck` | `ok: bool`, `queueId(32)`, `reason: QueueRejectReason` | Результат `AllocateQueue` / `RevokeQueue` / `SetQueueOnly`; отказ `ListQueues` |
-| `QueueList` | `queues[]: {queueId(32), createdAt, revokedAt, expiresAt}`, `queueOnly: bool` | Ответ на `ListQueues`: живые очереди и надгробия |
+| `QueueAck` | `ok: bool`, `queueId(32)`, `reason: QueueRejectReason` | Результат `AllocateQueue` / `RevokeQueue` / `SetQueueOnly` / `SetAccountRecord`; отказ `ListQueues` |
+| `QueueList` | `queues[]: {queueId(32), createdAt, revokedAt, expiresAt}`, `queueOnly: bool`, `accountRecord: bytes`, `accountRecordVersion: uint64` | Ответ на `ListQueues`: живые очереди, надгробия, режим и запись аккаунта |
 
 ### Вспомогательные типы
 
@@ -191,7 +192,7 @@ u32 LE длина логического кадра || тело кадра   ←
   `INVALID_TTL` | `INTERNAL` | `FORBIDDEN` | `TOO_LARGE`.
 - `QueueRejectReason` — уточнение отказа в `QueueAck` (см. §6.7):
   `UNSPECIFIED` (0) | `LIMIT` | `NOT_FOUND` | `INTERNAL` | `FORBIDDEN` |
-  `UNSUPPORTED` | `INVALID` | `REVOKED`.
+  `UNSUPPORTED` | `INVALID` | `REVOKED` | `CONFLICT`.
 
 **Незнакомое значение enum** от более свежей стороны — не ошибка кадра:
 читатель сводит его к `UNSPECIFIED`. Так enum-ы расширяются, не ломая уже
@@ -253,6 +254,7 @@ seed), поэтому пиннить нужно одну величину — X2
 | `supportsDeliveryAck` | true — сервер ждёт `DeliveryAck` (брокерный бэкенд); false — не ждёт |
 | `supportsQueueAddressing` | true — `queueId` определяет получателя (§6.8); false — принимается и игнорируется |
 | `deviceCertMaxTtlSecs` | Потолок срока сертификата устройства, секунды; 0 — делегированный вход не принимается |
+| `supportsDerivedQueues` | true — `AllocateQueue` понимает `tag`/`expiresAt`/`revoked`, отзыв оставляет надгробия, `ListQueues` их отдаёт, есть `SetAccountRecord` (§6.7). Не зависит от адресации по очередям; на этой версии ноды всегда true |
 | `supportsQueueOnly` | true — нода понимает `SetQueueOnly` и применяет режим «только по очередям» (§6.9). Поднят ровно тогда, когда поднят `supportsQueueAddressing` |
 
 Полей о версиях клиента и ссылке на обновление в снапшоте нет (номера 9–11
@@ -631,8 +633,9 @@ rate-limit списывается в момент его проверки: от�
 |---|---|---|
 | `AllocateQueue { tag, expiresAt, revoked }` | `QueueAck { ok: true, queueId }` | Нода выдала идентификатор (новый или, для тега, уже существующий) |
 | `RevokeQueue { queueId }` | `QueueAck { ok: true }` | Очередь стала надгробием: депозиты больше не принимаются, уже лежащее доставляется обычным порядком |
-| `ListQueues` | `QueueList { queues[], queueOnly }` | Живые очереди и надгробия аккаунта и режим «только по очередям» (§6.9); при ошибке — `QueueAck { ok: false, reason: INTERNAL }` |
+| `ListQueues` | `QueueList { queues[], queueOnly, accountRecord, accountRecordVersion }` | Живые очереди и надгробия аккаунта, режим «только по очередям» (§6.9) и запись аккаунта; при ошибке — `QueueAck { ok: false, reason: INTERNAL }` |
 | `SetQueueOnly { enabled }` | `QueueAck { ok: true }` | Режим «только по очередям» включён или снят (§6.9) |
+| `SetAccountRecord { record, expectedVersion }` | `QueueAck { ok: true }` | Запись аккаунта заменена, её версия выросла на 1 |
 
 `QueueRejectReason`: `LIMIT` — достигнут потолок живых очередей на
 пользователя; `NOT_FOUND` — очереди нет либо она чужая; `INTERNAL` — ошибка
@@ -641,7 +644,11 @@ rate-limit списывается в момент его проверки: от�
 операция не поддерживается в текущей конфигурации ноды (`SetQueueOnly` при
 снятом `QUEUE_ADDRESSING_ENABLED`); `INVALID` — негодные параметры запроса;
 `REVOKED` — очередь с этим id отозвана или истекла (надгробие) и заново не
-выделяется.
+выделяется; `CONFLICT` — версия записи аккаунта не совпала с ожидаемой.
+
+Все операции control-канала требуют у делегированной сессии бита `QUEUES`
+и доступны независимо от `QUEUE_ADDRESSING_ENABLED`; то, что нода их
+понимает, объявляет `ServerConfig.supportsDerivedQueues`.
 
 #### Выделение: случайное и по тегу
 
@@ -725,6 +732,27 @@ Unix-секунды; `0` — бессрочно. Срок не в будущем
 оператор опустил `MAX_FRAME_LEN` так, что список в кадр не влезает, нода
 отвечает `QueueAck { ok: false, reason: INTERNAL }` и сессию не рвёт;
 постраничной выдачи нет.
+
+#### Запись аккаунта
+
+Маленькое значение, которое нода хранит за аккаунтом и не понимает:
+клиент шифрует в нём пул своих нод, чтобы устройства аккаунта сходились в
+его составе.
+
+- `SetAccountRecord { record, expectedVersion }` заменяет запись, если её
+  текущая версия равна `expectedVersion` (`0` — записи ещё нет). Новая
+  версия — `expectedVersion + 1`. Не совпала — `CONFLICT`, запись не
+  меняется. Сравнение и запись — одна транзакция: из двух одновременных
+  замен с одной ожидаемой версией проходит ровно одна; проигравший
+  перечитывает запись через `ListQueues` и повторяет со свежей версией.
+- `record` длиннее 4 КиБ — `INVALID`. Пустой `record` — обычное значение
+  (отличается от отсутствия записи версией).
+- Ответ — `QueueAck` с пустым `queueId`; ошибка хранилища — `INTERNAL`,
+  сессия без бита `QUEUES` — `FORBIDDEN`.
+- Читается в `QueueList.accountRecord` / `accountRecordVersion`; записи нет
+  — пусто и `0`.
+- Нода запись не разбирает, не логирует и не связывает между нодами: на
+  каждой ноде пула у аккаунта своя запись со своей версией.
 
 #### Что ещё важно знать клиенту
 

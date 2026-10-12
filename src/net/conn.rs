@@ -387,6 +387,10 @@ pub async fn handle_conn(
                   SetQueueOnly {
                       enabled: bool,
                   },
+                  SetAccountRecord {
+                      record: Vec<u8>,
+                      expected_version: u64,
+                  },
                   Ignore,
               }
 
@@ -439,6 +443,10 @@ pub async fn handle_conn(
                   Some(frame::Payload::SetQueueOnly(cmd)) => ClientFrame::SetQueueOnly {
                       enabled: cmd.enabled,
                   },
+                  Some(frame::Payload::SetAccountRecord(cmd)) => ClientFrame::SetAccountRecord {
+                      record: cmd.record,
+                      expected_version: cmd.expected_version,
+                  },
                   _ => ClientFrame::Ignore,
               };
 
@@ -474,6 +482,7 @@ pub async fn handle_conn(
                   | ClientFrame::RevokeQueue { .. }
                   | ClientFrame::ListQueues
                   | ClientFrame::SetQueueOnly { .. }
+                  | ClientFrame::SetAccountRecord { .. }
                       if !scope.can_manage_queues() =>
                   {
                       Some(encode_queue_ack(false, None, WireQueueRejectReason::Forbidden))
@@ -1113,12 +1122,15 @@ pub async fn handle_conn(
                       framed.send_frame(&ack).await?;
                   }
                   ClientFrame::ListQueues => {
-                      let listed = queues
-                          .list(&user_id, unix_now_secs())
-                          .and_then(|records| Ok((records, queues.is_queue_only(&user_id)?)));
+                      let listed = queues.list(&user_id, unix_now_secs()).and_then(|records| {
+                          let queue_only = queues.is_queue_only(&user_id)?;
+                          let account_record = queues.account_record(&user_id)?;
+                          Ok((records, queue_only, account_record))
+                      });
                       let response = match listed {
-                          Ok((records, queue_only)) => {
-                              let list = encode_queue_list(&records, queue_only);
+                          Ok((records, queue_only, account_record)) => {
+                              let list =
+                                  encode_queue_list(&records, queue_only, account_record.as_ref());
                               // Список с надгробиями растёт до ~0,4 МБ (1024
                               // живых и 8192 надгробия). Если оператор опустил
                               // MAX_FRAME_LEN ниже, кадр не записать — отказ
@@ -1177,6 +1189,46 @@ pub async fn handle_conn(
                                   );
                                   encode_queue_ack(false, None, WireQueueRejectReason::Internal)
                               }
+                          }
+                      };
+                      framed.send_frame(&ack).await?;
+                  }
+                  ClientFrame::SetAccountRecord {
+                      record,
+                      expected_version,
+                  } => {
+                      // Содержимое записи не логируется: ноде оно
+                      // непрозрачно, и лишняя копия шифротекста в логах
+                      // никому не нужна.
+                      let ack = match queues.set_account_record(&user_id, &record, expected_version) {
+                          Ok(Ok(version)) => {
+                              debug!(
+                                  user = %hex::encode(user_id),
+                                  ?device_id,
+                                  version,
+                                  size = record.len(),
+                                  "account record replaced"
+                              );
+                              encode_queue_ack(true, None, WireQueueRejectReason::Unspecified)
+                          }
+                          Ok(Err(err)) => {
+                              debug!(
+                                  user = %hex::encode(user_id),
+                                  ?device_id,
+                                  expected_version,
+                                  size = record.len(),
+                                  reason = ?err,
+                                  "account record replacement refused"
+                              );
+                              queue_reject(err)
+                          }
+                          Err(err) => {
+                              warn!(
+                                  user = %hex::encode(user_id),
+                                  error = %err,
+                                  "failed to write the account record"
+                              );
+                              encode_queue_ack(false, None, WireQueueRejectReason::Internal)
                           }
                       };
                       framed.send_frame(&ack).await?;
@@ -1878,6 +1930,7 @@ fn queue_reject(err: QueueError) -> Vec<u8> {
         QueueError::NotFound => WireQueueRejectReason::NotFound,
         QueueError::Invalid => WireQueueRejectReason::Invalid,
         QueueError::Revoked => WireQueueRejectReason::Revoked,
+        QueueError::Conflict => WireQueueRejectReason::Conflict,
     };
     encode_queue_ack(false, None, reason)
 }

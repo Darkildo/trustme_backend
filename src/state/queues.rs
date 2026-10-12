@@ -44,10 +44,14 @@
 //! операции владельца над своими очередями. Депозит в истёкшую не проходит
 //! ни мгновения: срок сверяется на том же чтении, что и владелец.
 //!
-//! Рядом живёт флаг аккаунта «только по очередям» (`queue_only`:
-//! `owner(32)` → `set_at(u64 BE)`, ключ есть — режим включён). Он в том же
-//! store, потому что без очередей смысла не имеет: блокировка контакта при
-//! включённом режиме — это отзыв его очереди.
+//! Рядом живут два свойства аккаунта, без очередей смысла не имеющие:
+//! - `queue_only` — `owner(32)` → `set_at(u64 BE)`: ключ есть — режим
+//!   «только по очередям» включён (блокировка контакта при нём — отзыв его
+//!   очереди);
+//! - `account_records` — `owner(32)` → `version(u64 BE) ‖ record`: запись
+//!   аккаунта, непрозрачная для ноды (клиент шифрует в ней пул своих нод),
+//!   с заменой по CAS версии. Через неё устройства аккаунта сходятся в
+//!   составе пула.
 
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
@@ -75,6 +79,9 @@ pub const QUEUE_ID_DOMAIN: &[u8; 15] = b"tm-queue-id-v1\0";
 /// гарантия клиенту (сколько отзывов нода помнит), и разные значения на
 /// нодах одного пула значили бы разные гарантии.
 pub const MAX_QUEUE_TOMBSTONES_PER_USER: usize = 8192;
+
+/// Потолок записи аккаунта, байт. Длиннее — `Invalid`.
+pub const MAX_ACCOUNT_RECORD_LEN: usize = 4096;
 
 const KEY_LEN: usize = 64;
 
@@ -125,6 +132,15 @@ pub enum QueueError {
     /// Очередь с этим id отозвана или истекла (надгробие) и заново не
     /// выделяется.
     Revoked,
+    /// Версия записи аккаунта не совпала с ожидаемой.
+    Conflict,
+}
+
+/// Запись аккаунта и её версия (1, 2, …; записи нет — версия 0).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountRecord {
+    pub version: u64,
+    pub record: Vec<u8>,
 }
 
 /// Параметры `AllocateQueue`, прошедшие проверку.
@@ -240,6 +256,16 @@ fn decode_owner_value(raw: &[u8]) -> Option<(UserId, u64)> {
     }
 }
 
+/// `version(8) ‖ record`. Значение короче 8 байт — порча, читается как
+/// «записи нет»: клиент перезапишет её с версии 0.
+fn decode_account_record(raw: &[u8]) -> Option<AccountRecord> {
+    let version = u64::from_be_bytes(raw.get(..8)?.try_into().ok()?);
+    Some(AccountRecord {
+        version,
+        record: raw[8..].to_vec(),
+    })
+}
+
 fn decode_u64(raw: &[u8]) -> u64 {
     raw.try_into().map(u64::from_be_bytes).unwrap_or(0)
 }
@@ -265,6 +291,7 @@ pub struct QueueStore {
     tombstones: Tree,
     tombstone_count: Tree,
     queue_only: Tree,
+    account_records: Tree,
     tombstone_cap: usize,
 }
 
@@ -286,6 +313,9 @@ impl QueueStore {
             queue_only: db
                 .open_tree("queue_only")
                 .context("failed to open `queue_only` tree")?,
+            account_records: db
+                .open_tree("account_records")
+                .context("failed to open `account_records` tree")?,
             tombstone_cap: MAX_QUEUE_TOMBSTONES_PER_USER,
         })
     }
@@ -316,6 +346,57 @@ impl QueueStore {
         self.queue_only
             .contains_key(&owner[..])
             .context("failed to read the queue-only flag")
+    }
+
+    /// Запись аккаунта; `None` — записи нет (версия 0).
+    pub fn account_record(&self, owner: &UserId) -> Result<Option<AccountRecord>> {
+        let raw = self
+            .account_records
+            .get(&owner[..])
+            .context("failed to read the account record")?;
+        Ok(raw.as_deref().and_then(decode_account_record))
+    }
+
+    /// Заменить запись аккаунта, если её текущая версия равна
+    /// `expected_version` (0 — записи ещё нет). Новая версия —
+    /// `expected_version + 1`, она и возвращается. Не совпала — `Conflict`,
+    /// запись не меняется. Сравнение и запись — одна транзакция: из двух
+    /// одновременных замен с одной ожидаемой версией проходит ровно одна.
+    /// Длиннее [`MAX_ACCOUNT_RECORD_LEN`] — `Invalid`; пустая запись —
+    /// обычное значение.
+    pub fn set_account_record(
+        &self,
+        owner: &UserId,
+        record: &[u8],
+        expected_version: u64,
+    ) -> Result<Result<u64, QueueError>> {
+        if record.len() > MAX_ACCOUNT_RECORD_LEN {
+            return Ok(Err(QueueError::Invalid));
+        }
+        let Some(next_version) = expected_version.checked_add(1) else {
+            return Ok(Err(QueueError::Invalid));
+        };
+        let mut value = Vec::with_capacity(8 + record.len());
+        value.extend_from_slice(&next_version.to_be_bytes());
+        value.extend_from_slice(record);
+
+        let outcome: Result<bool, TransactionError> = self.account_records.transaction(|tree| {
+            let current = tree
+                .get(&owner[..])?
+                .as_deref()
+                .and_then(decode_account_record)
+                .map_or(0, |current| current.version);
+            if current != expected_version {
+                return Ok(false);
+            }
+            tree.insert(&owner[..], value.as_slice())?;
+            Ok(true)
+        });
+        if outcome.context("failed to write the account record")? {
+            Ok(Ok(next_version))
+        } else {
+            Ok(Err(QueueError::Conflict))
+        }
     }
 
     /// Выделить очередь с id `queue_id` (случайным или выведенным из тега —
@@ -1324,6 +1405,138 @@ mod tests {
         assert!(store.is_queue_only(&BOB).unwrap());
     }
 
+    // ---- запись аккаунта ----
+
+    #[test]
+    fn account_record_cas_bumps_the_version_by_one() {
+        let store = store();
+        assert_eq!(store.account_record(&ALICE).unwrap(), None);
+
+        assert_eq!(
+            store.set_account_record(&ALICE, b"pool-1", 0).unwrap(),
+            Ok(1)
+        );
+        assert_eq!(
+            store.account_record(&ALICE).unwrap(),
+            Some(AccountRecord {
+                version: 1,
+                record: b"pool-1".to_vec()
+            })
+        );
+        assert_eq!(
+            store.set_account_record(&ALICE, b"pool-2", 1).unwrap(),
+            Ok(2)
+        );
+        // Пустая запись — обычное значение.
+        assert_eq!(store.set_account_record(&ALICE, b"", 2).unwrap(), Ok(3));
+        assert_eq!(
+            store.account_record(&ALICE).unwrap(),
+            Some(AccountRecord {
+                version: 3,
+                record: Vec::new()
+            })
+        );
+    }
+
+    #[test]
+    fn a_stale_version_is_a_conflict_and_changes_nothing() {
+        let store = store();
+        store
+            .set_account_record(&ALICE, b"first", 0)
+            .unwrap()
+            .unwrap();
+        for stale in [0u64, 2, 99] {
+            assert_eq!(
+                store.set_account_record(&ALICE, b"lost", stale).unwrap(),
+                Err(QueueError::Conflict)
+            );
+        }
+        assert_eq!(
+            store.account_record(&ALICE).unwrap().unwrap().record,
+            b"first"
+        );
+    }
+
+    #[test]
+    fn account_record_size_is_capped() {
+        let store = store();
+        assert_eq!(
+            store
+                .set_account_record(&ALICE, &[0u8; MAX_ACCOUNT_RECORD_LEN + 1], 0)
+                .unwrap(),
+            Err(QueueError::Invalid)
+        );
+        assert_eq!(store.account_record(&ALICE).unwrap(), None);
+        assert_eq!(
+            store
+                .set_account_record(&ALICE, &[0u8; MAX_ACCOUNT_RECORD_LEN], 0)
+                .unwrap(),
+            Ok(1)
+        );
+        // Версия, которую нельзя увеличить, — негодный запрос, а не паника.
+        assert_eq!(
+            store.set_account_record(&ALICE, b"x", u64::MAX).unwrap(),
+            Err(QueueError::Invalid)
+        );
+    }
+
+    #[test]
+    fn account_records_are_per_user() {
+        let store = store();
+        store
+            .set_account_record(&ALICE, b"alice", 0)
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.account_record(&BOB).unwrap(), None);
+        assert_eq!(store.set_account_record(&BOB, b"bob", 0).unwrap(), Ok(1));
+        assert_eq!(
+            store.account_record(&ALICE).unwrap().unwrap().record,
+            b"alice"
+        );
+    }
+
+    /// Из двух одновременных замен с одной ожидаемой версией проходит ровно
+    /// одна: CAS — одна транзакция, а не чтение и запись порознь.
+    #[test]
+    fn concurrent_cas_lets_exactly_one_writer_through() {
+        let store = store();
+        for round in 0..20u64 {
+            let wins: usize = std::thread::scope(|scope| {
+                let handles: Vec<_> = (0..4u8)
+                    .map(|writer| {
+                        let store = &store;
+                        scope.spawn(move || {
+                            store
+                                .set_account_record(&ALICE, &[writer], round)
+                                .unwrap()
+                                .is_ok()
+                        })
+                    })
+                    .collect();
+                handles
+                    .into_iter()
+                    .map(|handle| usize::from(handle.join().unwrap()))
+                    .sum()
+            });
+            assert_eq!(wins, 1, "round {round}");
+        }
+        assert_eq!(store.account_record(&ALICE).unwrap().unwrap().version, 20);
+    }
+
+    #[test]
+    fn a_malformed_account_record_reads_as_absent() {
+        let store = store();
+        store
+            .account_records
+            .insert(&ALICE[..], &[1u8; 3][..])
+            .unwrap();
+        assert_eq!(store.account_record(&ALICE).unwrap(), None);
+        assert_eq!(
+            store.set_account_record(&ALICE, b"fresh", 0).unwrap(),
+            Ok(1)
+        );
+    }
+
     // ---- переоткрытие БД ----
 
     fn temp_path(label: &str) -> String {
@@ -1337,17 +1550,28 @@ mod tests {
     }
 
     #[test]
-    fn queue_only_flag_survives_reopening_the_database() {
-        let path = temp_path("queue_only_reopen");
+    fn account_state_survives_reopening_the_database() {
+        let path = temp_path("account_reopen");
         {
             let db = sled::open(&path).unwrap();
             let store = QueueStore::open(&db).unwrap();
             store.set_queue_only(&ALICE, true, 100).unwrap();
+            store
+                .set_account_record(&ALICE, b"pool", 0)
+                .unwrap()
+                .unwrap();
         }
         let db = sled::open(&path).unwrap();
         let store = QueueStore::open(&db).unwrap();
         assert!(store.is_queue_only(&ALICE).unwrap());
         assert!(!store.is_queue_only(&BOB).unwrap());
+        assert_eq!(
+            store.account_record(&ALICE).unwrap(),
+            Some(AccountRecord {
+                version: 1,
+                record: b"pool".to_vec()
+            })
+        );
         drop(store);
         drop(db);
         let _ = std::fs::remove_dir_all(&path);

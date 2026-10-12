@@ -11,8 +11,8 @@ use trust_message_tcp::wire::{
     AllocateQueue, AuthError, AuthOk, ClientSend, DeliveryAck, Frame, GetServerConfig,
     IncomingMessage, ListQueues, MessagePriority, Ping, Pong, PushPlatform, PushTokenAck, QueueAck,
     QueueList, QueueRecord, QueueRejectReason, RegisterPushToken, RetentionConfig, RetentionMode,
-    RevokeQueue, SendAck, SendRejectReason, ServerConfig, SetQueueOnly, SignedServerConfig,
-    UnregisterPushToken, WakeHint, frame,
+    RevokeQueue, SendAck, SendRejectReason, ServerConfig, SetAccountRecord, SetQueueOnly,
+    SignedServerConfig, UnregisterPushToken, WakeHint, frame,
 };
 
 const PROTO_VERSION: u32 = 1;
@@ -30,7 +30,7 @@ fn roundtrip(frame: &Frame) -> Frame {
 }
 
 /// Число вариантов `Frame.payload`. Обновляется вместе с `variant_index`.
-const PAYLOAD_VARIANTS: usize = 19;
+const PAYLOAD_VARIANTS: usize = 20;
 
 /// Порядковый номер варианта. `match` без `_`: новый вариант oneof в схеме
 /// ломает компиляцию теста, а не проходит мимо него.
@@ -56,6 +56,7 @@ fn variant_index(payload: &frame::Payload) -> usize {
         P::QueueAck(_) => 16,
         P::QueueList(_) => 17,
         P::SetQueueOnly(_) => 18,
+        P::SetAccountRecord(_) => 19,
     }
 }
 
@@ -103,6 +104,7 @@ fn every_payload_variant_roundtrips() {
             config: ServerConfig {
                 supports_queue_addressing: true,
                 supports_queue_only: true,
+                supports_derived_queues: true,
                 device_cert_max_ttl_secs: 2_592_000,
                 proto_version: PROTO_VERSION,
                 max_frame_len: 8 * 1024 * 1024,
@@ -167,8 +169,14 @@ fn every_payload_variant_roundtrips() {
                 },
             ],
             queue_only: true,
+            account_record: vec![13u8; 48],
+            account_record_version: 3,
         }),
         frame::Payload::SetQueueOnly(SetQueueOnly { enabled: true }),
+        frame::Payload::SetAccountRecord(SetAccountRecord {
+            record: vec![14u8; 48],
+            expected_version: 2,
+        }),
     ];
 
     let mut seen = [false; PAYLOAD_VARIANTS];
@@ -300,6 +308,37 @@ fn derived_queue_wire_numbers_are_pinned() {
     };
     // revoked_at = 3, expires_at = 4.
     assert_eq!(record.encode_to_vec(), [0x18, 0x07, 0x20, 0x09]);
+}
+
+/// Номера полей записи аккаунта и возможности N-2′.
+#[test]
+fn account_record_wire_numbers_are_pinned() {
+    assert_eq!(QueueRejectReason::Conflict as i32, 8);
+
+    let set = wrap(frame::Payload::SetAccountRecord(SetAccountRecord {
+        record: vec![0xCD],
+        expected_version: 4,
+    }));
+    // Frame.payload = 21: ключ (21 << 3) | 2 = 170; record = 1,
+    // expected_version = 2.
+    assert_eq!(
+        set.encode_to_vec(),
+        [0x08, 0x01, 0xaa, 0x01, 0x05, 0x0a, 0x01, 0xcd, 0x10, 0x04]
+    );
+
+    let list = QueueList {
+        account_record: vec![0xEF],
+        account_record_version: 6,
+        ..QueueList::default()
+    };
+    assert_eq!(list.encode_to_vec(), [0x1a, 0x01, 0xef, 0x20, 0x06]);
+
+    let config = ServerConfig {
+        supports_derived_queues: true,
+        ..ServerConfig::default()
+    };
+    // ServerConfig.supports_derived_queues = 20: ключ 160.
+    assert_eq!(config.encode_to_vec(), [0xa0, 0x01, 0x01]);
 }
 
 /// Номера на проводе, которые клиенты держат в своих копиях схемы. Тест
