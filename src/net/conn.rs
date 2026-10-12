@@ -25,7 +25,7 @@ use crate::state::cert_revocations::{self, CertRevocationStore, RevocationError}
 use crate::state::queues::{AllocateParams, QueueError, derive_queue_id, queue_fingerprint};
 use crate::state::{
     push_tokens::{PushTokenStore, RegisterOutcome},
-    registry::{ConnRegistry, DeviceId, OutboundFrame, UserId},
+    registry::{ConnRegistry, DeviceId, OutboundFrame, SessionRevocation, UserId},
     storage::{EnqueueResult, QueueQuotaCeilings, Storage, StoredMessage},
 };
 use crate::wire::QueueRejectReason as WireQueueRejectReason;
@@ -207,7 +207,18 @@ pub async fn handle_conn(
     // Доставка, реплей и пуши к этому моменту ещё не тронуты.
     match is_cert_revoked(&cert_revocations, &user_id, device_id, cert_not_before) {
         Ok(false) if !revocation.is_revoked() => {}
-        Ok(_) => return refuse_revoked_cert(&mut framed, &user_id, device_id, "confirm").await,
+        Ok(_) => {
+            return close_revoked_session(
+                &mut framed,
+                &storage,
+                &user_id,
+                device_id,
+                &mut rx_to_client,
+                None,
+                "confirm",
+            )
+            .await;
+        }
         Err(err) => return refuse_storage_unavailable(&mut framed, user_id, device_id, &err).await,
     }
     observability::observe_connection_auth("ok");
@@ -262,10 +273,17 @@ pub async fn handle_conn(
                 "delivery backend unavailable; refusing the session"
             );
             let err_frame = encode_auth_error(503, "delivery backend unavailable");
-            framed.send_frame(&err_frame).await?;
+            send_final_frame(&mut framed, &err_frame).await?;
             bail!("delivery backend unavailable");
         }
     } else {
+        // Реплей прерывается отзывом сертификата и истечением его срока:
+        // остаток очереди остаётся в хранилище, отозванной сессии не
+        // уходит ни одной записи.
+        let replay_guard = ReplayGuard {
+            revocation: &revocation,
+            cert_not_after,
+        };
         if registration.is_first_for_user {
             let inbox_messages = match storage.drain_inbox(&user_id, OFFLINE_REPLAY_LIMIT) {
                 Ok(messages) => messages,
@@ -281,16 +299,29 @@ pub async fn handle_conn(
                     "starting account-level offline message replay"
                 );
             }
-            replay_messages(
+            let outcome = replay_messages(
                 &mut framed,
                 &storage,
                 &user_id,
                 ReplayScope::Account,
                 inbox_messages,
+                &replay_guard,
                 &mut messages_delivered_offline,
                 &mut messages_failed,
             )
             .await?;
+            if let Some(closed) = finish_interrupted_replay(
+                outcome,
+                &mut framed,
+                &storage,
+                &user_id,
+                device_id,
+                &mut rx_to_client,
+            )
+            .await
+            {
+                return closed;
+            }
         }
 
         if let Some(current_device_id) = device_id
@@ -313,16 +344,29 @@ pub async fn handle_conn(
                     "starting device-level offline message replay"
                 );
             }
-            replay_messages(
+            let outcome = replay_messages(
                 &mut framed,
                 &storage,
                 &user_id,
                 ReplayScope::Device(current_device_id),
                 inbox_messages,
+                &replay_guard,
                 &mut messages_delivered_offline,
                 &mut messages_failed,
             )
             .await?;
+            if let Some(closed) = finish_interrupted_replay(
+                outcome,
+                &mut framed,
+                &storage,
+                &user_id,
+                device_id,
+                &mut rx_to_client,
+            )
+            .await
+            {
+                return closed;
+            }
         }
     }
 
@@ -340,7 +384,16 @@ pub async fn handle_conn(
     loop {
         select! {
           () = revocation.revoked() => {
-              return refuse_revoked_cert(&mut framed, &user_id, device_id, "live").await;
+              return close_revoked_session(
+                      &mut framed,
+                      &storage,
+                      &user_id,
+                      device_id,
+                      &mut rx_to_client,
+                      None,
+                      "live",
+                  )
+                  .await;
           }
 
           maybe_in = next_client_frame(&mut framed, &mut confirming_frame) => {
@@ -360,7 +413,16 @@ pub async fn handle_conn(
               // Отозванная сессия больше ничего не делает от имени
               // устройства, даже если сигнал ещё не выбран `select!`.
               if revocation.is_revoked() {
-                  return refuse_revoked_cert(&mut framed, &user_id, device_id, "live").await;
+                  return close_revoked_session(
+                      &mut framed,
+                      &storage,
+                      &user_id,
+                      device_id,
+                      &mut rx_to_client,
+                      None,
+                      "live",
+                  )
+                  .await;
               }
               debug!(user = %hex::encode(user_id), size = bytes.len(), "received frame from client");
               frames_received += 1;
@@ -828,6 +890,7 @@ pub async fn handle_conn(
                                   close_after_send: false,
                                   sender_user_id: Some(user_id),
                                   sender_device_id: device_id,
+                                  target_device_id: recipient_device_id,
                               };
                               match target.tx.try_send(outgoing) {
                                   Ok(()) => {
@@ -1327,10 +1390,26 @@ pub async fn handle_conn(
                                       revocation_request.device_id,
                                       revocation_request.issued_before,
                                   );
+                                  // Пуш-токены устройства тоже уходят: будить
+                                  // украденный телефон незачем, а токен в
+                                  // руках вора — канал наблюдения за
+                                  // активностью аккаунта.
+                                  let tokens_removed = push_tokens
+                                      .remove_all(&user_id, revocation_request.device_id)
+                                      .unwrap_or_else(|err| {
+                                          warn!(
+                                              user = %hex::encode(user_id),
+                                              revoked_device_id = revocation_request.device_id,
+                                              error = %err,
+                                              "failed to remove push tokens of a revoked device"
+                                          );
+                                          false
+                                      });
                                   info!(
                                       user = %hex::encode(user_id),
                                       revoked_device_id = revocation_request.device_id,
                                       closed_sessions = closed,
+                                      tokens_removed,
                                       "device certificates revoked"
                                   );
                                   encode_queue_ack(true, None, WireQueueRejectReason::Unspecified)
@@ -1374,7 +1453,16 @@ pub async fn handle_conn(
                   // канал может прийти раньше сигнала отзыва: клиент должен
                   // узнать о 403, а не о разрыве.
                   if revocation.is_revoked() {
-                      return refuse_revoked_cert(&mut framed, &user_id, device_id, "live").await;
+                      return close_revoked_session(
+                      &mut framed,
+                      &storage,
+                      &user_id,
+                      device_id,
+                      &mut rx_to_client,
+                      None,
+                      "live",
+                  )
+                  .await;
                   }
                   warn!(
                       user = %hex::encode(user_id),
@@ -1388,7 +1476,16 @@ pub async fn handle_conn(
               // канале, ей не отдаётся (брокерный бэкенд вернёт
               // неподтверждённое в поток при отключении).
               if revocation.is_revoked() {
-                  return refuse_revoked_cert(&mut framed, &user_id, device_id, "live").await;
+                  return close_revoked_session(
+                      &mut framed,
+                      &storage,
+                      &user_id,
+                      device_id,
+                      &mut rx_to_client,
+                      Some(outgoing),
+                      "live",
+                  )
+                  .await;
               }
               let size = outgoing.bytes.len();
               let sender_hex = outgoing.sender_user_id.map(hex::encode);
@@ -1742,7 +1839,7 @@ async fn refuse_over_session_limit(
     observability::observe_reject("session_limit");
     observability::observe_connection_auth("limit");
     let err_frame = encode_auth_error(401, "session limit exceeded");
-    framed.send_frame(&err_frame).await?;
+    send_final_frame(framed, &err_frame).await?;
     warn!(
         user = %hex::encode(user_id),
         limit,
@@ -1857,7 +1954,7 @@ async fn refuse_storage_unavailable(
         "storage unavailable; refusing the session"
     );
     let err_frame = encode_auth_error(503, "storage unavailable");
-    framed.send_frame(&err_frame).await?;
+    send_final_frame(framed, &err_frame).await?;
     bail!("storage unavailable")
 }
 
@@ -1898,8 +1995,116 @@ async fn refuse_revoked_cert(
         "device certificate revoked; closing delegated session"
     );
     let err_frame = encode_auth_error(403, "device certificate revoked");
-    framed.send_frame(&err_frame).await?;
-    Ok(())
+    send_final_frame(framed, &err_frame).await
+}
+
+/// Сколько ждать записи последнего кадра перед закрытием (`AuthError`).
+/// Клиент, переставший читать, не должен держать задачу сессии: кадр-отказ
+/// — вежливость, а не условие закрытия.
+const FINAL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Записать последний кадр сессии с таймаутом; не успели — закрываемся
+/// без него.
+async fn send_final_frame(framed: &mut NoiseFramed<TcpStream>, bytes: &[u8]) -> Result<()> {
+    match tokio::time::timeout(FINAL_FRAME_TIMEOUT, framed.send_frame(bytes)).await {
+        Ok(written) => Ok(written?),
+        Err(_) => {
+            debug!("final frame was not written in time; closing without it");
+            Ok(())
+        }
+    }
+}
+
+/// Закрыть сессию, чей сертификат отозван: недоставленное из её канала
+/// вернуть в офлайн-очередь и ответить `AuthError(403)`.
+///
+/// Канал закрывается первым: конверт, который параллельный отправитель
+/// успел направить в эту сессию, получает отказ записи и уходит
+/// офлайн-путём у самого отправителя, а уже лежащее в канале — кадры
+/// прямого бэкенда — перекладывается обратно в account- или device-очередь,
+/// по которой кадр сюда попал. Конверты брокера (`message_id`) не
+/// перекладываются: неподтверждённые вернутся в поток при отключении.
+async fn close_revoked_session(
+    framed: &mut NoiseFramed<TcpStream>,
+    storage: &Storage,
+    user_id: &UserId,
+    device_id: Option<DeviceId>,
+    rx_to_client: &mut mpsc::Receiver<OutboundFrame>,
+    pending: Option<OutboundFrame>,
+    stage: &'static str,
+) -> Result<()> {
+    rx_to_client.close();
+    let mut requeued = 0usize;
+    let mut pending = pending;
+    loop {
+        let frame = match pending.take() {
+            Some(frame) => frame,
+            None => match rx_to_client.try_recv() {
+                Ok(frame) => frame,
+                Err(_) => break,
+            },
+        };
+        if requeue_outbound(storage, user_id, &frame) {
+            requeued += 1;
+        }
+    }
+    if requeued > 0 {
+        info!(
+            user = %hex::encode(user_id),
+            ?device_id,
+            requeued,
+            "returned undelivered envelopes of a revoked session to the offline queue"
+        );
+    }
+    refuse_revoked_cert(framed, user_id, device_id, stage).await
+}
+
+/// Вернуть кадр прямого бэкенда в офлайн-очередь получателя. `true` —
+/// кадр был конвертом и записан обратно.
+fn requeue_outbound(storage: &Storage, user_id: &UserId, frame: &OutboundFrame) -> bool {
+    if frame.close_after_send || frame.message_id.is_some() {
+        return false;
+    }
+    let Some(sender) = frame.sender_user_id else {
+        return false;
+    };
+    let Ok(Some(frame::Payload::Incoming(incoming))) =
+        decode_frame(&frame.bytes).map(|decoded| decoded.payload)
+    else {
+        return false;
+    };
+    let priority = MessagePriority::from_wire(incoming.priority);
+    let stored = match frame.target_device_id {
+        Some(target) => storage.enqueue_device_inbox(
+            user_id,
+            target,
+            &sender,
+            frame.sender_device_id,
+            &incoming.body,
+            priority,
+            0,
+        ),
+        None => storage.enqueue_inbox(
+            user_id,
+            &sender,
+            frame.sender_device_id,
+            &incoming.body,
+            priority,
+            0,
+        ),
+    };
+    match stored {
+        Ok(result) => result.stored,
+        Err(err) => {
+            error!(
+                user = %hex::encode(user_id),
+                sender = %hex::encode(sender),
+                error = %err,
+                "failed to return an envelope of a revoked session to the offline queue"
+            );
+            false
+        }
+    }
 }
 
 /// Отправить отказ и учесть его в `reject_total{reason=...}`. Отказ всегда
@@ -1970,16 +2175,81 @@ async fn handle_offline_enqueue_result(
     Ok(())
 }
 
+/// Когда офлайн-реплей обязан остановиться: сертификат сессии отозван или
+/// истёк.
+struct ReplayGuard<'a> {
+    revocation: &'a SessionRevocation,
+    cert_not_after: Option<u64>,
+}
+
+/// Чем кончился офлайн-реплей.
+#[derive(Debug, PartialEq, Eq)]
+enum ReplayOutcome {
+    Completed,
+    /// Сертификат отозван — сессию закрывает `AuthError(403)`.
+    Revoked,
+    /// Сертификат истёк — сессия закрывается.
+    Expired,
+}
+
+/// Реплей прервался — закрыть сессию так, как требует причина. `Some` —
+/// результат `handle_conn`, `None` — реплей дошёл до конца.
+async fn finish_interrupted_replay(
+    outcome: ReplayOutcome,
+    framed: &mut NoiseFramed<TcpStream>,
+    storage: &Storage,
+    user_id: &UserId,
+    device_id: Option<DeviceId>,
+    rx_to_client: &mut mpsc::Receiver<OutboundFrame>,
+) -> Option<Result<()>> {
+    match outcome {
+        ReplayOutcome::Completed => None,
+        ReplayOutcome::Revoked => Some(
+            close_revoked_session(
+                framed,
+                storage,
+                user_id,
+                device_id,
+                rx_to_client,
+                None,
+                "live",
+            )
+            .await,
+        ),
+        ReplayOutcome::Expired => {
+            info!(
+                user = %hex::encode(user_id),
+                ?device_id,
+                "device certificate expired during offline replay; closing delegated session"
+            );
+            Some(Ok(()))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn replay_messages(
     framed: &mut NoiseFramed<TcpStream>,
     storage: &Storage,
     user_id: &[u8; 32],
     scope: ReplayScope,
     messages: Vec<StoredMessage>,
+    guard: &ReplayGuard<'_>,
     messages_delivered_offline: &mut u64,
     messages_failed: &mut u64,
-) -> Result<()> {
+) -> Result<ReplayOutcome> {
     for message in messages {
+        // Перед каждой записью: отозванной или истёкшей сессии не уходит
+        // ничего, остаток остаётся в очереди.
+        if guard.revocation.is_revoked() {
+            return Ok(ReplayOutcome::Revoked);
+        }
+        if guard
+            .cert_not_after
+            .is_some_and(|not_after| unix_now_secs() >= not_after)
+        {
+            return Ok(ReplayOutcome::Expired);
+        }
         let frame = encode_incoming(
             message.sender_id,
             message.sender_device_id,
@@ -2098,7 +2368,7 @@ async fn replay_messages(
         }
     }
 
-    Ok(())
+    Ok(ReplayOutcome::Completed)
 }
 
 /// Отказ операции над очередью — `QueueAck` с причиной на проводе.

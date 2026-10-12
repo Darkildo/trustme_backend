@@ -1119,6 +1119,7 @@ impl JetStreamBackend {
                 close_after_send: false,
                 sender_user_id: Some(payload.sender_user_id),
                 sender_device_id: payload.sender_device_id,
+                target_device_id: None,
             };
 
             let target_count = route_targets.len();
@@ -1298,6 +1299,7 @@ impl JetStreamBackend {
             message_id: None,
             sender_user_id: None,
             sender_device_id: None,
+            target_device_id: None,
             close_after_send: true,
         };
 

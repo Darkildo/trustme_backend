@@ -168,6 +168,7 @@ async fn oversized_frame_in_the_session_channel_does_not_close_the_session() -> 
             message_id: None,
             sender_user_id: None,
             sender_device_id: None,
+            target_device_id: None,
             close_after_send: false,
         })
         .await

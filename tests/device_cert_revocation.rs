@@ -416,3 +416,214 @@ async fn revoking_all_closes_certificates_dated_ahead() -> Result<()> {
     );
     Ok(())
 }
+
+/// Лимиты, которые не мешают залить в устройство сотни крупных конвертов.
+fn bulk_limits() -> LimitsConfig {
+    LimitsConfig {
+        send_msgs_per_sec: 0,
+        send_bytes_per_day: 0,
+        ..LimitsConfig::default()
+    }
+}
+
+/// Столько конвертов по 64 КиБ заведомо не помещается в сокетные буферы
+/// loopback: запись ноды упирается в нечитающего клиента.
+const BULK: usize = 400;
+const BULK_BODY: usize = 64 * 1024;
+
+fn bulk_body(index: usize) -> Vec<u8> {
+    let mut body = vec![0u8; BULK_BODY];
+    body[..8].copy_from_slice(&(index as u64).to_be_bytes());
+    body
+}
+
+fn bulk_index(body: &[u8]) -> usize {
+    u64::from_be_bytes(body[..8].try_into().unwrap()) as usize
+}
+
+/// Читать сессию до `AuthError(403)`; вернуть номера полученных конвертов.
+async fn drain_until_revoked(conn: &mut Conn) -> Result<Vec<usize>> {
+    let mut received = Vec::new();
+    loop {
+        match decode(&next_frame(conn).await?)? {
+            frame::Payload::Incoming(incoming) => received.push(bulk_index(&incoming.body)),
+            frame::Payload::Pong(_) => {}
+            frame::Payload::AuthError(err) if err.code == 403 => break,
+            other => bail!("unexpected frame: {other:?}"),
+        }
+    }
+    assert!(expect_connection_gone(conn).await);
+    Ok(received)
+}
+
+/// Забрать офлайн-очередь устройства сессией ключом аккаунта.
+async fn drain_device_inbox(server: &ServerHandle, account: &SigningKey) -> Result<Vec<usize>> {
+    let mut device = full_session(server, account, DEVICE).await?;
+    let mut received = Vec::new();
+    while let Some(incoming) = next_incoming_within(&mut device, Duration::from_secs(2)).await? {
+        received.push(bulk_index(&incoming.body));
+    }
+    Ok(received)
+}
+
+/// Ни один конверт не потерян и не выдан дважды, а отозванная сессия
+/// получила не всё.
+fn assert_split(revoked_got: &[usize], later_got: &[usize]) {
+    let mut all: Vec<usize> = revoked_got.iter().chain(later_got).copied().collect();
+    all.sort_unstable();
+    assert_eq!(
+        all,
+        (0..BULK).collect::<Vec<_>>(),
+        "lost or duplicated envelopes"
+    );
+    assert!(
+        !later_got.is_empty(),
+        "the revoked session must not have drained everything"
+    );
+}
+
+/// Отзыв посреди офлайн-реплея: отозванной сессии больше не уходит ни одной
+/// записи, остаток остаётся в очереди устройства.
+#[tokio::test]
+async fn revocation_interrupts_the_offline_replay() -> Result<()> {
+    let server = spawn_server("rev_replay", bulk_limits()).await?;
+    let account = random_identity();
+    let account_id = user_id_of(&account);
+    let sender = random_identity();
+    let now = unix_now_secs();
+
+    let mut sender_conn = full_session(&server, &sender, 1).await?;
+    for index in 0..BULK {
+        let ack = send_raw_and_read_ack(
+            &mut sender_conn,
+            &encode_client_send(&account_id, Some(DEVICE), &bulk_body(index), 0)?,
+        )
+        .await?;
+        assert!(ack.queued, "must wait in the device inbox: {ack:?}");
+    }
+
+    // Сессия подтверждается, но не читает: реплей упирается в сокет.
+    let key = device_key();
+    let cert = issue_device_cert(&account, DEVICE, &key.public, ALL_BITS, now - 60, now + DAY);
+    let mut victim =
+        connect_delegated_unconfirmed(&server, &account_id, &key, DEVICE, cert).await?;
+    expect_auth_ok(&next_frame(&mut victim).await?, &account_id)?;
+    victim.send_frame(&encode_ping()).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut owner = full_session(&server, &account, 1).await?;
+    assert!(revoke(&mut owner, u32::from(DEVICE), now).await?.ok);
+
+    let revoked_got = drain_until_revoked(&mut victim).await?;
+    let later_got = drain_device_inbox(&server, &account).await?;
+    assert_split(&revoked_got, &later_got);
+    Ok(())
+}
+
+/// Прямой бэкенд: конверты, уже лежавшие в канале отозванной сессии,
+/// возвращаются в очередь устройства, а не теряются.
+#[tokio::test]
+async fn envelopes_queued_for_a_revoked_session_go_back_to_the_inbox() -> Result<()> {
+    let server = spawn_server("rev_channel", bulk_limits()).await?;
+    let account = random_identity();
+    let account_id = user_id_of(&account);
+    let sender = random_identity();
+    let now = unix_now_secs();
+
+    // Сессия жива, но не читает.
+    let mut victim = delegated_ok(&server, &account, DEVICE, ALL_BITS, now - 60).await?;
+    let mut sender_conn = full_session(&server, &sender, 1).await?;
+    for index in 0..BULK {
+        let ack = send_raw_and_read_ack(
+            &mut sender_conn,
+            &encode_client_send(&account_id, Some(DEVICE), &bulk_body(index), 0)?,
+        )
+        .await?;
+        assert!(ack.ok, "the online session must take it: {ack:?}");
+    }
+
+    let mut owner = full_session(&server, &account, 1).await?;
+    assert!(revoke(&mut owner, u32::from(DEVICE), now).await?.ok);
+
+    let revoked_got = drain_until_revoked(&mut victim).await?;
+    let later_got = drain_device_inbox(&server, &account).await?;
+    assert_split(&revoked_got, &later_got);
+    Ok(())
+}
+
+/// Отзыв снимает push-токены устройства: украденный телефон больше не
+/// будят, другие устройства — будят.
+#[tokio::test]
+async fn revocation_removes_the_push_tokens_of_the_device() -> Result<()> {
+    let transport = Arc::new(MockTransport::always_ok());
+    let (server, _internals) = spawn_node_with(
+        "rev_tokens",
+        LimitsConfig::default(),
+        NodeOptions {
+            push: Some(transport.clone()),
+            ..NodeOptions::default()
+        },
+    )
+    .await?;
+    let account = random_identity();
+    let account_id = user_id_of(&account);
+    let sender = random_identity();
+
+    for device in [DEVICE, OTHER_DEVICE] {
+        let mut conn = full_session(&server, &account, device).await?;
+        conn.send_frame(&wrap(frame::Payload::RegisterPushToken(
+            wire::RegisterPushToken {
+                token: format!("token-{device}"),
+                platform: wire::PushPlatform::AndroidFcm as i32,
+            },
+        )))
+        .await?;
+        match decode(&next_frame(&mut conn).await?)? {
+            frame::Payload::PushTokenAck(ack) if ack.ok => {}
+            other => bail!("push token registration failed: {other:?}"),
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut owner = full_session(&server, &account, 1).await?;
+    assert!(
+        revoke(&mut owner, u32::from(DEVICE), unix_now_secs())
+            .await?
+            .ok
+    );
+    drop(owner);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut sender_conn = full_session(&server, &sender, 1).await?;
+    for device in [DEVICE, OTHER_DEVICE] {
+        let frame = wrap(frame::Payload::ClientSend(wire::ClientSend {
+            recipient_id: account_id.to_vec(),
+            body: b"wake?".to_vec(),
+            recipient_device_id: Some(u32::from(device)),
+            priority: wire::MessagePriority::High as i32,
+            ..wire::ClientSend::default()
+        }));
+        assert!(
+            send_raw_and_read_ack(&mut sender_conn, &frame)
+                .await?
+                .queued
+        );
+    }
+    let woken = || -> Vec<u16> {
+        transport
+            .sent_payloads()
+            .iter()
+            .filter(|payload| payload.kind == PushKind::Wake)
+            .map(|payload| payload.device_id)
+            .collect()
+    };
+    for _ in 0..50 {
+        if !woken().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(SILENCE).await;
+    assert_eq!(woken(), vec![OTHER_DEVICE]);
+    Ok(())
+}
