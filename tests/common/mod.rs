@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bytes::BytesMut;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use prost::Message;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -22,9 +22,10 @@ use trust_message_tcp::config::{
 };
 use trust_message_tcp::delivery::{DeliveryBackend, SledBackend};
 use trust_message_tcp::domain::reject::SendRejectReason;
+use trust_message_tcp::net::device_cert::signed_bytes;
 use trust_message_tcp::net::framing::verify_signed_server_config;
 use trust_message_tcp::net::listener::accept_loop;
-use trust_message_tcp::net::noise::{NodeIdentity, NoiseFramed};
+use trust_message_tcp::net::noise::{NOISE_PARAMS_IK, NodeIdentity, NoiseFramed};
 use trust_message_tcp::push::{
     InMemoryTokenStore, MockTransport, NoopStatePersistence, PushScheduler,
 };
@@ -182,6 +183,10 @@ pub async fn spawn_server(label: &str, limits: LimitsConfig) -> Result<ServerHan
 pub struct NodeInternals {
     pub storage: Storage,
     pub registry: ConnRegistry,
+    /// Accept-цикл ноды. `abort` вместе с закрытием всех соединений
+    /// останавливает ноду и отпускает её хранилище — так тест делает
+    /// рестарт на том же каталоге (см. [`NodeOptions::storage_path`]).
+    pub accept_task: tokio::task::AbortHandle,
 }
 
 /// Нода на прямом бэкенде вместе с её хранилищем и реестром сессий.
@@ -284,13 +289,55 @@ pub struct JetStreamSetup {
 }
 
 #[derive(Default)]
-struct NodeOptions {
-    jetstream: Option<JetStreamSetup>,
-    queue_addressing: bool,
+pub struct NodeOptions {
+    pub jetstream: Option<JetStreamSetup>,
+    pub queue_addressing: bool,
     /// `Some` — push включён и отправляет в этот транспорт.
-    push: Option<Arc<MockTransport>>,
+    pub push: Option<Arc<MockTransport>>,
     /// `Some` — потолок кадра ноды вместо [`FRAME_MAX`].
-    max_frame_len: Option<usize>,
+    pub max_frame_len: Option<usize>,
+    /// `Some` — хранилище в этом каталоге, а не во временном. Каталог
+    /// принадлежит тесту: `ServerHandle` его не удаляет, поэтому ноду можно
+    /// остановить и поднять на нём снова (рестарт).
+    pub storage_path: Option<String>,
+}
+
+/// Нода с произвольным набором опций и её внутренности.
+pub async fn spawn_node_with(
+    label: &str,
+    limits: LimitsConfig,
+    options: NodeOptions,
+) -> Result<(ServerHandle, NodeInternals)> {
+    spawn_node_with_internals(label, limits, options).await
+}
+
+/// Остановить ноду, поднятую [`spawn_node_with`], и дождаться, пока она
+/// отпустит хранилище. Соединения с ней тест обязан закрыть до вызова:
+/// открытая сессия держит хранилище, и sled не даст открыть его снова.
+pub fn stop_node(internals: NodeInternals) {
+    internals.accept_task.abort();
+}
+
+/// Открыть хранилище, которое, возможно, ещё держит только что
+/// остановленная нода: задачи её сессий завершаются не мгновенно, а sled
+/// не пускает второй экземпляр в тот же каталог. Ожидание асинхронное:
+/// тестовый рантайм однопоточный, и блокирующий сон не дал бы остановленным
+/// задачам ноды завершиться.
+async fn open_storage_with_retry(path: &str) -> Result<Storage> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match Storage::open(
+            path,
+            RetentionPolicy::KeepFor(Duration::from_secs(30 * 86_400)),
+            RetentionPolicy::KeepFor(Duration::from_secs(30 * 86_400)),
+        ) {
+            Ok(storage) => return Ok(storage),
+            Err(_) if Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(err) => return Err(err),
+        }
+    }
 }
 
 /// Имя потока общее для всех тестов: JetStream запрещает двум
@@ -318,13 +365,11 @@ async fn spawn_node_with_internals(
         queue_addressing,
         push,
         max_frame_len,
+        storage_path: external_storage,
     } = options;
-    let storage_path = temp_storage_path(label);
-    let storage = Storage::open(
-        &storage_path,
-        RetentionPolicy::KeepFor(Duration::from_secs(30 * 86_400)),
-        RetentionPolicy::KeepFor(Duration::from_secs(30 * 86_400)),
-    )?;
+    let owns_storage = external_storage.is_none();
+    let storage_path = external_storage.unwrap_or_else(|| temp_storage_path(label));
+    let storage = open_storage_with_retry(&storage_path).await?;
     let registry = ConnRegistry::default();
     let push_tokens = storage.push_token_store()?;
     let push_scheduler = match push {
@@ -370,27 +415,33 @@ async fn spawn_node_with_internals(
 
     let listener = TcpListener::bind(&cfg.bind_addr).await?;
     let addr = listener.local_addr()?;
-    let internals = NodeInternals {
-        storage: storage.clone(),
-        registry: registry.clone(),
-    };
-
-    tokio::spawn(accept_loop(
+    let accept_task = tokio::spawn(accept_loop(
         listener,
-        registry,
-        storage,
+        registry.clone(),
+        storage.clone(),
         delivery,
         push_tokens,
         push_scheduler,
         node,
         cfg,
-    ));
+    ))
+    .abort_handle();
+    let internals = NodeInternals {
+        storage,
+        registry,
+        accept_task,
+    };
 
     Ok((
         ServerHandle {
             addr,
             node_public,
-            storage_path,
+            // Чужой каталог не удаляется: его владелец — тест.
+            storage_path: if owns_storage {
+                storage_path
+            } else {
+                String::new()
+            },
         },
         internals,
     ))
@@ -826,4 +877,77 @@ pub async fn expect_raw_close(stream: &mut TcpStream, within: Duration) -> Resul
             Err(_) => bail!("the node kept the connection open for {within:?}"),
         }
     }
+}
+
+// ---- делегированный вход ----
+
+/// X25519-пара устройства. Тем же генератором, каким snow делает
+/// эфемералы: от ключа аккаунта она не зависит ничем.
+pub struct DeviceKey {
+    pub secret: [u8; 32],
+    pub public: [u8; 32],
+}
+
+pub fn device_key() -> DeviceKey {
+    let pair = snow::Builder::new(NOISE_PARAMS_IK.parse().expect("noise params"))
+        .generate_keypair()
+        .expect("device keypair");
+    DeviceKey {
+        secret: pair.private.as_slice().try_into().expect("32-byte secret"),
+        public: pair.public.as_slice().try_into().expect("32-byte public"),
+    }
+}
+
+/// Сертификат устройства, подписанный ключом аккаунта.
+pub fn issue_device_cert(
+    account: &SigningKey,
+    device_id: u16,
+    transport_key: &[u8; 32],
+    scope: u32,
+    not_before: u64,
+    not_after: u64,
+) -> wire::DeviceCertificate {
+    let signing_key = [0x5a; 32];
+    let message = signed_bytes(
+        &user_id_of(account),
+        device_id,
+        transport_key,
+        &signing_key,
+        scope,
+        not_before,
+        not_after,
+    );
+    wire::DeviceCertificate {
+        transport_key: transport_key.to_vec(),
+        signing_key: signing_key.to_vec(),
+        scope,
+        not_before,
+        not_after,
+        signature: account.sign(&message).to_bytes().to_vec(),
+        device_id: u32::from(device_id),
+    }
+}
+
+/// Делегированный вход с подтверждением сессии — так, как это делает
+/// клиент (см. [`confirm`]).
+pub async fn connect_delegated(
+    server: &ServerHandle,
+    account_id: &[u8; 32],
+    device: &DeviceKey,
+    device_id: u16,
+    cert: wire::DeviceCertificate,
+) -> Result<Conn> {
+    let stream = TcpStream::connect(server.addr).await?;
+    let raw = NoiseFramed::connect_delegated(
+        stream,
+        &server.node_public,
+        &device.secret,
+        account_id,
+        device_id,
+        cert,
+        HANDSHAKE_TIMEOUT,
+        FRAME_MAX,
+    )
+    .await?;
+    confirm(raw).await
 }

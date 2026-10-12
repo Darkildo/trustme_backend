@@ -168,16 +168,26 @@ fn main() -> Result<()> {
     write(
         &dir,
         "queue_list.bin",
-        &encode_queue_list(&[
-            QueueRecord {
-                queue_id: [6u8; 32],
-                created_at_secs: 1_700_000_000,
-            },
-            QueueRecord {
-                queue_id: [8u8; 32],
-                created_at_secs: 1_700_086_400,
-            },
-        ]),
+        &encode_queue_list(
+            &[
+                QueueRecord {
+                    queue_id: [6u8; 32],
+                    created_at_secs: 1_700_000_000,
+                },
+                QueueRecord {
+                    queue_id: [8u8; 32],
+                    created_at_secs: 1_700_086_400,
+                },
+            ],
+            true,
+        ),
+    )?;
+    write(
+        &dir,
+        "set_queue_only.bin",
+        &wrap(frame::Payload::SetQueueOnly(wire::SetQueueOnly {
+            enabled: true,
+        })),
     )?;
     write(
         &dir,

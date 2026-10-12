@@ -17,6 +17,11 @@
 //!
 //! Расхождение деревьев — это потерянная или неотзываемая очередь, поэтому
 //! пишутся они одной транзакцией sled, а не двумя put'ами подряд.
+//!
+//! Рядом живёт флаг аккаунта «только по очередям» (`queue_only`:
+//! `owner(32)` → `set_at(u64 BE)`, ключ есть — режим включён). Он в том же
+//! store, потому что без очередей смысла не имеет: блокировка контакта при
+//! включённом режиме — это отзыв его очереди.
 
 use anyhow::{Context, Result};
 use sled::Transactional;
@@ -52,6 +57,7 @@ pub enum QueueError {
 pub struct QueueStore {
     queues: Tree,
     owners: Tree,
+    queue_only: Tree,
 }
 
 impl QueueStore {
@@ -63,7 +69,38 @@ impl QueueStore {
             owners: db
                 .open_tree("queue_owner")
                 .context("failed to open `queue_owner` tree")?,
+            queue_only: db
+                .open_tree("queue_only")
+                .context("failed to open `queue_only` tree")?,
         })
+    }
+
+    /// Включить или снять режим «только по очередям» для аккаунта.
+    /// Идемпотентно: повторное включение сохраняет исходное `set_at`, снятие
+    /// удаляет ключ.
+    pub fn set_queue_only(&self, owner: &UserId, enabled: bool, now_secs: u64) -> Result<()> {
+        if enabled {
+            // CAS «ключа нет → есть»: момент включения — первое включение,
+            // а не последнее подтверждение. Проигранная гонка значит, что
+            // флаг уже стоит, и это тот же исход.
+            let _ = self
+                .queue_only
+                .compare_and_swap(&owner[..], None::<&[u8]>, Some(&now_secs.to_be_bytes()[..]))
+                .context("failed to set the queue-only flag")?;
+        } else {
+            self.queue_only
+                .remove(&owner[..])
+                .context("failed to clear the queue-only flag")?;
+        }
+        Ok(())
+    }
+
+    /// Включён ли у аккаунта режим «только по очередям». Читается на каждом
+    /// `ClientSend`, адресованном по `recipientId`.
+    pub fn is_queue_only(&self, owner: &UserId) -> Result<bool> {
+        self.queue_only
+            .contains_key(&owner[..])
+            .context("failed to read the queue-only flag")
     }
 
     /// Завести очередь. Идентификатор генерирует вызывающий (нода, 32 байта
@@ -277,6 +314,55 @@ mod tests {
         let mut path = std::env::temp_dir();
         path.push(format!("trust_queues_{label}_{nanos}"));
         path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn queue_only_flag_sets_clears_and_is_idempotent() {
+        let store = store();
+        assert!(!store.is_queue_only(&ALICE).unwrap());
+
+        store.set_queue_only(&ALICE, true, 100).unwrap();
+        assert!(store.is_queue_only(&ALICE).unwrap());
+        // Повторное включение — не ошибка и не перезапись момента.
+        store.set_queue_only(&ALICE, true, 200).unwrap();
+        assert!(store.is_queue_only(&ALICE).unwrap());
+        assert_eq!(
+            store.queue_only.get(&ALICE[..]).unwrap().unwrap().as_ref(),
+            &100u64.to_be_bytes()[..]
+        );
+
+        store.set_queue_only(&ALICE, false, 300).unwrap();
+        assert!(!store.is_queue_only(&ALICE).unwrap());
+        // Снятие снятого — тоже не ошибка.
+        store.set_queue_only(&ALICE, false, 400).unwrap();
+        assert!(!store.is_queue_only(&ALICE).unwrap());
+    }
+
+    #[test]
+    fn queue_only_flag_is_per_user() {
+        let store = store();
+        store.set_queue_only(&ALICE, true, 100).unwrap();
+        assert!(!store.is_queue_only(&BOB).unwrap());
+        store.set_queue_only(&BOB, true, 100).unwrap();
+        store.set_queue_only(&ALICE, false, 200).unwrap();
+        assert!(store.is_queue_only(&BOB).unwrap());
+    }
+
+    #[test]
+    fn queue_only_flag_survives_reopening_the_database() {
+        let path = temp_path("queue_only_reopen");
+        {
+            let db = sled::open(&path).unwrap();
+            let store = QueueStore::open(&db).unwrap();
+            store.set_queue_only(&ALICE, true, 100).unwrap();
+        }
+        let db = sled::open(&path).unwrap();
+        let store = QueueStore::open(&db).unwrap();
+        assert!(store.is_queue_only(&ALICE).unwrap());
+        assert!(!store.is_queue_only(&BOB).unwrap());
+        drop(store);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&path);
     }
 
     #[test]

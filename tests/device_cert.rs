@@ -11,93 +11,18 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
 use common::{
-    Conn, HANDSHAKE_TIMEOUT, ServerHandle, confirm, connect, decode, encode_delivery_ack,
-    expect_auth_ok, expect_connection_gone, next_frame, next_incoming_within, random_identity,
-    send_and_read_ack, spawn_server, unix_now_secs, user_id_of,
+    connect, connect_delegated, decode, device_key, encode_delivery_ack, expect_auth_ok,
+    expect_connection_gone, issue_device_cert as issue, next_frame, next_incoming_within,
+    random_identity, send_and_read_ack, spawn_server, unix_now_secs, user_id_of,
 };
-use ed25519_dalek::{Signer, SigningKey};
 use prost::Message;
-use tokio::net::TcpStream;
 use trust_message_tcp::config::LimitsConfig;
 use trust_message_tcp::domain::reject::SendRejectReason;
-use trust_message_tcp::net::device_cert::signed_bytes;
-use trust_message_tcp::net::noise::{NOISE_PARAMS_IK, NoiseFramed};
 use trust_message_tcp::wire::{self, Frame, QueueRejectReason, frame};
 
-const FRAME_MAX: usize = 8 * 1024 * 1024;
 const DEVICE: u16 = 3;
 const SCOPE_SEND: u32 = wire::DeviceCertScope::Send as u32;
 const DAY: u64 = 24 * 3600;
-
-/// X25519-пара устройства. Тем же генератором, каким snow делает
-/// эфемералы: от ключа аккаунта она не зависит ничем.
-struct DeviceKey {
-    secret: [u8; 32],
-    public: [u8; 32],
-}
-
-fn device_key() -> DeviceKey {
-    let pair = snow::Builder::new(NOISE_PARAMS_IK.parse().expect("noise params"))
-        .generate_keypair()
-        .expect("device keypair");
-    DeviceKey {
-        secret: pair.private.as_slice().try_into().expect("32-byte secret"),
-        public: pair.public.as_slice().try_into().expect("32-byte public"),
-    }
-}
-
-fn issue(
-    account: &SigningKey,
-    device_id: u16,
-    transport_key: &[u8; 32],
-    scope: u32,
-    not_before: u64,
-    not_after: u64,
-) -> wire::DeviceCertificate {
-    let signing_key = [0x5a; 32];
-    let message = signed_bytes(
-        &user_id_of(account),
-        device_id,
-        transport_key,
-        &signing_key,
-        scope,
-        not_before,
-        not_after,
-    );
-    wire::DeviceCertificate {
-        transport_key: transport_key.to_vec(),
-        signing_key: signing_key.to_vec(),
-        scope,
-        not_before,
-        not_after,
-        signature: account.sign(&message).to_bytes().to_vec(),
-        device_id: u32::from(device_id),
-    }
-}
-
-/// Делегированный вход с подтверждением сессии — так, как это делает
-/// клиент (см. `common::confirm`).
-async fn connect_delegated(
-    server: &ServerHandle,
-    account_id: &[u8; 32],
-    device: &DeviceKey,
-    device_id: u16,
-    cert: wire::DeviceCertificate,
-) -> Result<Conn> {
-    let stream = TcpStream::connect(server.addr).await?;
-    let raw = NoiseFramed::connect_delegated(
-        stream,
-        &server.node_public,
-        &device.secret,
-        account_id,
-        device_id,
-        cert,
-        HANDSHAKE_TIMEOUT,
-        FRAME_MAX,
-    )
-    .await?;
-    confirm(raw).await
-}
 
 fn wrap(payload: frame::Payload) -> Vec<u8> {
     Frame {

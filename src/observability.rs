@@ -333,6 +333,15 @@ pub fn observe_queue_addressed_reject() {
     counter!("trust_message_tcp_queue_addressed_reject_total").increment(1);
 }
 
+/// Депозит по `recipientId` аккаунту в режиме «только по очередям»,
+/// отвергнутый с `NO_PERMIT`. Отдельно от `queue_addressed_reject_total`:
+/// там отправитель назвал негодную очередь, здесь — не назвал никакой.
+/// Устойчивый рост после включения режима у аккаунта значит, что часть
+/// его контактов так и не получила очередь.
+pub fn observe_queue_only_reject() {
+    counter!("trust_message_tcp_queue_only_reject_total").increment(1);
+}
+
 pub fn observe_push_sent(priority: &'static str, result: &'static str) {
     counter!(
         "trust_message_tcp_push_sent_total",
