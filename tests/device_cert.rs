@@ -93,7 +93,7 @@ async fn delegated_session_cannot_touch_push_tokens_or_queues() -> Result<()> {
     expect_auth_ok(&next_frame(&mut conn).await?, &account_id)?;
 
     for request in [
-        wrap(frame::Payload::AllocateQueue(wire::AllocateQueue {})),
+        wrap(frame::Payload::AllocateQueue(wire::AllocateQueue::default())),
         wrap(frame::Payload::ListQueues(wire::ListQueues {})),
         wrap(frame::Payload::RevokeQueue(wire::RevokeQueue {
             queue_id: vec![1u8; 32],

@@ -209,7 +209,8 @@ pub fn encode_queue_ack(
     }))
 }
 
-/// Список очередей аккаунта вместе с его флагом «только по очередям».
+/// Список очередей аккаунта (живые и надгробия) вместе с его флагом
+/// «только по очередям».
 pub fn encode_queue_list(
     records: &[crate::state::queues::QueueRecord],
     queue_only: bool,
@@ -220,6 +221,8 @@ pub fn encode_queue_list(
             .map(|record| wire::QueueRecord {
                 queue_id: record.queue_id.to_vec(),
                 created_at: record.created_at_secs,
+                revoked_at: record.revoked_at_secs,
+                expires_at: record.expires_at_secs,
             })
             .collect(),
         queue_only,

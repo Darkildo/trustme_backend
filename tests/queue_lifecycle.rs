@@ -26,7 +26,7 @@ fn wrap(payload: frame::Payload) -> Vec<u8> {
 }
 
 fn allocate() -> Vec<u8> {
-    wrap(frame::Payload::AllocateQueue(wire::AllocateQueue {}))
+    wrap(frame::Payload::AllocateQueue(wire::AllocateQueue::default()))
 }
 
 fn revoke(queue_id: Vec<u8>) -> Vec<u8> {
@@ -58,7 +58,7 @@ fn limits(max_queues_per_user: usize) -> LimitsConfig {
     }
 }
 
-/// Базовый цикл: завести, увидеть в списке, отозвать, увидеть пустой список.
+/// Базовый цикл: завести, увидеть в списке, отозвать, увидеть надгробие.
 #[tokio::test]
 async fn allocate_list_revoke_roundtrip() -> Result<()> {
     let server = spawn_server("queue_roundtrip", limits(0)).await?;
@@ -84,13 +84,19 @@ async fn allocate_list_revoke_roundtrip() -> Result<()> {
     assert_eq!(listed.queues[0].queue_id, queue_id);
     assert!(listed.queues[0].created_at > 0);
 
+    let revoked_id = queue_id.clone();
     conn.send_frame(&revoke(queue_id)).await?;
     let ack = expect_ack(&next_frame(&mut conn).await?)?;
     assert!(ack.ok, "revocation rejected: {:?}", ack.reason);
 
+    // Отозванная очередь остаётся в списке надгробием: другие устройства
+    // аккаунта должны узнать, что она отозвана, а не забыта.
     conn.send_frame(&list()).await?;
     let listed = expect_list(&next_frame(&mut conn).await?)?;
-    assert!(listed.queues.is_empty());
+    assert_eq!(listed.queues.len(), 1);
+    assert_eq!(listed.queues[0].queue_id, revoked_id);
+    assert_eq!(listed.queues[0].created_at, 0);
+    assert!(listed.queues[0].revoked_at > 0);
     Ok(())
 }
 

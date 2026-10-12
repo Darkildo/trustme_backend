@@ -21,7 +21,7 @@ use crate::net::noise::{HandshakePolicy, NodeIdentity, NoiseFramed};
 use crate::net::rate_limit::{AdmissionGuard, PingGate, SessionLimits, unix_now_secs};
 use crate::observability::{self, ConnectionMetricsGuard};
 use crate::push::PushScheduler;
-use crate::state::queues::QueueError;
+use crate::state::queues::{AllocateParams, QueueError, derive_queue_id};
 use crate::state::{
     push_tokens::{PushTokenStore, RegisterOutcome},
     registry::{ConnRegistry, DeviceId, OutboundFrame, UserId},
@@ -371,7 +371,13 @@ pub async fn handle_conn(
                       platform: i32,
                   },
                   UnregisterPushToken,
-                  AllocateQueue,
+                  AllocateQueue {
+                      /// Сырые поля: негодные значения — не повод рвать
+                      /// сессию, клиент получит `INVALID` в ack.
+                      tag: Vec<u8>,
+                      expires_at: u64,
+                      revoked: bool,
+                  },
                   RevokeQueue {
                       /// Сырые байты: неверная длина — не повод рвать
                       /// сессию, клиент получит `NOT_FOUND` в ack.
@@ -421,7 +427,11 @@ pub async fn handle_conn(
                       platform: req.platform,
                   },
                   Some(frame::Payload::UnregisterPushToken(_)) => ClientFrame::UnregisterPushToken,
-                  Some(frame::Payload::AllocateQueue(_)) => ClientFrame::AllocateQueue,
+                  Some(frame::Payload::AllocateQueue(cmd)) => ClientFrame::AllocateQueue {
+                      tag: cmd.tag,
+                      expires_at: cmd.expires_at,
+                      revoked: cmd.revoked,
+                  },
                   Some(frame::Payload::RevokeQueue(cmd)) => ClientFrame::RevokeQueue {
                       queue_id: cmd.queue_id,
                   },
@@ -460,7 +470,7 @@ pub async fn handle_conn(
                           "device certificate does not permit push token changes",
                       ))
                   }
-                  ClientFrame::AllocateQueue
+                  ClientFrame::AllocateQueue { .. }
                   | ClientFrame::RevokeQueue { .. }
                   | ClientFrame::ListQueues
                   | ClientFrame::SetQueueOnly { .. }
@@ -515,7 +525,7 @@ pub async fn handle_conn(
                                   "clientSend carries v3 node-header; queueId ignored"
                               );
                           } else {
-                              match queues.owner_of(&id) {
+                              match queues.owner_of(&id, unix_now_secs()) {
                                   Ok(Some(owner)) => {
                                       // Очередь принадлежит аккаунту, а не
                                       // устройству, поэтому
@@ -526,9 +536,9 @@ pub async fn handle_conn(
                                       observability::observe_queue_addressed_send();
                                   }
                                   Ok(None) => {
-                                      // Неизвестная или отозванная очередь.
-                                      // Разница между ними клиенту не
-                                      // сообщается: ответ не должен
+                                      // Неизвестная, отозванная или истёкшая
+                                      // очередь. Разница между ними клиенту
+                                      // не сообщается: ответ не должен
                                       // подтверждать существование чужого
                                       // адреса (как и у RevokeQueue).
                                       warn!(
@@ -1011,46 +1021,63 @@ pub async fn handle_conn(
                       };
                       framed.send_frame(&ack).await?;
                   }
-                  ClientFrame::AllocateQueue => {
-                      // Идентификатор выдаёт нода: уникальность в её
-                      // пространстве имён гарантирует только она. 32 байта
-                      // из CSPRNG не перебрать, а знание идентификатора и
-                      // есть право писать в очередь.
-                      let mut queue_id = [0u8; 32];
-                      let ack = if let Err(err) = getrandom::fill(&mut queue_id) {
-                          warn!(
-                              user = %hex::encode(user_id),
-                              error = %err,
-                              "failed to read random bytes for a queue id"
-                          );
-                          encode_queue_ack(false, None, WireQueueRejectReason::Internal)
-                      } else {
-                          match queues.allocate(&user_id, queue_id, unix_now_secs(), max_queues) {
-                              Ok(Ok(record)) => {
-                                  debug!(
-                                      user = %hex::encode(user_id),
-                                      queue_id = %hex::encode(record.queue_id),
-                                      "queue allocated"
-                                  );
-                                  encode_queue_ack(
-                                      true,
-                                      Some(record.queue_id),
-                                      WireQueueRejectReason::Unspecified,
-                                  )
-                              }
-                              Ok(Err(QueueError::Limit)) => {
-                                  encode_queue_ack(false, None, WireQueueRejectReason::Limit)
-                              }
-                              Ok(Err(QueueError::NotFound)) => {
-                                  encode_queue_ack(false, None, WireQueueRejectReason::NotFound)
-                              }
-                              Err(err) => {
-                                  warn!(
-                                      user = %hex::encode(user_id),
-                                      error = %err,
-                                      "queue allocation failed"
-                                  );
-                                  encode_queue_ack(false, None, WireQueueRejectReason::Internal)
+                  ClientFrame::AllocateQueue {
+                      tag,
+                      expires_at,
+                      revoked,
+                  } => {
+                      let now = unix_now_secs();
+                      let ack = match AllocateParams::parse(&tag, expires_at, revoked, now) {
+                          Err(err) => queue_reject(err),
+                          Ok(params) => {
+                              // С тегом id считает нода, и в нём владелец:
+                              // чужой id тегом не назвать. Без тега — 32
+                              // байта из CSPRNG: не перебрать, а знание id
+                              // и есть право писать в очередь.
+                              let queue_id = match params.tag {
+                                  Some(tag) => Ok(derive_queue_id(&user_id, &tag)),
+                                  None => {
+                                      let mut random = [0u8; 32];
+                                      getrandom::fill(&mut random).map(|()| random)
+                                  }
+                              };
+                              match queue_id {
+                                  Err(err) => {
+                                      warn!(
+                                          user = %hex::encode(user_id),
+                                          error = %err,
+                                          "failed to read random bytes for a queue id"
+                                      );
+                                      encode_queue_ack(false, None, WireQueueRejectReason::Internal)
+                                  }
+                                  Ok(queue_id) => {
+                                      match queues.allocate(&user_id, queue_id, params, now, max_queues) {
+                                          Ok(Ok(record)) => {
+                                              debug!(
+                                                  user = %hex::encode(user_id),
+                                                  queue_id = %hex::encode(record.queue_id),
+                                                  derived = params.tag.is_some(),
+                                                  tombstone = record.is_tombstone(),
+                                                  expires_at = record.expires_at_secs,
+                                                  "queue allocated"
+                                              );
+                                              encode_queue_ack(
+                                                  true,
+                                                  Some(record.queue_id),
+                                                  WireQueueRejectReason::Unspecified,
+                                              )
+                                          }
+                                          Ok(Err(err)) => queue_reject(err),
+                                          Err(err) => {
+                                              warn!(
+                                                  user = %hex::encode(user_id),
+                                                  error = %err,
+                                                  "queue allocation failed"
+                                              );
+                                              encode_queue_ack(false, None, WireQueueRejectReason::Internal)
+                                          }
+                                      }
+                                  }
                               }
                           }
                       };
@@ -1063,7 +1090,7 @@ pub async fn handle_conn(
                       // подсказка для перебора права на запись.
                       let ack = match decode_queue_id(&queue_id) {
                           None => encode_queue_ack(false, None, WireQueueRejectReason::NotFound),
-                          Some(queue_id) => match queues.revoke(&user_id, &queue_id) {
+                          Some(queue_id) => match queues.revoke(&user_id, &queue_id, unix_now_secs()) {
                               Ok(Ok(())) => {
                                   debug!(
                                       user = %hex::encode(user_id),
@@ -1072,12 +1099,7 @@ pub async fn handle_conn(
                                   );
                                   encode_queue_ack(true, None, WireQueueRejectReason::Unspecified)
                               }
-                              Ok(Err(QueueError::Limit)) => {
-                                  encode_queue_ack(false, None, WireQueueRejectReason::Limit)
-                              }
-                              Ok(Err(QueueError::NotFound)) => {
-                                  encode_queue_ack(false, None, WireQueueRejectReason::NotFound)
-                              }
+                              Ok(Err(err)) => queue_reject(err),
                               Err(err) => {
                                   warn!(
                                       user = %hex::encode(user_id),
@@ -1092,10 +1114,29 @@ pub async fn handle_conn(
                   }
                   ClientFrame::ListQueues => {
                       let listed = queues
-                          .list(&user_id)
+                          .list(&user_id, unix_now_secs())
                           .and_then(|records| Ok((records, queues.is_queue_only(&user_id)?)));
                       let response = match listed {
-                          Ok((records, queue_only)) => encode_queue_list(&records, queue_only),
+                          Ok((records, queue_only)) => {
+                              let list = encode_queue_list(&records, queue_only);
+                              // Список с надгробиями растёт до ~0,4 МБ (1024
+                              // живых и 8192 надгробия). Если оператор опустил
+                              // MAX_FRAME_LEN ниже, кадр не записать — отказ
+                              // вместо разрыва сессии, который клиент принял
+                              // бы за сбой сети и повторял бы по кругу.
+                              if list.len() > framed.max_frame_len() {
+                                  error!(
+                                      user = %hex::encode(user_id),
+                                      records = records.len(),
+                                      size = list.len(),
+                                      max_frame_len = framed.max_frame_len(),
+                                      "queue list does not fit max_frame_len; answering with a reject"
+                                  );
+                                  encode_queue_ack(false, None, WireQueueRejectReason::Internal)
+                              } else {
+                                  list
+                              }
+                          }
                           Err(err) => {
                               warn!(
                                   user = %hex::encode(user_id),
@@ -1828,6 +1869,17 @@ async fn replay_messages(
     }
 
     Ok(())
+}
+
+/// Отказ операции над очередью — `QueueAck` с причиной на проводе.
+fn queue_reject(err: QueueError) -> Vec<u8> {
+    let reason = match err {
+        QueueError::Limit => WireQueueRejectReason::Limit,
+        QueueError::NotFound => WireQueueRejectReason::NotFound,
+        QueueError::Invalid => WireQueueRejectReason::Invalid,
+        QueueError::Revoked => WireQueueRejectReason::Revoked,
+    };
+    encode_queue_ack(false, None, reason)
 }
 
 /// Node-header конверта v3: `queueId` из clientSend. `None` — для пустого

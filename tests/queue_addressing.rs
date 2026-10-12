@@ -56,8 +56,10 @@ fn send_by_recipient(recipient: [u8; 32], queue_id: Vec<u8>, body: &str) -> Vec<
 }
 
 async fn allocate_queue(conn: &mut Conn) -> Result<Vec<u8>> {
-    conn.send_frame(&wrap(frame::Payload::AllocateQueue(wire::AllocateQueue {})))
-        .await?;
+    conn.send_frame(&wrap(frame::Payload::AllocateQueue(
+        wire::AllocateQueue::default(),
+    )))
+    .await?;
     match decode(&next_frame(conn).await?)? {
         frame::Payload::QueueAck(ack) if ack.ok => Ok(ack.queue_id),
         other => bail!("expected a successful QueueAck, got {other:?}"),
