@@ -393,8 +393,10 @@ impl QueueStore {
         if record.len() > MAX_ACCOUNT_RECORD_LEN {
             return Ok(Err(QueueError::Invalid));
         }
+        // Версии u64::MAX у записи не бывает (каждая замена прибавляет 1 с
+        // нуля), так что это обычное несовпадение версии.
         let Some(next_version) = expected_version.checked_add(1) else {
-            return Ok(Err(QueueError::Invalid));
+            return Ok(Err(QueueError::Conflict));
         };
         let mut value = Vec::with_capacity(8 + record.len());
         value.extend_from_slice(&next_version.to_be_bytes());
@@ -1562,10 +1564,11 @@ mod tests {
                 .unwrap(),
             Ok(1)
         );
-        // Версия, которую нельзя увеличить, — негодный запрос, а не паника.
+        // Версии, которую нельзя увеличить, у записи не бывает — это
+        // несовпадение версии, а не паника.
         assert_eq!(
             store.set_account_record(&ALICE, b"x", u64::MAX).unwrap(),
-            Err(QueueError::Invalid)
+            Err(QueueError::Conflict)
         );
     }
 
