@@ -105,6 +105,7 @@ fn every_payload_variant_roundtrips() {
                 supports_queue_addressing: true,
                 supports_queue_only: true,
                 supports_derived_queues: true,
+                supports_queue_device_scope: true,
                 device_cert_max_ttl_secs: 2_592_000,
                 proto_version: PROTO_VERSION,
                 max_frame_len: 8 * 1024 * 1024,
@@ -339,6 +340,17 @@ fn account_record_wire_numbers_are_pinned() {
     };
     // ServerConfig.supports_derived_queues = 20: ключ 160.
     assert_eq!(config.encode_to_vec(), [0xa0, 0x01, 0x01]);
+}
+
+/// Номер возможности N-3 (очередь плюс устройство).
+#[test]
+fn queue_device_scope_wire_number_is_pinned() {
+    let config = ServerConfig {
+        supports_queue_device_scope: true,
+        ..ServerConfig::default()
+    };
+    // ServerConfig.supports_queue_device_scope = 21: ключ 168.
+    assert_eq!(config.encode_to_vec(), [0xa8, 0x01, 0x01]);
 }
 
 /// Номера на проводе, которые клиенты держат в своих копиях схемы. Тест
