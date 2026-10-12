@@ -15,10 +15,11 @@ use ed25519_dalek::SigningKey;
 use prost::Message;
 use trust_message_tcp::config::{RetentionPolicy, ServerConfigSnapshot};
 use trust_message_tcp::net::framing::{
-    encode_auth_error, encode_incoming, encode_pong, encode_push_token_ack, encode_queue_ack,
-    encode_queue_list, encode_send_ack, encode_signed_server_config,
+    QueueListing, encode_auth_error, encode_incoming, encode_pong, encode_push_token_ack,
+    encode_queue_ack, encode_queue_list, encode_send_ack, encode_signed_server_config,
 };
 use trust_message_tcp::net::noise::{NodeIdentity, NodeKeySource};
+use trust_message_tcp::state::cert_revocations::DeviceCertRevocation;
 use trust_message_tcp::state::queues::{AccountRecord, QueueRecord};
 use trust_message_tcp::wire::{self, Frame, frame};
 
@@ -168,8 +169,8 @@ fn main() -> Result<()> {
     write(
         &dir,
         "queue_list.bin",
-        &encode_queue_list(
-            &[
+        &encode_queue_list(&QueueListing {
+            records: &[
                 QueueRecord {
                     queue_id: [6u8; 32],
                     created_at_secs: 1_700_000_000,
@@ -183,12 +184,29 @@ fn main() -> Result<()> {
                     expires_at_secs: 0,
                 },
             ],
-            true,
-            Some(&AccountRecord {
+            queue_only: true,
+            account_record: Some(&AccountRecord {
                 version: 3,
                 record: vec![0xEE; 64],
             }),
-        ),
+            revocations: &[DeviceCertRevocation {
+                device_id: 7,
+                issued_before: 1_700_000_000,
+            }],
+        }),
+    )?;
+    write(
+        &dir,
+        "revoke_device_certs.bin",
+        &wrap(frame::Payload::RevokeDeviceCerts(wire::RevokeDeviceCerts {
+            device_id: 7,
+            issued_before: 1_700_000_000,
+        })),
+    )?;
+    write(
+        &dir,
+        "auth_error_revoked.bin",
+        &encode_auth_error(403, "device certificate revoked"),
     )?;
     write(
         &dir,

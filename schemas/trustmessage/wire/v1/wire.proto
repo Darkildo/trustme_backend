@@ -104,7 +104,9 @@ enum QueueRejectReason {
   QUEUE_REJECT_REASON_NOT_FOUND = 2;
   // Ошибка ноды: хранилище, внутренняя ошибка.
   QUEUE_REJECT_REASON_INTERNAL = 3;
-  // Сессия вошла по сертификату устройства без права управлять очередями.
+  // Сессия вошла по сертификату устройства без права управлять очередями,
+  // или операция требует сессии, вошедшей ключом аккаунта
+  // (RevokeDeviceCerts).
   QUEUE_REJECT_REASON_FORBIDDEN = 4;
   // Нода не поддерживает операцию в текущей конфигурации (например,
   // SetQueueOnly при выключенной адресации по очередям).
@@ -152,8 +154,14 @@ message AuthOk {
 // разрывом. Может прийти и посреди живой сессии — например, когда умер
 // обслуживавший её пул доставки.
 message AuthError {
-  // Код в стиле HTTP: 401 — лимит одновременных сессий, 503 — нода
-  // временно не может обслуживать сессию (доставка или хранилище).
+  // Код в стиле HTTP:
+  //   * 401 — лимит одновременных сессий;
+  //   * 403 — вход по этому сертификату устройства запрещён навсегда: он
+  //     отозван (RevokeDeviceCerts). Приходит вместо AuthOk, при
+  //     подтверждении сессии или посреди живой сессии. Повтор с тем же
+  //     сертификатом бессмыслен;
+  //   * 503 — нода временно не может обслуживать сессию (доставка или
+  //     хранилище).
   uint32 code = 1;
   string message = 2;
 }
@@ -298,8 +306,9 @@ message DeviceCertificate {
   // Unix-секунды. Нода отвергает сертификат вне окна действия (для
   // `not_before` допускается расхождение часов до 300 с) и сертификат со
   // сроком жизни длиннее своего потолка (`ServerConfig.
-  // device_cert_max_ttl_secs`). Отзыва нет: единственный предел
-  // украденному сертификату — `not_after`.
+  // device_cert_max_ttl_secs`). Кроме срока, украденный сертификат
+  // ограничивает отзыв: RevokeDeviceCerts закрывает вход устройства по
+  // сертификатам с `not_before` раньше заданного момента.
   uint64 not_before = 4;
   uint64 not_after = 5;
   // Ed25519-подпись ключом `identity_key` над байтами, описанными выше
@@ -415,6 +424,11 @@ message ServerConfig {
   // доставку до этого устройства владельца очереди (server-contract.md,
   // §6.8). Не зависит от адресации по очередям.
   bool supports_queue_device_scope = 21;
+
+  // Нода понимает RevokeDeviceCerts и проверяет отзывы при делегированном
+  // входе (server-contract.md, §6.10). Не зависит от адресации по очередям
+  // и от `device_cert_max_ttl_secs`.
+  bool supports_device_cert_revocation = 22;
 
   // Номера 9–11 зарезервированы под удалённые поля версий клиента и ссылки
   // на обновление. Оператор ноды не должен влиять на дистрибуцию
@@ -556,6 +570,15 @@ message QueueList {
   bytes account_record = 3;
   // Версия записи аккаунта; 0 — записи нет.
   uint64 account_record_version = 4;
+  // Действующие отзывы сертификатов устройств этого аккаунта на этой ноде
+  // (RevokeDeviceCerts); устаревшие не отдаются.
+  repeated DeviceCertRevocation device_cert_revocations = 5;
+}
+
+// Отзыв сертификатов одного устройства (в QueueList).
+message DeviceCertRevocation {
+  uint32 device_id = 1;
+  uint64 issued_before = 2;
 }
 
 // Клиент → нода: включить или снять для своего аккаунта режим «только по
@@ -581,6 +604,21 @@ message SetQueueOnly {
 message SetAccountRecord {
   bytes record = 1;
   uint64 expected_version = 2;
+}
+
+// Клиент → нода: отозвать сертификаты устройства своего аккаунта. После
+// успеха нода не пускает делегированный вход этого устройства по
+// сертификату с not_before < issued_before (AuthError 403) и закрывает
+// такие живые сессии. Сессии, вошедшие ключом аккаунта, не затрагиваются.
+// Ответ — QueueAck (queue_id пуст). Только сессия, вошедшая ключом
+// аккаунта: делегированной — FORBIDDEN при любых битах scope. Идемпотентен;
+// хранится максимум issued_before. Потолок действующих отзывов — LIMIT.
+message RevokeDeviceCerts {
+  // Устройство, как в DeviceCertificate.device_id; > 65535 — INVALID.
+  uint32 device_id = 1;
+  // Unix-секунды. 0 или больше now + 300 (допуск NOT_BEFORE_SKEW_SECS) —
+  // INVALID.
+  uint64 issued_before = 2;
 }
 
 message Ping {}
@@ -614,5 +652,6 @@ message Frame {
     QueueList queue_list = 19;
     SetQueueOnly set_queue_only = 20;
     SetAccountRecord set_account_record = 21;
+    RevokeDeviceCerts revoke_device_certs = 22;
   }
 }

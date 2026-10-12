@@ -11,12 +11,16 @@
 //! она. Утечка фонового хранилища отдаёт ключ, который протухает сам, ничего
 //! не может подписать от имени аккаунта и ограничен в правах на ноде.
 //!
-//! # Ограничение: нет отзыва
+//! # Отзыв
 //!
-//! Нода не хранит состояния о сертификатах, поэтому единственный предел
-//! украденному сертификату — `not_after`. Отсюда потолок срока жизни на
-//! стороне ноды: клиент с ошибкой (или под принуждением) не выпишет
-//! сертификат на десять лет.
+//! Хендшейк по-прежнему без состояния: здесь проверяется только сам
+//! сертификат. Отзыв — `RevokeDeviceCerts` из сессии ключом аккаунта —
+//! хранится в `state::cert_revocations` и запрещает делегированный вход
+//! устройства по сертификатам с `not_before < issued_before`. Проверяет его
+//! `handle_conn` после хендшейка, до `AuthOk` и ещё раз при подтверждении
+//! сессии; живые такие сессии закрываются сразу (контракт §6.10). Срок
+//! `not_after` и потолок срока жизни на стороне ноды остаются вторым
+//! пределом: отзыв просит владелец, а сертификат протухает и сам.
 
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::{Signature, VerifyingKey};
@@ -80,6 +84,8 @@ impl SessionScope {
 pub struct VerifiedDeviceCert {
     pub transport_key: [u8; 32],
     pub scope: SessionScope,
+    /// Момент выпуска: по нему отзыв решает, закрыт ли сертификат.
+    pub not_before: u64,
     pub not_after: u64,
 }
 
@@ -184,6 +190,7 @@ pub fn verify(
     Ok(VerifiedDeviceCert {
         transport_key,
         scope: SessionScope::from_cert_bits(cert.scope),
+        not_before: cert.not_before,
         not_after: cert.not_after,
     })
 }
@@ -258,6 +265,10 @@ mod tests {
         assert!(!verified.scope.can_manage_push_tokens());
         assert!(!verified.scope.can_manage_queues());
         assert!(verified.scope.is_delegated());
+        // Окно сертификата отдаётся целиком: по `not_before` сессию сверяют
+        // с отзывами.
+        assert_eq!(verified.not_before, NOW - 10);
+        assert_eq!(verified.not_after, NOW + 14 * 24 * 3600);
     }
 
     #[test]

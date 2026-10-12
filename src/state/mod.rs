@@ -1,3 +1,4 @@
+pub mod cert_revocations;
 pub mod push_state;
 pub mod push_tokens;
 pub mod queues;

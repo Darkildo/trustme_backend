@@ -11,8 +11,8 @@ use trust_message_tcp::wire::{
     AllocateQueue, AuthError, AuthOk, ClientSend, DeliveryAck, Frame, GetServerConfig,
     IncomingMessage, ListQueues, MessagePriority, Ping, Pong, PushPlatform, PushTokenAck, QueueAck,
     QueueList, QueueRecord, QueueRejectReason, RegisterPushToken, RetentionConfig, RetentionMode,
-    RevokeQueue, SendAck, SendRejectReason, ServerConfig, SetAccountRecord, SetQueueOnly,
-    SignedServerConfig, UnregisterPushToken, WakeHint, frame,
+    RevokeDeviceCerts, RevokeQueue, SendAck, SendRejectReason, ServerConfig, SetAccountRecord,
+    SetQueueOnly, SignedServerConfig, UnregisterPushToken, WakeHint, frame,
 };
 
 const PROTO_VERSION: u32 = 1;
@@ -30,7 +30,7 @@ fn roundtrip(frame: &Frame) -> Frame {
 }
 
 /// Число вариантов `Frame.payload`. Обновляется вместе с `variant_index`.
-const PAYLOAD_VARIANTS: usize = 20;
+const PAYLOAD_VARIANTS: usize = 21;
 
 /// Порядковый номер варианта. `match` без `_`: новый вариант oneof в схеме
 /// ломает компиляцию теста, а не проходит мимо него.
@@ -57,6 +57,7 @@ fn variant_index(payload: &frame::Payload) -> usize {
         P::QueueList(_) => 17,
         P::SetQueueOnly(_) => 18,
         P::SetAccountRecord(_) => 19,
+        P::RevokeDeviceCerts(_) => 20,
     }
 }
 
@@ -106,6 +107,7 @@ fn every_payload_variant_roundtrips() {
                 supports_queue_only: true,
                 supports_derived_queues: true,
                 supports_queue_device_scope: true,
+                supports_device_cert_revocation: true,
                 device_cert_max_ttl_secs: 2_592_000,
                 proto_version: PROTO_VERSION,
                 max_frame_len: 8 * 1024 * 1024,
@@ -172,11 +174,19 @@ fn every_payload_variant_roundtrips() {
             queue_only: true,
             account_record: vec![13u8; 48],
             account_record_version: 3,
+            device_cert_revocations: vec![trust_message_tcp::wire::DeviceCertRevocation {
+                device_id: 7,
+                issued_before: 1_700_000_000,
+            }],
         }),
         frame::Payload::SetQueueOnly(SetQueueOnly { enabled: true }),
         frame::Payload::SetAccountRecord(SetAccountRecord {
             record: vec![14u8; 48],
             expected_version: 2,
+        }),
+        frame::Payload::RevokeDeviceCerts(RevokeDeviceCerts {
+            device_id: 7,
+            issued_before: 1_700_000_000,
         }),
     ];
 
@@ -340,6 +350,38 @@ fn account_record_wire_numbers_are_pinned() {
     };
     // ServerConfig.supports_derived_queues = 20: ключ 160.
     assert_eq!(config.encode_to_vec(), [0xa0, 0x01, 0x01]);
+}
+
+/// Номера N-6 (отзыв сертификатов устройства).
+#[test]
+fn device_cert_revocation_wire_numbers_are_pinned() {
+    let revoke = wrap(frame::Payload::RevokeDeviceCerts(RevokeDeviceCerts {
+        device_id: 7,
+        issued_before: 9,
+    }));
+    // Frame.payload = 22: ключ (22 << 3) | 2 = 178; device_id = 1,
+    // issued_before = 2.
+    assert_eq!(
+        revoke.encode_to_vec(),
+        [0x08, 0x01, 0xb2, 0x01, 0x04, 0x08, 0x07, 0x10, 0x09]
+    );
+
+    let list = QueueList {
+        device_cert_revocations: vec![trust_message_tcp::wire::DeviceCertRevocation {
+            device_id: 7,
+            issued_before: 9,
+        }],
+        ..QueueList::default()
+    };
+    // QueueList.device_cert_revocations = 5.
+    assert_eq!(list.encode_to_vec(), [0x2a, 0x04, 0x08, 0x07, 0x10, 0x09]);
+
+    let config = ServerConfig {
+        supports_device_cert_revocation: true,
+        ..ServerConfig::default()
+    };
+    // ServerConfig.supports_device_cert_revocation = 22: ключ 176.
+    assert_eq!(config.encode_to_vec(), [0xb0, 0x01, 0x01]);
 }
 
 /// Номер возможности N-3 (очередь плюс устройство).

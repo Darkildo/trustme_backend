@@ -342,6 +342,15 @@ pub fn observe_queue_only_reject() {
     counter!("trust_message_tcp_queue_only_reject_total").increment(1);
 }
 
+/// Делегированная сессия по отозванному сертификату отвергнута
+/// `AuthError(403)`. `stage`: `handshake` — вместо `AuthOk`, `confirm` — при
+/// подтверждении сессии, `live` — живая сессия закрыта отзывом. Рост
+/// `handshake` после отзыва — устройство (или тот, у кого его сертификат)
+/// продолжает стучаться.
+pub fn observe_device_cert_revoked_reject(stage: &'static str) {
+    counter!("trust_message_tcp_device_cert_revoked_reject_total", "stage" => stage).increment(1);
+}
+
 pub fn observe_push_sent(priority: &'static str, result: &'static str) {
     counter!(
         "trust_message_tcp_push_sent_total",

@@ -81,6 +81,7 @@ pub fn encode_signed_server_config(
         supports_queue_only: config.supports_queue_only(),
         supports_derived_queues: config.supports_derived_queues(),
         supports_queue_device_scope: config.supports_queue_device_scope(),
+        supports_device_cert_revocation: config.supports_device_cert_revocation(),
         device_cert_max_ttl_secs: config.device_cert_max_ttl.as_secs(),
         // Статик ноды попадает под подпись: клиент сверяет его с тем,
         // которым прошёл хендшейк, и снапшот нельзя пересадить на другую
@@ -211,13 +212,26 @@ pub fn encode_queue_ack(
     }))
 }
 
-/// Список очередей аккаунта (живые и надгробия) вместе с его флагом
-/// «только по очередям» и записью аккаунта (`None` — записи нет).
-pub fn encode_queue_list(
-    records: &[crate::state::queues::QueueRecord],
-    queue_only: bool,
-    account_record: Option<&crate::state::queues::AccountRecord>,
-) -> Vec<u8> {
+/// Состояние аккаунта для `ListQueues`.
+pub struct QueueListing<'a> {
+    /// Живые очереди и надгробия.
+    pub records: &'a [crate::state::queues::QueueRecord],
+    pub queue_only: bool,
+    /// `None` — записи аккаунта нет.
+    pub account_record: Option<&'a crate::state::queues::AccountRecord>,
+    /// Действующие отзывы сертификатов устройств.
+    pub revocations: &'a [crate::state::cert_revocations::DeviceCertRevocation],
+}
+
+/// Ответ на `ListQueues`: очереди аккаунта (живые и надгробия), режим
+/// «только по очередям», запись аккаунта и отзывы сертификатов.
+pub fn encode_queue_list(listing: &QueueListing<'_>) -> Vec<u8> {
+    let QueueListing {
+        records,
+        queue_only,
+        account_record,
+        revocations,
+    } = *listing;
     encode_frame(frame::Payload::QueueList(wire::QueueList {
         queues: records
             .iter()
@@ -233,6 +247,13 @@ pub fn encode_queue_list(
             .map(|account| account.record.clone())
             .unwrap_or_default(),
         account_record_version: account_record.map_or(0, |account| account.version),
+        device_cert_revocations: revocations
+            .iter()
+            .map(|revocation| wire::DeviceCertRevocation {
+                device_id: u32::from(revocation.device_id),
+                issued_before: revocation.issued_before,
+            })
+            .collect(),
     }))
 }
 
