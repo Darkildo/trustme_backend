@@ -617,8 +617,14 @@ message RevokeDeviceCerts {
   // Устройство, как в DeviceCertificate.device_id; > 65535 — INVALID.
   uint32 device_id = 1;
   // Unix-секунды. 0 или больше now + 300 (допуск NOT_BEFORE_SKEW_SECS) —
-  // INVALID.
+  // INVALID. При `all = true` игнорируется.
   uint64 issued_before = 2;
+  // true — отозвать все сертификаты устройства, в том числе выписанные
+  // заранее с `not_before` в будущем: нода сама ставит issued_before = now +
+  // горизонт по своим часам (горизонт — max(device_cert_max_ttl_secs,
+  // 30 суток) + 300). До его наступления устройство не войдёт делегированно
+  // ни по какому сертификату, в том числе выписанному после отзыва.
+  bool all = 3;
 }
 
 message Ping {}

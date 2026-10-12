@@ -12,13 +12,20 @@
 //! `issued_before(u64 BE)`. Хранится максимум: более ранний отзыв ничего не
 //! добавляет к более позднему.
 //!
+//! Отзыв «всех сертификатов устройства» (`all`) нода записывает как
+//! `issued_before = now + горизонт` по своим часам: он закрывает и
+//! сертификаты, выписанные заранее с `not_before` в будущем (часы
+//! выписывающего устройства спешат), в пределах горизонта.
+//!
 //! Отзыв устаревает: сертификат с `not_before < issued_before` истекает не
-//! позже `issued_before + max_ttl` (потолок срока сертификата на ноде), так
-//! что после `issued_before + max_ttl + NOT_BEFORE_SKEW_SECS` отзыву нечего
-//! запрещать. Устаревшие записи удаляются лениво — при записи отзыва и при
-//! перечислении. Если оператор потом поднимет потолок срока, удалённый по
-//! старому потолку отзыв не вернётся (известное ограничение, контракт
-//! §6.10).
+//! позже `issued_before + max_ttl`, так что после `issued_before + горизонт`
+//! отзыву нечего запрещать. Горизонт — `max(max_ttl, 30 суток) +
+//! NOT_BEFORE_SKEW_SECS`: нижний предел не даёт отзыву испариться, если
+//! оператор временно снизил потолок срока, а при `max_ttl = 0`
+//! (делегированный вход выключен) отзывы не чистятся вовсе. Устаревшие
+//! записи удаляются лениво — при записи отзыва и при перечислении. Если
+//! оператор поднимет потолок выше 30 суток, отзыв, удалённый по старому
+//! потолку, не вернётся (известное ограничение, контракт §6.10).
 
 use anyhow::{Context, Result};
 use sled::transaction::TransactionError;
@@ -33,13 +40,19 @@ use crate::state::registry::{DeviceId, UserId};
 /// вытесняются: вытеснение вернуло бы вход украденному сертификату.
 pub const MAX_DEVICE_CERT_REVOCATIONS_PER_USER: usize = 256;
 
+/// Нижний предел горизонта устаревания отзыва, секунд. Отзыв живёт не
+/// меньше этого срока после `issued_before`, даже если потолок срока
+/// сертификата на ноде сейчас ниже: потолок могли снизить временно, а
+/// сертификат, выписанный при прежнем, всё ещё действует.
+pub const REVOCATION_HORIZON_FLOOR_SECS: u64 = 30 * 24 * 3600;
+
 const KEY_LEN: usize = 34;
 
 /// Почему отзыв не записан.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RevocationError {
     /// Негодные параметры: `device_id` вне u16, `issued_before = 0` или
-    /// дальше `now + NOT_BEFORE_SKEW_SECS`.
+    /// дальше `now + NOT_BEFORE_SKEW_SECS` (без `all`).
     Invalid,
     /// Действующих отзывов у пользователя уже `MAX_…` и устаревших нет.
     Limit,
@@ -53,15 +66,35 @@ pub struct DeviceCertRevocation {
     pub issued_before: u64,
 }
 
-/// Проверить сырые поля `RevokeDeviceCerts`. `issued_before` в будущем
-/// допускается в пределах того же допуска на часы, что и `not_before`
-/// сертификата: клиент ставит «сейчас» по своим часам.
+/// Горизонт отзыва: сколько после `issued_before` может ещё действовать
+/// сертификат, который отзыв закрывает.
+pub fn revocation_horizon(max_ttl_secs: u64) -> u64 {
+    max_ttl_secs
+        .max(REVOCATION_HORIZON_FLOOR_SECS)
+        .saturating_add(NOT_BEFORE_SKEW_SECS)
+}
+
+/// Проверить сырые поля `RevokeDeviceCerts`.
+///
+/// Без `all` — `issued_before` от клиента; в будущем допускается в пределах
+/// того же допуска на часы, что и `not_before` сертификата: клиент ставит
+/// «сейчас» по своим часам. С `all` поле игнорируется, и нода сама ставит
+/// `now + горизонт` по своим часам — так закрываются и сертификаты,
+/// выписанные заранее.
 pub fn validate(
     device_id: u32,
     issued_before: u64,
+    all: bool,
     now_secs: u64,
+    max_ttl_secs: u64,
 ) -> Result<DeviceCertRevocation, RevocationError> {
     let device_id = DeviceId::try_from(device_id).map_err(|_| RevocationError::Invalid)?;
+    if all {
+        return Ok(DeviceCertRevocation {
+            device_id,
+            issued_before: now_secs.saturating_add(revocation_horizon(max_ttl_secs)),
+        });
+    }
     if issued_before == 0 || issued_before > now_secs.saturating_add(NOT_BEFORE_SKEW_SECS) {
         return Err(RevocationError::Invalid);
     }
@@ -72,12 +105,11 @@ pub fn validate(
 }
 
 /// Отзыв больше ничего не запрещает: любой сертификат, который он
-/// закрывал, уже истёк сам.
+/// закрывал, уже истёк сам. При выключенном делегированном входе
+/// (`max_ttl = 0`) не устаревает: срок сертификатов, которые пустят после
+/// включения, заранее неизвестен.
 fn is_stale(issued_before: u64, now_secs: u64, max_ttl_secs: u64) -> bool {
-    now_secs
-        > issued_before
-            .saturating_add(max_ttl_secs)
-            .saturating_add(NOT_BEFORE_SKEW_SECS)
+    max_ttl_secs != 0 && now_secs > issued_before.saturating_add(revocation_horizon(max_ttl_secs))
 }
 
 #[derive(Clone)]
@@ -211,7 +243,8 @@ mod tests {
     const ALICE: UserId = [1u8; 32];
     const BOB: UserId = [2u8; 32];
     const NOW: u64 = 1_000_000;
-    const TTL: u64 = 30 * 24 * 3600;
+    const DAY: u64 = 24 * 3600;
+    const TTL: u64 = 60 * DAY;
 
     fn store() -> CertRevocationStore {
         let db = sled::Config::new().temporary(true).open().unwrap();
@@ -227,18 +260,62 @@ mod tests {
 
     #[test]
     fn validation() {
-        assert_eq!(validate(7, NOW, NOW), Ok(rev(7, NOW)));
+        let check = |device, issued_before| validate(device, issued_before, false, NOW, TTL);
+        assert_eq!(check(7, NOW), Ok(rev(7, NOW)));
         assert_eq!(
-            validate(7, NOW + NOT_BEFORE_SKEW_SECS, NOW),
+            check(7, NOW + NOT_BEFORE_SKEW_SECS),
             Ok(rev(7, NOW + NOT_BEFORE_SKEW_SECS))
         );
-        assert_eq!(validate(65_535, 1, NOW), Ok(rev(65_535, 1)));
-        assert_eq!(validate(65_536, NOW, NOW), Err(RevocationError::Invalid));
-        assert_eq!(validate(7, 0, NOW), Err(RevocationError::Invalid));
+        assert_eq!(check(65_535, 1), Ok(rev(65_535, 1)));
+        assert_eq!(check(65_536, NOW), Err(RevocationError::Invalid));
+        assert_eq!(check(7, 0), Err(RevocationError::Invalid));
         assert_eq!(
-            validate(7, NOW + NOT_BEFORE_SKEW_SECS + 1, NOW),
+            check(7, NOW + NOT_BEFORE_SKEW_SECS + 1),
             Err(RevocationError::Invalid)
         );
+    }
+
+    /// `all` ставит `issued_before` по часам ноды на горизонт вперёд, что бы
+    /// ни прислал клиент, — и закрывает сертификат с `not_before` в будущем.
+    #[test]
+    fn revoking_all_covers_certificates_dated_ahead() {
+        let horizon = revocation_horizon(TTL);
+        assert_eq!(horizon, TTL + NOT_BEFORE_SKEW_SECS);
+        for sent in [0u64, 1, NOW, u64::MAX] {
+            assert_eq!(validate(7, sent, true, NOW, TTL), Ok(rev(7, NOW + horizon)));
+        }
+        assert_eq!(
+            validate(65_536, 0, true, NOW, TTL),
+            Err(RevocationError::Invalid)
+        );
+        // Сертификат, выписанный «на завтра» до отзыва, отзыв закрывает.
+        let store = store();
+        let all = validate(7, 0, true, NOW, TTL).unwrap();
+        store.revoke(&ALICE, all, NOW, TTL).unwrap().unwrap();
+        let ahead_not_before = NOW + DAY;
+        assert!(ahead_not_before < store.revoked_since(&ALICE, 7).unwrap().unwrap());
+        // Обычный, более поздний по часам клиента, отзыв его не ослабляет.
+        store
+            .revoke(&ALICE, rev(7, NOW + 10), NOW + 10, TTL)
+            .unwrap()
+            .unwrap();
+        assert_eq!(store.revoked_since(&ALICE, 7).unwrap(), Some(NOW + horizon));
+    }
+
+    /// Нижний предел горизонта: при сниженном потолке срока отзыв живёт не
+    /// меньше 30 суток.
+    #[test]
+    fn a_lowered_ttl_does_not_evaporate_revocations() {
+        let store = store();
+        store
+            .revoke(&ALICE, rev(1, NOW), NOW, TTL)
+            .unwrap()
+            .unwrap();
+        let hour = 3600;
+        let floor_edge = NOW + REVOCATION_HORIZON_FLOOR_SECS + NOT_BEFORE_SKEW_SECS;
+        assert_eq!(store.list(&ALICE, NOW + DAY, hour).unwrap().len(), 1);
+        assert_eq!(store.list(&ALICE, floor_edge, hour).unwrap().len(), 1);
+        assert!(store.list(&ALICE, floor_edge + 1, hour).unwrap().is_empty());
     }
 
     #[test]
@@ -344,16 +421,16 @@ mod tests {
         );
     }
 
+    /// При выключенном делегированном входе отзывы не чистятся: потолок,
+    /// с которым вход включат, заранее неизвестен.
     #[test]
-    fn zero_ttl_still_stores_revocations() {
+    fn zero_ttl_keeps_revocations_forever() {
         let store = store();
         store.revoke(&ALICE, rev(3, NOW), NOW, 0).unwrap().unwrap();
         assert_eq!(store.list(&ALICE, NOW, 0).unwrap(), vec![rev(3, NOW)]);
-        assert!(
-            store
-                .list(&ALICE, NOW + NOT_BEFORE_SKEW_SECS + 1, 0)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            store.list(&ALICE, NOW + 10 * 365 * DAY, 0).unwrap(),
+            vec![rev(3, NOW)]
         );
     }
 

@@ -187,6 +187,7 @@ fn every_payload_variant_roundtrips() {
         frame::Payload::RevokeDeviceCerts(RevokeDeviceCerts {
             device_id: 7,
             issued_before: 1_700_000_000,
+            all: true,
         }),
     ];
 
@@ -358,12 +359,15 @@ fn device_cert_revocation_wire_numbers_are_pinned() {
     let revoke = wrap(frame::Payload::RevokeDeviceCerts(RevokeDeviceCerts {
         device_id: 7,
         issued_before: 9,
+        all: true,
     }));
     // Frame.payload = 22: ключ (22 << 3) | 2 = 178; device_id = 1,
-    // issued_before = 2.
+    // issued_before = 2, all = 3.
     assert_eq!(
         revoke.encode_to_vec(),
-        [0x08, 0x01, 0xb2, 0x01, 0x04, 0x08, 0x07, 0x10, 0x09]
+        [
+            0x08, 0x01, 0xb2, 0x01, 0x06, 0x08, 0x07, 0x10, 0x09, 0x18, 0x01
+        ]
     );
 
     let list = QueueList {
