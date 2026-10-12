@@ -7,16 +7,24 @@
 
 mod common;
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use anyhow::{Result, bail};
 use common::{
-    Conn, connect, decode, expect_auth_ok, next_frame, send_raw_and_read_ack, spawn_server,
-    spawn_server_with_queue_addressing,
+    Conn, FRAME_MAX, NodeOptions, connect, connect_as, decode, expect_auth_ok, next_frame,
+    next_incoming_within, random_identity, send_raw_and_read_ack, spawn_node_with, spawn_server,
+    spawn_server_with_queue_addressing, user_id_of,
 };
 use ed25519_dalek::SigningKey;
 use prost::Message;
 use trust_message_tcp::config::LimitsConfig;
 use trust_message_tcp::domain::reject::SendRejectReason;
+use trust_message_tcp::push::{MockTransport, PushKind};
 use trust_message_tcp::wire::{self, Frame, frame};
+
+/// Сколько ждать конверт, которого быть не должно.
+const SILENCE: Duration = Duration::from_millis(400);
 
 const PROTO_VERSION: u32 = 1;
 
@@ -214,44 +222,174 @@ async fn with_the_flag_down_the_queue_id_is_still_ignored() -> Result<()> {
     Ok(())
 }
 
-/// Очередь адресует аккаунт целиком, поэтому `recipientDeviceId` рядом с
-/// ней не сужает доставку: конверт приходит в сессию без device_id так же,
-/// как и в любую другую.
-#[tokio::test]
-async fn a_queue_addressed_deposit_is_account_scoped() -> Result<()> {
-    let server = spawn_server_with_queue_addressing("qa_scope", LimitsConfig::default()).await?;
-    let owner = SigningKey::from_bytes(&[49u8; 32]);
-    let sender = SigningKey::from_bytes(&[50u8; 32]);
-
-    let mut owner_conn = connect(&server, &owner).await?;
-    expect_auth_ok(
-        &next_frame(&mut owner_conn).await?,
-        &owner.verifying_key().to_bytes(),
-    )?;
-    let queue_id = allocate_queue(&mut owner_conn).await?;
-
-    let mut sender_conn = connect(&server, &sender).await?;
-    expect_auth_ok(
-        &next_frame(&mut sender_conn).await?,
-        &sender.verifying_key().to_bytes(),
-    )?;
-
-    let framed = wrap(frame::Payload::ClientSend(wire::ClientSend {
+/// Депозит по очереди с указанием устройства (ответы sync).
+fn send_to_device(queue_id: &[u8], device_id: Option<u32>, body: &str) -> Vec<u8> {
+    wrap(frame::Payload::ClientSend(wire::ClientSend {
         recipient_id: Vec::new(),
-        body: b"account-scope".to_vec(),
-        // Устройство указано, но очередь принадлежит аккаунту — сужения
-        // не происходит.
-        recipient_device_id: Some(7),
-        priority: 0,
+        body: body.as_bytes().to_vec(),
+        recipient_device_id: device_id,
+        priority: wire::MessagePriority::High as i32,
         wake_hint: 0,
-        queue_id,
+        queue_id: queue_id.to_vec(),
         ttl_seconds: 0,
-    }));
-    let ack = send_raw_and_read_ack(&mut sender_conn, &framed).await?;
-    assert!(ack.ok || ack.queued, "unexpected ack: {ack:?}");
-    assert_eq!(
-        expect_incoming(&mut owner_conn).await?.body,
-        b"account-scope"
+    }))
+}
+
+async fn device_session(
+    server: &common::ServerHandle,
+    identity: &SigningKey,
+    device_id: u16,
+) -> Result<Conn> {
+    let mut conn = connect_as(server, identity, Some(device_id), FRAME_MAX).await?;
+    expect_auth_ok(&next_frame(&mut conn).await?, &user_id_of(identity))?;
+    Ok(conn)
+}
+
+/// Очередь плюс `recipientDeviceId` — доставка только этому устройству
+/// владельца очереди, как у `recipientId` с устройством. Другое устройство
+/// того же аккаунта конверта не видит.
+#[tokio::test]
+async fn a_queue_deposit_with_a_device_reaches_only_that_device() -> Result<()> {
+    let server = spawn_server_with_queue_addressing("qa_device", LimitsConfig::default()).await?;
+    let owner = random_identity();
+    let sender = random_identity();
+
+    let mut phone = device_session(&server, &owner, 1).await?;
+    let mut tablet = device_session(&server, &owner, 7).await?;
+    let queue_id = allocate_queue(&mut phone).await?;
+    let mut sender_conn = device_session(&server, &sender, 1).await?;
+
+    let ack = send_raw_and_read_ack(
+        &mut sender_conn,
+        &send_to_device(&queue_id, Some(7), "to-tablet"),
+    )
+    .await?;
+    assert!(ack.ok, "online device must receive it: {ack:?}");
+    assert_eq!(expect_incoming(&mut tablet).await?.body, b"to-tablet");
+    assert_eq!(next_incoming_within(&mut phone, SILENCE).await?, None);
+    Ok(())
+}
+
+/// Устройство офлайн — конверт ждёт в его device-очереди и при
+/// подключении приходит ему, а не другому устройству, которое было онлайн.
+#[tokio::test]
+async fn a_queue_deposit_for_an_offline_device_waits_for_it() -> Result<()> {
+    let server =
+        spawn_server_with_queue_addressing("qa_device_offline", LimitsConfig::default()).await?;
+    let owner = random_identity();
+    let sender = random_identity();
+
+    let mut phone = device_session(&server, &owner, 1).await?;
+    let queue_id = allocate_queue(&mut phone).await?;
+    let mut sender_conn = device_session(&server, &sender, 1).await?;
+
+    let ack = send_raw_and_read_ack(
+        &mut sender_conn,
+        &send_to_device(&queue_id, Some(7), "for-tablet"),
+    )
+    .await?;
+    assert!(
+        !ack.ok && ack.queued,
+        "must wait in the device inbox: {ack:?}"
     );
+    assert_eq!(next_incoming_within(&mut phone, SILENCE).await?, None);
+
+    let mut tablet = device_session(&server, &owner, 7).await?;
+    let replayed = next_incoming_within(&mut tablet, SILENCE)
+        .await?
+        .expect("the device inbox must be replayed to that device");
+    assert_eq!(replayed.body, b"for-tablet");
+    assert_eq!(next_incoming_within(&mut phone, SILENCE).await?, None);
+    Ok(())
+}
+
+/// Очередь без устройства — как раньше: во все устройства владельца.
+#[tokio::test]
+async fn a_queue_deposit_without_a_device_reaches_every_device() -> Result<()> {
+    let server =
+        spawn_server_with_queue_addressing("qa_account_scope", LimitsConfig::default()).await?;
+    let owner = random_identity();
+    let sender = random_identity();
+
+    let mut phone = device_session(&server, &owner, 1).await?;
+    let mut tablet = device_session(&server, &owner, 7).await?;
+    let queue_id = allocate_queue(&mut phone).await?;
+    let mut sender_conn = device_session(&server, &sender, 1).await?;
+
+    let ack =
+        send_raw_and_read_ack(&mut sender_conn, &send_to_device(&queue_id, None, "to-all")).await?;
+    assert!(ack.ok, "unexpected ack: {ack:?}");
+    assert_eq!(expect_incoming(&mut phone).await?.body, b"to-all");
+    assert_eq!(expect_incoming(&mut tablet).await?.body, b"to-all");
+    Ok(())
+}
+
+/// Пуш по депозиту с устройством будит только это устройство.
+#[tokio::test]
+async fn a_queue_deposit_with_a_device_wakes_only_that_device() -> Result<()> {
+    let transport = Arc::new(MockTransport::always_ok());
+    let (server, _internals) = spawn_node_with(
+        "qa_device_push",
+        LimitsConfig::default(),
+        NodeOptions {
+            queue_addressing: true,
+            push: Some(transport.clone()),
+            ..NodeOptions::default()
+        },
+    )
+    .await?;
+    let owner = random_identity();
+    let sender = random_identity();
+
+    let mut queue_id = Vec::new();
+    for device in [1u16, 7] {
+        let mut conn = device_session(&server, &owner, device).await?;
+        conn.send_frame(&wrap(frame::Payload::RegisterPushToken(
+            wire::RegisterPushToken {
+                token: format!("token-{device}"),
+                platform: wire::PushPlatform::AndroidFcm as i32,
+            },
+        )))
+        .await?;
+        match decode(&next_frame(&mut conn).await?)? {
+            frame::Payload::PushTokenAck(ack) if ack.ok => {}
+            other => bail!("push token registration failed: {other:?}"),
+        }
+        if queue_id.is_empty() {
+            queue_id = allocate_queue(&mut conn).await?;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    let mut sender_conn = device_session(&server, &sender, 1).await?;
+    let ack = send_raw_and_read_ack(
+        &mut sender_conn,
+        &send_to_device(&queue_id, Some(7), "wake"),
+    )
+    .await?;
+    assert!(ack.queued, "unexpected ack: {ack:?}");
+
+    let mut woken = Vec::new();
+    for _ in 0..50 {
+        woken = transport
+            .sent_payloads()
+            .iter()
+            .filter(|payload| payload.kind == PushKind::Wake)
+            .map(|payload| payload.device_id)
+            .collect();
+        if !woken.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    tokio::time::sleep(SILENCE).await;
+    let woken_after: Vec<u16> = transport
+        .sent_payloads()
+        .iter()
+        .filter(|payload| payload.kind == PushKind::Wake)
+        .map(|payload| payload.device_id)
+        .collect();
+    assert_eq!(woken, vec![7]);
+    assert_eq!(woken_after, vec![7], "no other device may be woken");
     Ok(())
 }

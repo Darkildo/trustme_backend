@@ -515,6 +515,12 @@ impl ServerConfigSnapshot {
         true
     }
 
+    /// `recipientDeviceId` рядом с разрешённой очередью сужает доставку до
+    /// этого устройства владельца (§6.8 контракта). Всегда `true`.
+    pub fn supports_queue_device_scope(&self) -> bool {
+        true
+    }
+
     pub fn supports_offline_messages(&self) -> bool {
         !self.offline_messages_retention.is_immediate()
     }

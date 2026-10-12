@@ -428,6 +428,164 @@ async fn unacked_envelope_returns_to_the_stream_when_the_pump_exits() -> Result<
     Ok(())
 }
 
+/// Нода на брокерном бэкенде с включённой адресацией по очередям.
+async fn spawn_jetstream_queue_node(label: &str) -> Result<common::ServerHandle> {
+    let (server, _internals) = common::spawn_node_with(
+        label,
+        LimitsConfig::default(),
+        common::NodeOptions {
+            jetstream: Some(common::JetStreamSetup {
+                nats_url: nats_url(),
+                ack_wait: ACK_WAIT,
+            }),
+            queue_addressing: true,
+            ..common::NodeOptions::default()
+        },
+    )
+    .await?;
+    Ok(server)
+}
+
+fn queue_frame(payload: trust_message_tcp::wire::frame::Payload) -> Vec<u8> {
+    use prost::Message;
+    trust_message_tcp::wire::Frame {
+        proto_version: common::PROTO_VERSION,
+        payload: Some(payload),
+    }
+    .encode_to_vec()
+}
+
+async fn allocate_queue(conn: &mut common::Conn) -> Result<Vec<u8>> {
+    use trust_message_tcp::wire::{self, frame};
+    conn.send_frame(&queue_frame(frame::Payload::AllocateQueue(
+        wire::AllocateQueue::default(),
+    )))
+    .await?;
+    match common::decode(&next_frame(conn).await?)? {
+        frame::Payload::QueueAck(ack) if ack.ok => Ok(ack.queue_id),
+        other => anyhow::bail!("expected a successful QueueAck, got {other:?}"),
+    }
+}
+
+fn send_by_queue(queue_id: &[u8], device_id: Option<u32>, body: &[u8]) -> Vec<u8> {
+    use trust_message_tcp::wire::{self, frame};
+    queue_frame(frame::Payload::ClientSend(wire::ClientSend {
+        body: body.to_vec(),
+        queue_id: queue_id.to_vec(),
+        recipient_device_id: device_id,
+        ..wire::ClientSend::default()
+    }))
+}
+
+/// Режим «только по очередям» на брокерном бэкенде: кадр по `recipientId`
+/// отвергается до публикации — в поток он не попадает и получателю не
+/// приходит, — а депозит по очереди публикуется и доходит.
+#[tokio::test]
+#[ignore = "требует живого NATS с JetStream"]
+async fn queue_only_refuses_recipient_id_before_publishing() -> Result<()> {
+    use trust_message_tcp::domain::reject::SendRejectReason;
+    use trust_message_tcp::wire::{self, frame};
+
+    let server = spawn_jetstream_queue_node("js_queue_only").await?;
+    let owner = random_identity();
+    let sender = random_identity();
+    let owner_id = user_id_of(&owner);
+
+    let mut owner_conn = common::connect(&server, &owner).await?;
+    expect_auth_ok(&next_frame(&mut owner_conn).await?, &owner_id)?;
+    let queue_id = allocate_queue(&mut owner_conn).await?;
+    owner_conn
+        .send_frame(&queue_frame(frame::Payload::SetQueueOnly(
+            wire::SetQueueOnly { enabled: true },
+        )))
+        .await?;
+    match common::decode(&next_frame(&mut owner_conn).await?)? {
+        frame::Payload::QueueAck(ack) if ack.ok => {}
+        other => anyhow::bail!("SetQueueOnly failed: {other:?}"),
+    }
+
+    let mut sender_conn = common::connect(&server, &sender).await?;
+    expect_auth_ok(&next_frame(&mut sender_conn).await?, &user_id_of(&sender))?;
+    let ack = send_and_read_ack(&mut sender_conn, &owner_id, b"by recipient id", 0).await?;
+    assert!(!ack.ok && !ack.queued, "must be refused: {ack:?}");
+    assert_eq!(ack.reason, SendRejectReason::NoPermit);
+    assert_eq!(
+        next_incoming_within(&mut owner_conn, SILENCE_WINDOW).await?,
+        None,
+        "refused envelope must never reach the stream"
+    );
+
+    let ack = common::send_raw_and_read_ack(
+        &mut sender_conn,
+        &send_by_queue(&queue_id, None, b"by queue"),
+    )
+    .await?;
+    assert!(
+        ack.ok && ack.queued,
+        "queue deposit must be published: {ack:?}"
+    );
+    let incoming = next_incoming_within(&mut owner_conn, REDELIVERY_WINDOW)
+        .await?
+        .expect("queue deposit must arrive");
+    assert_eq!(incoming.body, b"by queue");
+    Ok(())
+}
+
+/// Очередь плюс устройство на брокерном бэкенде: публикация в
+/// device-subject этого устройства владельца — онлайн и офлайн, — другое
+/// устройство конверта не видит. Без устройства — во все.
+#[tokio::test]
+#[ignore = "требует живого NATS с JetStream"]
+async fn queue_with_device_publishes_to_that_device_only() -> Result<()> {
+    let server = spawn_jetstream_queue_node("js_queue_device").await?;
+    let owner = random_identity();
+    let sender = random_identity();
+    let owner_id = user_id_of(&owner);
+
+    let mut phone = common::connect_as(&server, &owner, Some(1), common::FRAME_MAX).await?;
+    expect_auth_ok(&next_frame(&mut phone).await?, &owner_id)?;
+    let queue_id = allocate_queue(&mut phone).await?;
+    let mut sender_conn = common::connect(&server, &sender).await?;
+    expect_auth_ok(&next_frame(&mut sender_conn).await?, &user_id_of(&sender))?;
+
+    // Устройство 7 офлайн: конверт ждёт в его subject.
+    let ack = common::send_raw_and_read_ack(
+        &mut sender_conn,
+        &send_by_queue(&queue_id, Some(7), b"for tablet"),
+    )
+    .await?;
+    assert!(ack.ok && ack.queued, "must be published: {ack:?}");
+    assert_eq!(
+        next_incoming_within(&mut phone, SILENCE_WINDOW).await?,
+        None
+    );
+
+    let mut tablet = common::connect_as(&server, &owner, Some(7), common::FRAME_MAX).await?;
+    expect_auth_ok(&next_frame(&mut tablet).await?, &owner_id)?;
+    let incoming = next_incoming_within(&mut tablet, REDELIVERY_WINDOW)
+        .await?
+        .expect("the device envelope must reach that device");
+    assert_eq!(incoming.body, b"for tablet");
+    tablet
+        .send_frame(&encode_delivery_ack(incoming.message_id))
+        .await?;
+
+    // Без устройства — обоим.
+    let ack = common::send_raw_and_read_ack(
+        &mut sender_conn,
+        &send_by_queue(&queue_id, None, b"for everyone"),
+    )
+    .await?;
+    assert!(ack.ok && ack.queued, "must be published: {ack:?}");
+    for conn in [&mut phone, &mut tablet] {
+        let incoming = next_incoming_within(conn, REDELIVERY_WINDOW)
+            .await?
+            .expect("account-scope envelope must reach every device");
+        assert_eq!(incoming.body, b"for everyone");
+    }
+    Ok(())
+}
+
 fn free_port() -> Result<u16> {
     let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
     Ok(listener.local_addr()?.port())

@@ -450,8 +450,8 @@ async fn account_record_needs_the_queues_scope() -> Result<()> {
     Ok(())
 }
 
-/// `supports_derived_queues` объявлен всегда — от адресации по очередям он
-/// не зависит.
+/// `supports_derived_queues` и `supports_queue_device_scope` объявлены
+/// всегда — от адресации по очередям они не зависят.
 #[tokio::test]
 async fn derived_queues_are_always_advertised() -> Result<()> {
     for queue_addressing in [false, true] {
@@ -465,6 +465,7 @@ async fn derived_queues_are_always_advertised() -> Result<()> {
         let config = server_config(&mut conn, &server).await?;
         assert_eq!(config.supports_queue_addressing, queue_addressing);
         assert!(config.supports_derived_queues);
+        assert!(config.supports_queue_device_scope);
     }
     Ok(())
 }

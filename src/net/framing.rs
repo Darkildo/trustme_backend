@@ -80,6 +80,7 @@ pub fn encode_signed_server_config(
         supports_queue_addressing: config.supports_queue_addressing,
         supports_queue_only: config.supports_queue_only(),
         supports_derived_queues: config.supports_derived_queues(),
+        supports_queue_device_scope: config.supports_queue_device_scope(),
         device_cert_max_ttl_secs: config.device_cert_max_ttl.as_secs(),
         // Статик ноды попадает под подпись: клиент сверяет его с тем,
         // которым прошёл хендшейк, и снапшот нельзя пересадить на другую
