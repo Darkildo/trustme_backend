@@ -79,6 +79,7 @@ pub fn encode_signed_server_config(
         supports_delivery_ack: config.supports_delivery_ack,
         supports_queue_addressing: config.supports_queue_addressing,
         supports_queue_only: config.supports_queue_only(),
+        supports_derived_queues: config.supports_derived_queues(),
         device_cert_max_ttl_secs: config.device_cert_max_ttl.as_secs(),
         // Статик ноды попадает под подпись: клиент сверяет его с тем,
         // которым прошёл хендшейк, и снапшот нельзя пересадить на другую
@@ -210,10 +211,11 @@ pub fn encode_queue_ack(
 }
 
 /// Список очередей аккаунта (живые и надгробия) вместе с его флагом
-/// «только по очередям».
+/// «только по очередям» и записью аккаунта (`None` — записи нет).
 pub fn encode_queue_list(
     records: &[crate::state::queues::QueueRecord],
     queue_only: bool,
+    account_record: Option<&crate::state::queues::AccountRecord>,
 ) -> Vec<u8> {
     encode_frame(frame::Payload::QueueList(wire::QueueList {
         queues: records
@@ -226,6 +228,10 @@ pub fn encode_queue_list(
             })
             .collect(),
         queue_only,
+        account_record: account_record
+            .map(|account| account.record.clone())
+            .unwrap_or_default(),
+        account_record_version: account_record.map_or(0, |account| account.version),
     }))
 }
 

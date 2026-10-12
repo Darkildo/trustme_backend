@@ -110,11 +110,13 @@ enum QueueRejectReason {
   // SetQueueOnly при выключенной адресации по очередям).
   QUEUE_REJECT_REASON_UNSUPPORTED = 5;
   // Параметры запроса негодны: длина тега, срок в прошлом, надгробие без
-  // тега.
+  // тега, запись аккаунта длиннее 4 КиБ.
   QUEUE_REJECT_REASON_INVALID = 6;
   // Очередь с этим id отозвана или истекла (надгробие) и заново не
   // выделяется.
   QUEUE_REJECT_REASON_REVOKED = 7;
+  // Версия записи аккаунта не совпала с `SetAccountRecord.expected_version`.
+  QUEUE_REJECT_REASON_CONFLICT = 8;
 }
 
 // Платформа устройства, зарегистрировавшего push-токен.
@@ -315,7 +317,8 @@ enum DeviceCertScope {
   DEVICE_CERT_SCOPE_SEND = 1;
   // RegisterPushToken / UnregisterPushToken.
   DEVICE_CERT_SCOPE_PUSH_TOKENS = 2;
-  // AllocateQueue / RevokeQueue / ListQueues / SetQueueOnly.
+  // AllocateQueue / RevokeQueue / ListQueues / SetQueueOnly /
+  // SetAccountRecord.
   DEVICE_CERT_SCOPE_QUEUES = 4;
   // Прикладной бит: `signing_key` вправе подписывать сигналы звонка от
   // имени аккаунта. Нода его не читает — проверяет собеседник.
@@ -401,6 +404,11 @@ message ServerConfig {
   // на SetQueueOnly отказом `UNSUPPORTED`.
   bool supports_queue_only = 19;
 
+  // AllocateQueue понимает tag/expires_at/revoked, отзыв оставляет
+  // надгробия, ListQueues их отдаёт, есть SetAccountRecord
+  // (server-contract.md, §6.7). Не зависит от адресации по очередям.
+  bool supports_derived_queues = 20;
+
   // Номера 9–11 зарезервированы под удалённые поля версий клиента и ссылки
   // на обновление. Оператор ноды не должен влиять на дистрибуцию
   // клиентских бинарей: это забота вендорского подписанного манифеста, а
@@ -463,6 +471,10 @@ message SignedServerConfig {
 // **Отзыв оставляет надгробие.** Отозванный id заново не выделяется
 // (`REVOKED`), иначе устаревшее устройство вернуло бы заблокированному
 // контакту доступ по старому адресу.
+//
+// **Запись аккаунта.** Маленькое непрозрачное значение (клиент шифрует в
+// нём пул своих нод) с заменой по CAS версии: SetAccountRecord, чтение — в
+// QueueList.
 
 // Клиент → нода: завести очередь. Ответ — QueueAck с выданным id (в том
 // числе для `revoked = true`: клиенту нужен id надгробия).
@@ -532,6 +544,11 @@ message QueueList {
   // Отражает сохранённый флаг, даже если адресация по очередям на ноде
   // сейчас выключена и режим поэтому не действует.
   bool queue_only = 2;
+  // Запись аккаунта (SetAccountRecord) как есть; пусто — записи нет либо
+  // она пуста (различает версия).
+  bytes account_record = 3;
+  // Версия записи аккаунта; 0 — записи нет.
+  uint64 account_record_version = 4;
 }
 
 // Клиент → нода: включить или снять для своего аккаунта режим «только по
@@ -545,6 +562,18 @@ message QueueList {
 // `UNSUPPORTED`, флаг не меняется (server-contract.md, §6.9).
 message SetQueueOnly {
   bool enabled = 1;
+}
+
+// Клиент → нода: заменить запись аккаунта, если её текущая версия равна
+// expected_version (0 — записи ещё нет). Новая версия — expected_version + 1.
+// Не совпала — отказ `CONFLICT`, запись не меняется; из двух одновременных
+// замен с одной ожидаемой версией проходит ровно одна. Ответ — QueueAck
+// (`queue_id` пуст). Требует права QUEUES. Содержимое ноде непрозрачно
+// (клиент шифрует), не длиннее 4 КиБ (иначе `INVALID`); пустая запись —
+// обычное значение. Работает независимо от адресации по очередям.
+message SetAccountRecord {
+  bytes record = 1;
+  uint64 expected_version = 2;
 }
 
 message Ping {}
@@ -577,5 +606,6 @@ message Frame {
     QueueAck queue_ack = 18;
     QueueList queue_list = 19;
     SetQueueOnly set_queue_only = 20;
+    SetAccountRecord set_account_record = 21;
   }
 }

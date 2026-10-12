@@ -19,7 +19,7 @@ use trust_message_tcp::net::framing::{
     encode_queue_list, encode_send_ack, encode_signed_server_config,
 };
 use trust_message_tcp::net::noise::{NodeIdentity, NodeKeySource};
-use trust_message_tcp::state::queues::QueueRecord;
+use trust_message_tcp::state::queues::{AccountRecord, QueueRecord};
 use trust_message_tcp::wire::{self, Frame, frame};
 
 const PROTO_VERSION: u32 = 1;
@@ -184,7 +184,19 @@ fn main() -> Result<()> {
                 },
             ],
             true,
+            Some(&AccountRecord {
+                version: 3,
+                record: vec![0xEE; 64],
+            }),
         ),
+    )?;
+    write(
+        &dir,
+        "set_account_record.bin",
+        &wrap(frame::Payload::SetAccountRecord(wire::SetAccountRecord {
+            record: vec![0xEE; 64],
+            expected_version: 2,
+        })),
     )?;
     write(
         &dir,

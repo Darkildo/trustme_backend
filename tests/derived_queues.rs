@@ -11,9 +11,9 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use common::{
-    Conn, NodeOptions, connect, decode, encode_ping, expect_auth_ok, next_frame, random_identity,
-    send_raw_and_read_ack, spawn_node_with, spawn_server, spawn_server_with_queue_addressing,
-    unix_now_secs, user_id_of,
+    Conn, NodeOptions, connect, connect_delegated, decode, device_key, encode_ping, expect_auth_ok,
+    expect_signed_config, issue_device_cert, next_frame, random_identity, send_raw_and_read_ack,
+    spawn_node_with, spawn_server, spawn_server_with_queue_addressing, unix_now_secs, user_id_of,
 };
 use ed25519_dalek::SigningKey;
 use prost::Message;
@@ -88,6 +88,30 @@ async fn list(conn: &mut Conn) -> Result<wire::QueueList> {
         frame::Payload::QueueList(list) => Ok(list),
         other => bail!("expected QueueList, got {other:?}"),
     }
+}
+
+async fn set_account_record(
+    conn: &mut Conn,
+    record: &[u8],
+    expected_version: u64,
+) -> Result<wire::QueueAck> {
+    queue_ack(
+        conn,
+        frame::Payload::SetAccountRecord(wire::SetAccountRecord {
+            record: record.to_vec(),
+            expected_version,
+        }),
+    )
+    .await
+}
+
+async fn server_config(
+    conn: &mut Conn,
+    server: &common::ServerHandle,
+) -> Result<wire::ServerConfig> {
+    conn.send_frame(&common::encode_get_server_config()?)
+        .await?;
+    expect_signed_config(&next_frame(conn).await?, &server.node_public)
 }
 
 fn send_by_queue(queue_id: &[u8], body: &[u8]) -> Vec<u8> {
@@ -343,4 +367,149 @@ async fn a_list_over_the_frame_ceiling_is_refused_not_dropped() -> Result<()> {
         frame::Payload::Pong(_) => Ok(()),
         other => bail!("expected Pong, got {other:?}"),
     }
+}
+
+/// Запись аккаунта: CAS по версии из двух сессий одновременно пропускает
+/// ровно одну, версия растёт на единицу, `ListQueues` отдаёт запись как
+/// есть.
+#[tokio::test]
+async fn account_record_cas_admits_exactly_one_writer() -> Result<()> {
+    let server = spawn_server("dq_record", LimitsConfig::default()).await?;
+    let owner = random_identity();
+    let mut first = session(&server, &owner).await?;
+    let mut second = session(&server, &owner).await?;
+
+    let empty = list(&mut first).await?;
+    assert!(empty.account_record.is_empty());
+    assert_eq!(empty.account_record_version, 0);
+
+    let (a, b) = tokio::join!(
+        set_account_record(&mut first, b"pool-from-first", 0),
+        set_account_record(&mut second, b"pool-from-second", 0)
+    );
+    let (a, b) = (a?, b?);
+    assert_eq!(
+        u8::from(a.ok) + u8::from(b.ok),
+        1,
+        "exactly one CAS must win: {a:?} / {b:?}"
+    );
+    let loser = if a.ok { &b } else { &a };
+    assert_eq!(loser.reason, QueueRejectReason::Conflict as i32);
+    assert!(a.queue_id.is_empty() && b.queue_id.is_empty());
+
+    let listed = list(&mut second).await?;
+    assert_eq!(listed.account_record_version, 1);
+    let winner: &[u8] = if a.ok {
+        b"pool-from-first"
+    } else {
+        b"pool-from-second"
+    };
+    assert_eq!(listed.account_record, winner);
+
+    // Проигравший перечитал и пишет поверх свежей версии.
+    assert!(set_account_record(&mut first, b"merged", 1).await?.ok);
+    // Устаревшая версия — CONFLICT, запись не меняется.
+    let stale = set_account_record(&mut second, b"stale", 1).await?;
+    assert_eq!(stale.reason, QueueRejectReason::Conflict as i32);
+    let listed = list(&mut second).await?;
+    assert_eq!(listed.account_record, b"merged");
+    assert_eq!(listed.account_record_version, 2);
+
+    // Длиннее 4 КиБ — INVALID.
+    let oversized = set_account_record(&mut first, &[0u8; 4097], 2).await?;
+    assert_eq!(oversized.reason, QueueRejectReason::Invalid as i32);
+    assert_eq!(list(&mut first).await?.account_record_version, 2);
+    Ok(())
+}
+
+/// Делегированная сессия без права `QUEUES` запись не меняет; с ним —
+/// меняет.
+#[tokio::test]
+async fn account_record_needs_the_queues_scope() -> Result<()> {
+    let server = spawn_server("dq_record_scope", LimitsConfig::default()).await?;
+    let account = random_identity();
+    let account_id = user_id_of(&account);
+    let now = unix_now_secs();
+    let send_only = wire::DeviceCertScope::Send as u32;
+    let with_queues = send_only | wire::DeviceCertScope::Queues as u32;
+
+    let device = device_key();
+    let cert = issue_device_cert(&account, 5, &device.public, send_only, now, now + 3600);
+    let mut conn = connect_delegated(&server, &account_id, &device, 5, cert).await?;
+    expect_auth_ok(&next_frame(&mut conn).await?, &account_id)?;
+    let ack = set_account_record(&mut conn, b"nope", 0).await?;
+    assert!(!ack.ok);
+    assert_eq!(ack.reason, QueueRejectReason::Forbidden as i32);
+
+    let device = device_key();
+    let cert = issue_device_cert(&account, 6, &device.public, with_queues, now, now + 3600);
+    let mut conn = connect_delegated(&server, &account_id, &device, 6, cert).await?;
+    expect_auth_ok(&next_frame(&mut conn).await?, &account_id)?;
+    assert!(set_account_record(&mut conn, b"pool", 0).await?.ok);
+    assert_eq!(list(&mut conn).await?.account_record_version, 1);
+    Ok(())
+}
+
+/// `supports_derived_queues` объявлен всегда — от адресации по очередям он
+/// не зависит.
+#[tokio::test]
+async fn derived_queues_are_always_advertised() -> Result<()> {
+    for queue_addressing in [false, true] {
+        let server = if queue_addressing {
+            spawn_server_with_queue_addressing("dq_caps_on", LimitsConfig::default()).await?
+        } else {
+            spawn_server("dq_caps_off", LimitsConfig::default()).await?
+        };
+        let owner = random_identity();
+        let mut conn = session(&server, &owner).await?;
+        let config = server_config(&mut conn, &server).await?;
+        assert_eq!(config.supports_queue_addressing, queue_addressing);
+        assert!(config.supports_derived_queues);
+    }
+    Ok(())
+}
+
+/// `ListQueues` целиком: режим, живые (со сроком и без), надгробия и
+/// запись аккаунта с версией.
+#[tokio::test]
+async fn list_queues_reflects_the_whole_account_state() -> Result<()> {
+    let server = spawn_server_with_queue_addressing("dq_list_all", LimitsConfig::default()).await?;
+    let owner = random_identity();
+    let mut conn = session(&server, &owner).await?;
+    let expires_at = unix_now_secs() + 3600;
+
+    let forever = allocate(&mut conn, &[], 0, false).await?.queue_id;
+    let expiring = allocate(&mut conn, &[0x61; 32], expires_at, false)
+        .await?
+        .queue_id;
+    let revoked = allocate(&mut conn, &[0x62; 32], 0, false).await?.queue_id;
+    assert!(revoke(&mut conn, &revoked).await?.ok);
+    let seeded = allocate(&mut conn, &[0x63; 32], 0, true).await?.queue_id;
+    assert!(
+        queue_ack(
+            &mut conn,
+            frame::Payload::SetQueueOnly(wire::SetQueueOnly { enabled: true })
+        )
+        .await?
+        .ok
+    );
+    assert!(set_account_record(&mut conn, b"sealed-pool", 0).await?.ok);
+
+    let listed = list(&mut conn).await?;
+    assert!(listed.queue_only);
+    assert_eq!(listed.account_record, b"sealed-pool");
+    assert_eq!(listed.account_record_version, 1);
+    assert_eq!(listed.queues.len(), 4);
+
+    let live = record(&listed, &forever).unwrap();
+    assert!(live.created_at > 0);
+    assert_eq!((live.revoked_at, live.expires_at), (0, 0));
+    let live = record(&listed, &expiring).unwrap();
+    assert_eq!((live.revoked_at, live.expires_at), (0, expires_at));
+    for id in [&revoked, &seeded] {
+        let tombstone = record(&listed, id).unwrap();
+        assert_eq!(tombstone.created_at, 0);
+        assert!(tombstone.revoked_at > 0);
+    }
+    Ok(())
 }

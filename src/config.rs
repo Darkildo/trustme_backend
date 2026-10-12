@@ -508,6 +508,13 @@ impl ServerConfigSnapshot {
         self.supports_queue_addressing
     }
 
+    /// Очереди по тегу, надгробия и запись аккаунта (§6.7 контракта).
+    /// Операции control-канала от адресации по очередям не зависят, поэтому
+    /// всегда `true`.
+    pub fn supports_derived_queues(&self) -> bool {
+        true
+    }
+
     pub fn supports_offline_messages(&self) -> bool {
         !self.offline_messages_retention.is_immediate()
     }
