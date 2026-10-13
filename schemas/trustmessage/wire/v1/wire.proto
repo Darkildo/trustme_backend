@@ -215,14 +215,15 @@ message ClientSend {
 }
 
 // Нода → клиент: судьба отправленного конверта. Смысл флагов зависит от
-// бэкенда доставки (`ServerConfig.supports_delivery_ack`):
+// бэкенда доставки:
 //
 //   * `ok = true, queued = true` — брокерный бэкенд: опубликовано в поток,
 //     `queue_id` = `message_id` конверта;
-//   * `ok = true, queued = false` — прямой бэкенд: доставлено в живую
-//     сессию получателя;
-//   * `ok = false, queued = true` — прямой бэкенд: положено в офлайн-очередь,
-//     `queue_id` — идентификатор записи в ней;
+//   * `ok = true, queued = false` — прямой бэкенд: уведомление принято
+//     живой сессией получателя; `queue_id` — `message_id` записи в очереди
+//     (0, если хранение выключено);
+//   * `ok = false, queued = true` — прямой бэкенд: положено в очередь,
+//     `queue_id` — `message_id` записи в ней;
 //   * `ok = false, queued = false` — не принято, см. `reason`.
 //
 // `queue_id` здесь — идентификатор принятого конверта, с mailbox-очередью
@@ -234,8 +235,9 @@ message SendAck {
   SendRejectReason reason = 4;
 }
 
-// Клиент → нода: подтверждение получения конверта (at-least-once на
-// брокерном бэкенде).
+// Клиент → нода: подтверждение получения конверта (at-least-once). Без
+// него конверт выдаётся снова: брокерным бэкендом — по ack-таймауту
+// потока, прямым (с 0.4.0) — по `SLED_ACK_WAIT_SECS` и следующей сессии.
 message DeliveryAck {
   uint64 message_id = 1;
 }
@@ -251,8 +253,10 @@ message IncomingMessage {
   // (nonce не повторяется), поэтому её ловит только идентификатор внутри
   // E2E-конверта. См. server-contract.md, «Дедупликация входящих».
   //
-  // 0 для доставки в живую сессию на прямом (sled) бэкенде: подтверждать
-  // нечего.
+  // 0 только на прямом (sled) бэкенде с выключенным хранением
+  // (`offline_messages_retention = immediate`) и у нод до 0.4.0 при
+  // доставке в живую сессию: подтверждать нечего. Флага «повторная выдача»
+  // нет — повтор узнаётся по этому идентификатору.
   uint64 message_id = 4;
   // Переслан из ClientSend.
   MessagePriority priority = 5;
@@ -371,6 +375,8 @@ message ServerConfig {
   bool supports_deleted_message_archive = 5;
   RetentionConfig offline_messages_retention = 6;
   RetentionConfig deleted_messages_retention = 7;
+  // Нода ждёт DeliveryAck на каждый IncomingMessage с ненулевым
+  // message_id: брокерный бэкенд и прямой с хранением (с 0.4.0).
   bool supports_delivery_ack = 8;
   // Статик ноды (X25519, 32 байта), с которым клиент прошёл
   // Noise-хендшейк. Повторяется здесь, чтобы оказаться под подписью:
