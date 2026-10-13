@@ -23,9 +23,12 @@
 //! Неудачей считается только выдача, про которую доказано, что клиент жив и
 //! её не подтвердил: «не успел обработать» — не неудача. Доказательство —
 //! клиент подтвердил то, что ему выдали позже (клиент обрабатывает по
-//! порядку, значит, этот конверт он отверг), либо, если сессия не прислала
-//! ни одного подтверждения вовсе, любой кадр клиента после выдачи (клиент
-//! без `DeliveryAck`). Мёртвый сокет (телефон пропал без FIN) кадров не
+//! порядку, значит, этот конверт он отверг; «позже» — по первой выдаче
+//! записи в сессии, повтор номер не меняет), либо любой кадр клиента после
+//! выдачи — но только у сессии, которая за всю жизнь не прислала ни одного
+//! `DeliveryAck` и прожила дольше [`LEGACY_PROOF_AGE_FACTOR`] сроков
+//! `ack_wait` (клиент без подтверждений, а не клиент, который ещё не успел
+//! подтвердить первое). Мёртвый сокет (телефон пропал без FIN) кадров не
 //! шлёт и неудач не копит, а рвёт его `TCP_USER_TIMEOUT`. Сессия, ушедшая
 //! с хвостом необработанного (короткое фоновое пробуждение), засчитывает
 //! неудачу только записям раньше последней подтверждённой.
@@ -34,7 +37,7 @@
 //! области подтверждения); отличия — в документации `docs/architecture.md`.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashMap};
 
 use anyhow::Result;
 use tokio::time::Instant;
@@ -44,6 +47,12 @@ pub use crate::config::SledAckConfig;
 use crate::observability;
 use crate::state::registry::{ConnRegistry, ConnectionId, DeviceId, UserId};
 use crate::state::storage::{InboxScope, Storage, StoredMessage};
+
+/// Сколько сроков `ack_wait` должна прожить сессия без единого
+/// `DeliveryAck`, чтобы её кадры после выдачи считались доказательством
+/// неподтверждения (клиент без подтверждений). Раньше молчание об ack —
+/// скорее медленная обработка первого конверта, чем старый клиент.
+pub const LEGACY_PROOF_AGE_FACTOR: u32 = 3;
 
 /// Что делать с уведомлением из канала сессии.
 #[derive(Debug, PartialEq, Eq)]
@@ -101,9 +110,14 @@ pub struct SledSession {
     /// `next_seq` на момент последнего кадра клиента: выдачи с меньшим
     /// номером клиент застал живым.
     frame_seq: u64,
-    /// Истёкшие и ждущие повторной выдачи — для метрики повторов, когда
-    /// счётчик неудач не ведётся.
-    expired: HashSet<u64>,
+    /// Истёкшие и ждущие повторной выдачи → номер их первой выдачи в
+    /// сессии. Повтор сохраняет номер: подтверждение после повтора иначе
+    /// сопоставлялось бы с поздним номером, и более ранние неподтверждённые
+    /// выдачи выглядели бы отвергнутыми.
+    redeliver: HashMap<u64, u64>,
+    /// Прислала ли сессия хоть один `DeliveryAck` (любой, даже чужой).
+    acks_seen: bool,
+    started: Instant,
 }
 
 impl SledSession {
@@ -131,7 +145,9 @@ impl SledSession {
             next_seq: 1,
             acked_seq: 0,
             frame_seq: 0,
-            expired: HashSet::new(),
+            redeliver: HashMap::new(),
+            acks_seen: false,
+            started: Instant::now(),
         }
     }
 
@@ -142,8 +158,19 @@ impl SledSession {
 
     /// Доказано ли, что живой клиент выдачу `seq` не подтвердил, а не просто
     /// не успел обработать (см. документацию модуля).
-    fn proven_unacked(&self, seq: u64) -> bool {
-        seq < self.acked_seq || (self.acked_seq == 0 && seq < self.frame_seq)
+    fn proven_unacked(&self, seq: u64, now: Instant) -> bool {
+        if seq < self.acked_seq {
+            return true;
+        }
+        let legacy_age = self.cfg.ack_wait * LEGACY_PROOF_AGE_FACTOR;
+        !self.acks_seen
+            && now.saturating_duration_since(self.started) >= legacy_age
+            && seq < self.frame_seq
+    }
+
+    /// Забыть запись, которую выдавать снова не придётся.
+    fn forget(&mut self, id: u64) {
+        self.redeliver.remove(&id);
     }
 
     /// Ведётся ли счёт неудач: только при заданном пределе выдач.
@@ -260,23 +287,23 @@ impl SledSession {
     pub fn prepare(&mut self, scope: InboxScope, id: u64) -> Result<WriteDecision> {
         if !self.counts_failures() {
             if !self.storage.inbox_contains(&self.user_id, scope, id)? {
-                self.expired.remove(&id);
+                self.forget(id);
                 return Ok(WriteDecision::Skip);
             }
             return Ok(WriteDecision::Deliver {
                 last: false,
-                redelivery: self.expired.remove(&id),
+                redelivery: self.redeliver.contains_key(&id),
             });
         }
         Ok(
             match self.storage.inbox_failures(&self.user_id, scope, id)? {
                 None => {
-                    self.expired.remove(&id);
+                    self.forget(id);
                     WriteDecision::Skip
                 }
                 Some(failures) => WriteDecision::Deliver {
                     last: failures.saturating_add(1) >= self.cfg.max_deliveries,
-                    redelivery: self.expired.remove(&id) || failures > 0,
+                    redelivery: self.redeliver.contains_key(&id) || failures > 0,
                 },
             },
         )
@@ -285,6 +312,7 @@ impl SledSession {
     /// Запись `id` отдана в сокет. Последняя выдача удаляет её; иначе она
     /// ждёт подтверждения в окне.
     pub fn written(&mut self, scope: InboxScope, id: u64, last: bool) -> Result<()> {
+        let first_seq = self.redeliver.remove(&id);
         if last {
             if self.storage.remove_inbox_record(&self.user_id, scope, id)? {
                 observability::observe_sled_delivery_given_up();
@@ -299,8 +327,11 @@ impl SledSession {
             return Ok(());
         }
         let deadline = Instant::now() + self.cfg.ack_wait;
-        let seq = self.next_seq;
-        self.next_seq += 1;
+        let seq = first_seq.unwrap_or_else(|| {
+            let seq = self.next_seq;
+            self.next_seq += 1;
+            seq
+        });
         self.pending.insert(
             id,
             Pending {
@@ -316,6 +347,10 @@ impl SledSession {
     /// `DeliveryAck` этой сессии. Место в окне освобождается в любом
     /// случае; `true` — запись была и снята.
     pub fn ack(&mut self, id: u64) -> Result<bool> {
+        self.acks_seen = true;
+        if let Some(first_seq) = self.redeliver.remove(&id) {
+            self.acked_seq = self.acked_seq.max(first_seq);
+        }
         if let Some(pending) = self.pending.remove(&id) {
             self.acked_seq = self.acked_seq.max(pending.seq);
         }
@@ -357,7 +392,7 @@ impl SledSession {
                 continue;
             }
             self.pending.remove(&id);
-            if self.counts_failures() && self.proven_unacked(pending.seq) {
+            if self.counts_failures() && self.proven_unacked(pending.seq, now) {
                 // Записи нет — её подтвердила другая сессия аккаунта или
                 // она истекла; счёт тогда ничего не меняет.
                 self.storage
@@ -366,8 +401,21 @@ impl SledSession {
             // Запись, которой уже нет, дочитывание просто не найдёт.
             expired += 1;
             observability::observe_sled_ack_timeout();
-            self.expired.insert(id);
+            self.redeliver.insert(id, pending.seq);
             self.mark(pending.scope, id);
+        }
+        // Записи, подтверждённые другой сессией, дочитывание уже не найдёт,
+        // и из карты они сами не уйдут; держать их дольше, чем помещается
+        // в несколько окон, незачем — потеряется только метка «повтор».
+        if self.redeliver.len() > self.cfg.max_unacked.max(1).saturating_mul(4) {
+            let storage = &self.storage;
+            let user_id = self.user_id;
+            let device_id = self.device_id;
+            self.redeliver.retain(|id, _| {
+                storage
+                    .ack_inbox_probe(&user_id, device_id, *id)
+                    .unwrap_or(true)
+            });
         }
         if expired > 0 {
             debug!(
@@ -600,7 +648,8 @@ mod tests {
             deliveries += deliver_all(&mut s).len();
             s.note_client_frame();
             if let Some(deadline) = s.next_deadline() {
-                s.expire(deadline).unwrap();
+                // Сессия старше `LEGACY_PROOF_AGE_FACTOR` сроков.
+                s.expire(deadline + Duration::from_secs(90)).unwrap();
             }
         }
         assert_eq!(deliveries, 3);
@@ -731,6 +780,82 @@ mod tests {
             None
         );
         drop(s);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// Повтор сохраняет номер первой выдачи: подтверждение повторённой
+    /// записи не делает «отвергнутыми» выданные между оригиналом и повтором.
+    #[tokio::test]
+    async fn ack_of_a_redelivery_is_matched_to_the_first_delivery() {
+        let (storage, path) = storage("first_seq");
+        let a = enqueue(&storage, b"a");
+        let mut s = session(&storage, cfg(3, 4), None);
+        assert_eq!(deliver_all(&mut s), vec![a]);
+        let deadline_a = s.next_deadline().unwrap();
+        let b = enqueue(&storage, b"b");
+        s.resync();
+        assert_eq!(deliver_all(&mut s), vec![b]);
+        // Срок вышел только у `a`; медленный клиент ещё обрабатывает.
+        assert_eq!(s.expire(deadline_a).unwrap(), 1);
+        assert_eq!(deliver_all(&mut s), vec![a]);
+        assert!(s.ack(a).unwrap());
+        drop(s);
+        assert_eq!(
+            storage.inbox_failures(&ME, InboxScope::Account, b).unwrap(),
+            Some(0),
+            "b was delivered after a's first delivery and must not count"
+        );
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// Кадры после выдачи доказывают неподтверждение только у сессии без
+    /// единого `DeliveryAck`, прожившей дольше `LEGACY_PROOF_AGE_FACTOR`
+    /// сроков: клиент с подтверждениями, который ещё обрабатывает первый
+    /// конверт и пингует, неудач не копит.
+    #[tokio::test]
+    async fn frames_prove_nothing_for_young_or_acking_sessions() {
+        let (storage, path) = storage("legacy_rule");
+        let id = enqueue(&storage, b"slow");
+        let mut s = session(&storage, cfg(3, 4), None);
+        assert_eq!(deliver_all(&mut s), vec![id]);
+        s.note_client_frame();
+        let deadline = s.next_deadline().unwrap();
+        s.expire(deadline).unwrap();
+        assert_eq!(
+            storage
+                .inbox_failures(&ME, InboxScope::Account, id)
+                .unwrap(),
+            Some(0),
+            "young session"
+        );
+        // Сессия прислала хоть один ack (пусть и чужой записи) — старой она
+        // уже не считается, сколько бы ни жила.
+        s.ack(u64::MAX).unwrap();
+        assert_eq!(deliver_all(&mut s), vec![id]);
+        s.note_client_frame();
+        let deadline = s.next_deadline().unwrap();
+        s.expire(deadline + Duration::from_secs(90)).unwrap();
+        assert_eq!(
+            storage
+                .inbox_failures(&ME, InboxScope::Account, id)
+                .unwrap(),
+            Some(0),
+            "acking session"
+        );
+        drop(s);
+        // Старая сессия без единого ack — клиент без подтверждений.
+        let mut legacy = session(&storage, cfg(3, 4), None);
+        assert_eq!(deliver_all(&mut legacy), vec![id]);
+        legacy.note_client_frame();
+        let deadline = legacy.next_deadline().unwrap();
+        legacy.expire(deadline + Duration::from_secs(90)).unwrap();
+        assert_eq!(
+            storage
+                .inbox_failures(&ME, InboxScope::Account, id)
+                .unwrap(),
+            Some(1)
+        );
+        drop(legacy);
         let _ = std::fs::remove_dir_all(path);
     }
 

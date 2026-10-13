@@ -320,9 +320,10 @@ impl SessionLimits {
     }
 }
 
-/// Ключ вердикта: очередь получателя и, для под-квоты пары, отправитель
-/// (`None` — переполнена вся очередь).
-type QueueFullKey = (UserId, Option<DeviceId>, Option<UserId>);
+/// Ключ вердикта: очередь получателя и, для под-квоты пары, отправитель с
+/// потолком, по которому вердикт вынесен (`None` — переполнена вся
+/// очередь). Потолок в ключе: у живого и офлайн-получателя он разный.
+type QueueFullKey = (UserId, Option<DeviceId>, Option<(UserId, u64)>);
 
 /// Вердикт «очередь полна» на [`QueueFullCache::TTL`].
 ///
@@ -341,29 +342,41 @@ impl QueueFullCache {
     /// Сколько ключей держать, прежде чем вычистить истёкшие.
     const SWEEP_AT: usize = 4096;
 
-    /// Свежий вердикт «полна» для очереди или для пары с `sender`.
-    pub fn is_full(&self, recipient: &UserId, device: Option<DeviceId>, sender: &UserId) -> bool {
+    /// Свежий вердикт «полна» для очереди или, если под-квота пары
+    /// действует (`pair_ceiling > 0`), для пары с `sender` при этом потолке.
+    pub fn is_full(
+        &self,
+        recipient: &UserId,
+        device: Option<DeviceId>,
+        sender: &UserId,
+        pair_ceiling: u64,
+    ) -> bool {
         let now = std::time::Instant::now();
-        [None, Some(*sender)].into_iter().any(|sender| {
-            self.until
-                .get(&(*recipient, device, sender))
-                .is_some_and(|until| *until > now)
+        let pair = (pair_ceiling > 0).then_some((*sender, pair_ceiling));
+        [None, pair].into_iter().enumerate().any(|(index, key)| {
+            (index == 0 || key.is_some())
+                && self
+                    .until
+                    .get(&(*recipient, device, key))
+                    .is_some_and(|until| *until > now)
         })
     }
 
-    /// Запомнить вердикт: `pair_only` — упёрлась только под-квота пары.
+    /// Запомнить вердикт: `pair_only` — упёрлась только под-квота пары с
+    /// потолком `pair_ceiling`.
     pub fn remember(
         &self,
         recipient: &UserId,
         device: Option<DeviceId>,
         sender: &UserId,
+        pair_ceiling: u64,
         pair_only: bool,
     ) {
         let now = std::time::Instant::now();
         if self.until.len() >= Self::SWEEP_AT {
             self.until.retain(|_, until| *until > now);
         }
-        let sender = pair_only.then_some(*sender);
+        let sender = pair_only.then_some((*sender, pair_ceiling));
         self.until
             .insert((*recipient, device, sender), now + Self::TTL);
     }

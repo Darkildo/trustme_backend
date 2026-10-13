@@ -897,14 +897,15 @@ pub async fn handle_conn(
                           // меряют неподтверждённое и действуют и для живого
                           // получателя: иначе не подтверждающая сессия копила
                           // бы записи без предела. Под-квота пары
-                          // отправитель→получатель для живого получателя не
-                          // действует: она защищает офлайн-очередь от одного
-                          // громкого отправителя, а у живого получателя записи
+                          // отправитель→получатель для живого получателя
+                          // поднята на окно неподтверждённых: у него записи
                           // уходят по подтверждениям, и быстрый, но честный
-                          // поток одного отправителя упирался бы в неё ещё до
-                          // первого `DeliveryAck`. Общие потолки очереди
-                          // остаются. Брокерный путь ограничен лимитами самого
-                          // потока JetStream и сюда не заходит.
+                          // поток одного отправителя упирался бы в обычную
+                          // под-квоту ещё до первого `DeliveryAck`, а без
+                          // под-квоты вовсе один отправитель занимал бы всю
+                          // очередь живого, но медленного получателя.
+                          // Брокерный путь ограничен лимитами самого потока
+                          // JetStream и сюда не заходит.
                           let mut depth_before = None;
                           if durable || !recipient_online {
                               let quota = match queue_quota_reason(
@@ -913,7 +914,11 @@ pub async fn handle_conn(
                                   &recipient,
                                   recipient_device_id,
                                   &user_id,
-                                  !recipient_online,
+                                  sender_pair_ceiling(
+                                      &limits,
+                                      recipient_online,
+                                      delivery_backend.sled_ack_config(),
+                                  ),
                               ) {
                                   Ok(quota) => quota,
                                   Err(err) => {
@@ -1842,17 +1847,13 @@ fn queue_quota_reason(
     recipient: &UserId,
     recipient_device_id: Option<DeviceId>,
     sender: &UserId,
-    sender_pair: bool,
+    pair_ceiling: u64,
 ) -> Result<QuotaVerdict> {
     let cfg = &limits.cfg;
     let ceilings = QueueQuotaCeilings {
         messages: cfg.max_messages_per_queue as u64,
         bytes: cfg.max_bytes_per_queue,
-        from_sender: if sender_pair {
-            cfg.max_messages_sender_pair as u64
-        } else {
-            0
-        },
+        from_sender: pair_ceiling,
     };
 
     if ceilings.messages == 0 && ceilings.bytes == 0 && ceilings.from_sender == 0 {
@@ -1863,7 +1864,7 @@ fn queue_quota_reason(
     }
     if limits
         .queue_full
-        .is_full(recipient, recipient_device_id, sender)
+        .is_full(recipient, recipient_device_id, sender, pair_ceiling)
     {
         return Ok(QuotaVerdict {
             reason: Some(SendRejectReason::Full),
@@ -1876,9 +1877,13 @@ fn queue_quota_reason(
         || (ceilings.bytes > 0 && scan.bytes >= ceilings.bytes);
     let pair_full = ceilings.from_sender > 0 && scan.from_sender >= ceilings.from_sender;
     let reason = if queue_full || pair_full {
-        limits
-            .queue_full
-            .remember(recipient, recipient_device_id, sender, !queue_full);
+        limits.queue_full.remember(
+            recipient,
+            recipient_device_id,
+            sender,
+            pair_ceiling,
+            !queue_full,
+        );
         Some(SendRejectReason::Full)
     } else {
         None
@@ -1890,6 +1895,21 @@ fn queue_quota_reason(
         // лога стоил бы ещё одного полного прохода по очереди.
         depth_before: (!scan.truncated).then_some(scan.messages),
     })
+}
+
+/// Потолок под-квоты пары отправитель→получатель; `0` — не действует.
+/// Живому получателю с подтверждениями он поднят на окно
+/// неподтверждённых сессии (`SLED_MAX_UNACKED_PER_SESSION`).
+fn sender_pair_ceiling(
+    limits: &SessionLimits,
+    recipient_online: bool,
+    ack: Option<crate::config::SledAckConfig>,
+) -> u64 {
+    let base = limits.cfg.max_messages_sender_pair as u64;
+    match ack {
+        Some(ack) if recipient_online && base > 0 => base.saturating_add(ack.max_unacked as u64),
+        _ => base,
+    }
 }
 
 /// Ответ квоты плюс глубина очереди, посчитанная попутно.
@@ -2857,16 +2877,30 @@ mod tests {
         }
 
         assert_eq!(
-            queue_quota_reason(&storage, &limits, &recipient, None, &sender, true)
-                .unwrap()
-                .reason,
+            queue_quota_reason(
+                &storage,
+                &limits,
+                &recipient,
+                None,
+                &sender,
+                limits.cfg.max_messages_sender_pair as u64
+            )
+            .unwrap()
+            .reason,
             Some(SendRejectReason::Full)
         );
         // Очередь другого получателя не затронута.
         assert_eq!(
-            queue_quota_reason(&storage, &limits, &[7u8; 32], None, &sender, true)
-                .unwrap()
-                .reason,
+            queue_quota_reason(
+                &storage,
+                &limits,
+                &[7u8; 32],
+                None,
+                &sender,
+                limits.cfg.max_messages_sender_pair as u64
+            )
+            .unwrap()
+            .reason,
             None
         );
 
@@ -2892,9 +2926,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            queue_quota_reason(&storage, &limits, &recipient, None, &sender, true)
-                .unwrap()
-                .reason,
+            queue_quota_reason(
+                &storage,
+                &limits,
+                &recipient,
+                None,
+                &sender,
+                limits.cfg.max_messages_sender_pair as u64
+            )
+            .unwrap()
+            .reason,
             Some(SendRejectReason::Full)
         );
 
@@ -2924,16 +2965,30 @@ mod tests {
         }
 
         assert_eq!(
-            queue_quota_reason(&storage, &limits, &recipient, None, &loud, true)
-                .unwrap()
-                .reason,
+            queue_quota_reason(
+                &storage,
+                &limits,
+                &recipient,
+                None,
+                &loud,
+                limits.cfg.max_messages_sender_pair as u64
+            )
+            .unwrap()
+            .reason,
             Some(SendRejectReason::Full)
         );
         // Другой отправитель в ту же очередь всё ещё проходит.
         assert_eq!(
-            queue_quota_reason(&storage, &limits, &recipient, None, &quiet, true)
-                .unwrap()
-                .reason,
+            queue_quota_reason(
+                &storage,
+                &limits,
+                &recipient,
+                None,
+                &quiet,
+                limits.cfg.max_messages_sender_pair as u64
+            )
+            .unwrap()
+            .reason,
             None
         );
 
@@ -2941,34 +2996,50 @@ mod tests {
         let _ = std::fs::remove_dir_all(&path);
     }
 
-    /// Для живого получателя под-квота пары не действует, общие потолки —
-    /// да.
+    /// Для живого получателя под-квота пары поднята на окно
+    /// неподтверждённых, но действует: один отправитель не занимает всю
+    /// очередь живого, но медленного получателя. Вердикт по обычному
+    /// потолку живому получателю не мешает.
     #[test]
-    fn online_recipient_skips_only_the_sender_pair_quota() {
+    fn online_recipient_gets_a_raised_sender_pair_quota() {
         let (storage, path) = open_temp_storage("quota_online_pair");
         let recipient = [20u8; 32];
         let loud = [21u8; 32];
         let limits = limits_with(LimitsConfig {
-            max_messages_per_queue: 3,
+            max_messages_per_queue: 0,
             max_bytes_per_queue: 0,
             max_messages_sender_pair: 2,
             ..LimitsConfig::default()
         });
+        let ack = crate::config::SledAckConfig {
+            max_unacked: 3,
+            ..Default::default()
+        };
+        assert_eq!(sender_pair_ceiling(&limits, false, Some(ack)), 2);
+        assert_eq!(sender_pair_ceiling(&limits, true, Some(ack)), 5);
+        assert_eq!(sender_pair_ceiling(&limits, true, None), 2);
         for _ in 0..2 {
             storage
                 .enqueue_inbox(&recipient, &loud, None, b"burst", None, 0)
                 .unwrap();
         }
-        let online = |sender: &[u8; 32]| {
-            queue_quota_reason(&storage, &limits, &recipient, None, sender, false)
+        let verdict = |ceiling: u64| {
+            queue_quota_reason(&storage, &limits, &recipient, None, &loud, ceiling)
                 .unwrap()
                 .reason
         };
-        assert_eq!(online(&loud), None);
-        storage
-            .enqueue_inbox(&recipient, &loud, None, b"burst", None, 0)
-            .unwrap();
-        assert_eq!(online(&loud), Some(SendRejectReason::Full));
+        assert_eq!(verdict(2), Some(SendRejectReason::Full), "offline");
+        assert_eq!(
+            verdict(5),
+            None,
+            "online, despite the cached offline verdict"
+        );
+        for _ in 0..3 {
+            storage
+                .enqueue_inbox(&recipient, &loud, None, b"burst", None, 0)
+                .unwrap();
+        }
+        assert_eq!(verdict(5), Some(SendRejectReason::Full), "online cap holds");
 
         drop(storage);
         let _ = std::fs::remove_dir_all(&path);
@@ -2992,9 +3063,16 @@ mod tests {
             .unwrap()
             .id;
         let verdict = || {
-            queue_quota_reason(&storage, &limits, &recipient, None, &sender, true)
-                .unwrap()
-                .reason
+            queue_quota_reason(
+                &storage,
+                &limits,
+                &recipient,
+                None,
+                &sender,
+                limits.cfg.max_messages_sender_pair as u64,
+            )
+            .unwrap()
+            .reason
         };
         assert_eq!(verdict(), Some(SendRejectReason::Full));
         storage.remove_inbox(&recipient, id).unwrap();
@@ -3024,15 +3102,29 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            queue_quota_reason(&storage, &limits, &recipient, None, &sender, true)
-                .unwrap()
-                .reason,
+            queue_quota_reason(
+                &storage,
+                &limits,
+                &recipient,
+                None,
+                &sender,
+                limits.cfg.max_messages_sender_pair as u64
+            )
+            .unwrap()
+            .reason,
             Some(SendRejectReason::Full)
         );
         assert_eq!(
-            queue_quota_reason(&storage, &limits, &recipient, Some(7), &sender, true)
-                .unwrap()
-                .reason,
+            queue_quota_reason(
+                &storage,
+                &limits,
+                &recipient,
+                Some(7),
+                &sender,
+                limits.cfg.max_messages_sender_pair as u64
+            )
+            .unwrap()
+            .reason,
             None
         );
 
@@ -3060,9 +3152,16 @@ mod tests {
         }
 
         assert_eq!(
-            queue_quota_reason(&storage, &limits, &recipient, None, &sender, true)
-                .unwrap()
-                .reason,
+            queue_quota_reason(
+                &storage,
+                &limits,
+                &recipient,
+                None,
+                &sender,
+                limits.cfg.max_messages_sender_pair as u64
+            )
+            .unwrap()
+            .reason,
             None
         );
 

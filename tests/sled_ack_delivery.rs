@@ -24,6 +24,7 @@ use ed25519_dalek::SigningKey;
 use tokio::net::TcpSocket;
 use tokio::time::Instant;
 use trust_message_tcp::config::{LimitsConfig, RetentionPolicy, SledAckConfig};
+use trust_message_tcp::delivery::sled_ack::LEGACY_PROOF_AGE_FACTOR;
 use trust_message_tcp::net::noise::NoiseFramed;
 use trust_message_tcp::state::storage::InboxScope;
 use trust_message_tcp::wire::frame;
@@ -316,7 +317,9 @@ async fn collect(
 
 /// Явный предел (`SLED_MAX_DELIVERIES`) для клиента, который
 /// `DeliveryAck` не шлёт: живая сессия пингует, конверт повторяется по
-/// `ack_wait`, и выдача номер три — последняя.
+/// `ack_wait`. Неудачи начинают считаться, когда сессия без единого ack
+/// прожила `LEGACY_PROOF_AGE_FACTOR` сроков, и через три засчитанные выдачи
+/// запись удаляется — повторы кончаются.
 #[tokio::test]
 async fn client_without_acks_gets_a_bounded_number_of_deliveries() -> Result<()> {
     let (server, node) = node("ack_legacy", ack_cfg(Duration::from_millis(200), 3, 1024)).await?;
@@ -330,15 +333,31 @@ async fn client_without_acks_gets_a_bounded_number_of_deliveries() -> Result<()>
     let mut conn = session(&server, &bob, 1).await?;
     let bodies = collect(
         &mut conn,
-        Duration::from_secs(2),
+        Duration::from_secs(3),
         Some(Duration::from_millis(50)),
     )
     .await?;
-    assert_eq!(bodies, vec![b"legacy".to_vec(); 3]);
+    let bound = 3 + LEGACY_PROOF_AGE_FACTOR as usize + 1;
+    assert!(
+        (3..=bound).contains(&bodies.len()),
+        "deliveries: {}",
+        bodies.len()
+    );
+    assert!(bodies.iter().all(|body| body == b"legacy"));
     assert_eq!(
         node.storage
             .inbox_failures(&bob_id, InboxScope::Account, ack.queue_id)?,
         None
+    );
+    assert!(
+        collect(
+            &mut conn,
+            Duration::from_millis(600),
+            Some(Duration::from_millis(50))
+        )
+        .await?
+        .is_empty(),
+        "redelivery must stop after the limit"
     );
     Ok(())
 }
