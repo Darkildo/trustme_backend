@@ -466,19 +466,27 @@ async fn drain_device_inbox(server: &ServerHandle, account: &SigningKey) -> Resu
     Ok(received)
 }
 
-/// Ни один конверт не потерян и не выдан дважды, а отозванная сессия
-/// получила не всё.
+/// Ни один конверт не потерян, а отозванная сессия получила не всё.
+///
+/// Отозванная сессия ничего не подтвердила, поэтому всё, что ей ушло, лежит
+/// в очереди и приходит следующей сессии ещё раз: доставка — «хотя бы
+/// однажды», дубликаты отсеивает клиент.
 fn assert_split(revoked_got: &[usize], later_got: &[usize]) {
     let mut all: Vec<usize> = revoked_got.iter().chain(later_got).copied().collect();
     all.sort_unstable();
-    assert_eq!(
-        all,
-        (0..BULK).collect::<Vec<_>>(),
-        "lost or duplicated envelopes"
-    );
+    all.dedup();
+    assert_eq!(all, (0..BULK).collect::<Vec<_>>(), "lost envelopes");
     assert!(
-        !later_got.is_empty(),
+        revoked_got.len() < BULK,
         "the revoked session must not have drained everything"
+    );
+    let mut later = later_got.to_vec();
+    later.sort_unstable();
+    later.dedup();
+    assert_eq!(
+        later,
+        (0..BULK).collect::<Vec<_>>(),
+        "nothing was acknowledged, so the next session must get every envelope"
     );
 }
 
@@ -520,8 +528,8 @@ async fn revocation_interrupts_the_offline_replay() -> Result<()> {
     Ok(())
 }
 
-/// Прямой бэкенд: конверты, уже лежавшие в канале отозванной сессии,
-/// возвращаются в очередь устройства, а не теряются.
+/// Прямой бэкенд: конверты, уже лежавшие в канале отозванной сессии, не
+/// теряются — они остаются в очереди устройства до подтверждения.
 #[tokio::test]
 async fn envelopes_queued_for_a_revoked_session_go_back_to_the_inbox() -> Result<()> {
     let server = spawn_server("rev_channel", bulk_limits()).await?;

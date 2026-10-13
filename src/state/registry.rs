@@ -36,6 +36,10 @@ pub struct RoutedConnection {
     pub cert_not_before: Option<u64>,
     /// Сигнал «сертификат этой сессии отозван».
     pub revocation: Arc<SessionRevocation>,
+    /// Сигнал «перечитай свои очереди» прямого бэкенда: другая сессия
+    /// получателя ушла, не подтвердив отданное. Разрешение `Notify`
+    /// сохраняется, пока сессия занята, — сигнал не теряется.
+    pub resync: Arc<Notify>,
 }
 
 /// Сигнал отзыва для одной живой сессии. Флаг цикл сессии читает перед
@@ -74,6 +78,8 @@ pub struct Registration {
     pub is_first_for_device: bool,
     /// Сигнал отзыва этой сессии (см. [`ConnRegistry::revoke_delegated`]).
     pub revocation: Arc<SessionRevocation>,
+    /// Сигнал перечитать очереди (см. [`RoutedConnection::resync`]).
+    pub resync: Arc<Notify>,
 }
 
 /// Реестр живых сессий ноды: пользователь → его соединения (с `device_id`,
@@ -115,6 +121,7 @@ impl ConnRegistry {
         tx: mpsc::Sender<OutboundFrame>,
     ) -> Registration {
         let revocation = Arc::new(SessionRevocation::default());
+        let resync = Arc::new(Notify::new());
         let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
         let mut sessions = self.inner.entry(user).or_default();
         let is_first_for_user = sessions.is_empty();
@@ -127,6 +134,7 @@ impl ConnRegistry {
             tx,
             cert_not_before,
             revocation: revocation.clone(),
+            resync: resync.clone(),
         });
 
         Registration {
@@ -134,6 +142,7 @@ impl ConnRegistry {
             is_first_for_user,
             is_first_for_device,
             revocation,
+            resync,
         }
     }
 

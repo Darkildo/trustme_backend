@@ -10,21 +10,37 @@ mod common;
 
 use anyhow::{Result, bail};
 use common::{
-    Conn, FRAME_MAX, connect, connect_as, decode, expect_auth_ok, next_frame, send_and_read_ack,
-    spawn_server,
+    Conn, FRAME_MAX, connect, connect_as, decode, encode_delivery_ack, expect_auth_ok, next_frame,
+    send_and_read_ack, spawn_server,
 };
 use ed25519_dalek::SigningKey;
 use tokio::time::{Duration, timeout};
 use trust_message_tcp::config::LimitsConfig;
 use trust_message_tcp::wire::frame;
 
-/// Собрать все входящие, которые нода отдаст за отведённое окно.
+/// Собрать все входящие, которые нода отдаст за отведённое окно, не
+/// подтверждая их.
 async fn drain_incoming(conn: &mut Conn, window: Duration) -> Result<Vec<Vec<u8>>> {
+    drain(conn, window, false).await
+}
+
+/// То же, с `DeliveryAck` на каждый конверт — как настоящий клиент.
+async fn drain_and_ack(conn: &mut Conn, window: Duration) -> Result<Vec<Vec<u8>>> {
+    drain(conn, window, true).await
+}
+
+async fn drain(conn: &mut Conn, window: Duration, ack: bool) -> Result<Vec<Vec<u8>>> {
     let mut bodies = Vec::new();
     loop {
         match timeout(window, conn.next_frame()).await {
             Ok(Ok(Some(bytes))) => match decode(&bytes)? {
-                frame::Payload::Incoming(msg) => bodies.push(msg.body),
+                frame::Payload::Incoming(msg) => {
+                    if ack {
+                        conn.send_frame(&encode_delivery_ack(msg.message_id))
+                            .await?;
+                    }
+                    bodies.push(msg.body);
+                }
                 // Прочие кадры сессии в счёт не идут.
                 _ => continue,
             },
@@ -67,8 +83,8 @@ async fn offline_message_is_replayed_on_reconnect() -> Result<()> {
     Ok(())
 }
 
-/// Повторное подключение не отдаёт то же сообщение второй раз: очередь
-/// вычищается по мере доставки, а не по факту дренажа.
+/// Повторное подключение не отдаёт подтверждённое сообщение второй раз:
+/// очередь вычищается подтверждением клиента, а не фактом записи в сокет.
 #[tokio::test]
 async fn replayed_message_is_not_delivered_twice() -> Result<()> {
     let server = spawn_server("replay_once", LimitsConfig::default()).await?;
@@ -86,7 +102,7 @@ async fn replayed_message_is_not_delivered_twice() -> Result<()> {
     {
         let mut first = connect(&server, &recipient).await?;
         expect_auth_ok(&next_frame(&mut first).await?, &recipient_id)?;
-        let bodies = drain_incoming(&mut first, Duration::from_millis(400)).await?;
+        let bodies = drain_and_ack(&mut first, Duration::from_millis(400)).await?;
         assert_eq!(bodies, vec![b"once".to_vec()]);
     }
 

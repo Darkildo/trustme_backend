@@ -211,7 +211,10 @@ pub struct ServerConfigSnapshot {
     pub deleted_messages_retention: RetentionPolicy,
     /// `Config::offline_messages_retention`.
     pub offline_messages_retention: RetentionPolicy,
-    /// Подтверждение доставки клиентом: `true` только для JetStream-бэкенда.
+    /// Подтверждение доставки клиентом (`DeliveryAck`): брокерный бэкенд и
+    /// прямой с хранением офлайн-сообщений. Прямой без хранения
+    /// (`OFFLINE_MESSAGES_RETENTION=instant`) отдаёт конверты только в живую
+    /// сессию с `message_id = 0` — подтверждать там нечего.
     pub supports_delivery_ack: bool,
     /// Включена ли адресация по очередям (`QUEUE_ADDRESSING_ENABLED`).
     /// Default: false — `queueId` принимается и игнорируется, доставка идёт
@@ -301,6 +304,36 @@ pub struct DeliveryConfig {
     /// только `SendAck`, но и входящие. При мёртвом брокере короткий
     /// таймаут превращает аварию из «висит» в «быстро отказывает».
     pub nats_publish_timeout: Duration,
+    /// Подтверждения доставки прямого (sled) бэкенда (`SLED_*`).
+    pub sled_ack: SledAckConfig,
+}
+
+/// Параметры подтверждений прямого бэкенда.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SledAckConfig {
+    /// Сколько ждать `DeliveryAck` на отданную запись, прежде чем отдать её
+    /// снова (`SLED_ACK_WAIT_SECS`), сек. Default: 30 с — как `ack_wait`
+    /// брокерного бэкенда.
+    pub ack_wait: Duration,
+    /// Сколько раз запись выдаётся без подтверждения
+    /// (`SLED_MAX_DELIVERIES`). Последняя выдача удаляет запись после
+    /// записи в сокет. `1` — поведение до подтверждений: удаление сразу
+    /// после записи. Default: 10.
+    pub max_deliveries: u32,
+    /// Сколько записей сессия держит отданными и неподтверждёнными
+    /// (`SLED_MAX_UNACKED_PER_SESSION`). Дальше выдача ждёт подтверждений.
+    /// Default: 1024 — как `max_ack_pending` брокерного бэкенда.
+    pub max_unacked: usize,
+}
+
+impl Default for SledAckConfig {
+    fn default() -> Self {
+        Self {
+            ack_wait: Duration::from_secs(30),
+            max_deliveries: 10,
+            max_unacked: 1024,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -508,7 +541,10 @@ impl Config {
             supports_device_addressing: true,
             deleted_messages_retention: self.deleted_messages_retention,
             offline_messages_retention: self.offline_messages_retention,
-            supports_delivery_ack: matches!(self.delivery.backend, DeliveryBackendKind::JetStream),
+            supports_delivery_ack: match self.delivery.backend {
+                DeliveryBackendKind::JetStream => true,
+                DeliveryBackendKind::Sled => !self.offline_messages_retention.is_immediate(),
+            },
             supports_queue_addressing: self.queue_addressing_enabled,
             device_cert_max_ttl: self.device_cert_max_ttl,
             config_ttl: self.server_config_ttl,
@@ -591,6 +627,12 @@ struct RawConfig {
     nats_max_msgs_per_subject: Option<i64>,
     #[serde(default)]
     nats_publish_timeout_ms: Option<u64>,
+    #[serde(default)]
+    sled_ack_wait_secs: Option<u64>,
+    #[serde(default)]
+    sled_max_deliveries: Option<u32>,
+    #[serde(default)]
+    sled_max_unacked_per_session: Option<usize>,
     #[serde(default)]
     push_enabled: Option<bool>,
     #[serde(default)]
@@ -718,6 +760,9 @@ pub fn load() -> anyhow::Result<Config> {
         nats_stream_max_bytes,
         nats_max_msgs_per_subject,
         nats_publish_timeout_ms,
+        sled_ack_wait_secs,
+        sled_max_deliveries,
+        sled_max_unacked_per_session,
         push_enabled,
         push_gateway_url,
         push_gateway_timeout_ms,
@@ -798,7 +843,7 @@ pub fn load() -> anyhow::Result<Config> {
         parse_retention_policy(deleted_messages_retention, 30, "DELETED_MESSAGES_RETENTION")?;
     let offline_messages_retention =
         parse_retention_policy(offline_messages_retention, 30, "OFFLINE_MESSAGES_RETENTION")?;
-    let delivery = resolve_delivery(
+    let mut delivery = resolve_delivery(
         delivery_backend,
         nats_url,
         nats_stream_name,
@@ -808,6 +853,11 @@ pub fn load() -> anyhow::Result<Config> {
         nats_stream_max_bytes,
         nats_max_msgs_per_subject,
         nats_publish_timeout_ms,
+    )?;
+    delivery.sled_ack = resolve_sled_ack(
+        sled_ack_wait_secs,
+        sled_max_deliveries,
+        sled_max_unacked_per_session,
     )?;
     let push = resolve_push(PushRawConfig {
         enabled: push_enabled,
@@ -1269,6 +1319,37 @@ fn resolve_delivery(
         nats_stream_max_bytes: stream_max_bytes,
         nats_max_msgs_per_subject: max_msgs_per_subject,
         nats_publish_timeout: Duration::from_millis(publish_timeout_ms),
+        sled_ack: SledAckConfig::default(),
+    })
+}
+
+/// `SLED_ACK_WAIT_SECS`, `SLED_MAX_DELIVERIES`,
+/// `SLED_MAX_UNACKED_PER_SESSION` поверх значений по умолчанию.
+fn resolve_sled_ack(
+    ack_wait_secs: Option<u64>,
+    max_deliveries: Option<u32>,
+    max_unacked: Option<usize>,
+) -> anyhow::Result<SledAckConfig> {
+    let defaults = SledAckConfig::default();
+    let ack_wait = match ack_wait_secs {
+        None => defaults.ack_wait,
+        Some(0) => bail!("SLED_ACK_WAIT_SECS must be greater than 0"),
+        Some(secs) => Duration::from_secs(secs),
+    };
+    let max_deliveries = match max_deliveries {
+        None => defaults.max_deliveries,
+        Some(0) => bail!("SLED_MAX_DELIVERIES must be at least 1 (1 = no redelivery)"),
+        Some(value) => value,
+    };
+    let max_unacked = match max_unacked {
+        None => defaults.max_unacked,
+        Some(0) => bail!("SLED_MAX_UNACKED_PER_SESSION must be greater than 0"),
+        Some(value) => value,
+    };
+    Ok(SledAckConfig {
+        ack_wait,
+        max_deliveries,
+        max_unacked,
     })
 }
 
@@ -1348,8 +1429,8 @@ fn check_tcp_keepalive(limits: &LimitsConfig) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LimitsConfig, PushRawConfig, RetentionPolicy, check_tcp_keepalive, parse_retention_policy,
-        read_raw, resolve_delivery, resolve_push,
+        LimitsConfig, PushRawConfig, RetentionPolicy, SledAckConfig, check_tcp_keepalive,
+        parse_retention_policy, read_raw, resolve_delivery, resolve_push, resolve_sled_ack,
     };
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1661,5 +1742,74 @@ mod tests {
         assert_eq!(raw.nats_url.as_deref(), Some("nats://from-file:4222"));
         assert_eq!(raw.bind_port, Some(19001));
         assert_eq!(raw.push_enabled, Some(true));
+    }
+
+    #[test]
+    fn sled_ack_defaults_mirror_the_broker() {
+        let cfg = resolve_sled_ack(None, None, None).unwrap();
+        assert_eq!(cfg, SledAckConfig::default());
+        assert_eq!(cfg.ack_wait, Duration::from_secs(30));
+        assert_eq!(cfg.max_deliveries, 10);
+        assert_eq!(cfg.max_unacked, 1024);
+    }
+
+    #[test]
+    fn sled_ack_rejects_zeroes_and_takes_overrides() {
+        assert!(resolve_sled_ack(Some(0), None, None).is_err());
+        assert!(resolve_sled_ack(None, Some(0), None).is_err());
+        assert!(resolve_sled_ack(None, None, Some(0)).is_err());
+        let cfg = resolve_sled_ack(Some(5), Some(1), Some(16)).unwrap();
+        assert_eq!(cfg.ack_wait, Duration::from_secs(5));
+        assert_eq!(cfg.max_deliveries, 1);
+        assert_eq!(cfg.max_unacked, 16);
+    }
+
+    #[test]
+    fn sled_ack_variables_reach_the_raw_config() {
+        let env = [
+            ("SLED_ACK_WAIT_SECS", "7"),
+            ("SLED_MAX_DELIVERIES", "3"),
+            ("SLED_MAX_UNACKED_PER_SESSION", "64"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_owned(), v.to_owned()))
+        .collect();
+        let raw = read_raw(None, Some(env)).unwrap();
+        assert_eq!(raw.sled_ack_wait_secs, Some(7));
+        assert_eq!(raw.sled_max_deliveries, Some(3));
+        assert_eq!(raw.sled_max_unacked_per_session, Some(64));
+    }
+
+    /// Прямой бэкенд объявляет подтверждения, пока хранит офлайн-сообщения:
+    /// без хранения конверт идёт только онлайн с `message_id = 0`.
+    #[test]
+    fn sled_advertises_delivery_acks_unless_retention_is_immediate() {
+        let mut cfg = super::Config {
+            queue_addressing_enabled: false,
+            device_cert_max_ttl: Duration::ZERO,
+            bind_addr: "127.0.0.1:0".to_string(),
+            storage_path: String::new(),
+            node_identity_key: None,
+            server_config_ttl: Duration::from_secs(60),
+            advertised_address: None,
+            handshake_timeout: Duration::from_secs(1),
+            noise_allow_tofu: true,
+            max_frame_len: 1024,
+            metrics: super::MetricsConfig {
+                enabled: false,
+                addr: String::new(),
+            },
+            deleted_messages_retention: RetentionPolicy::Disabled,
+            offline_messages_retention: RetentionPolicy::Disabled,
+            delivery: resolve_delivery(None, None, None, None, None, None, None, None, None)
+                .unwrap(),
+            push: resolve_push(push_raw(false)).unwrap(),
+            limits: LimitsConfig::default(),
+        };
+        assert!(cfg.server_config_snapshot().supports_delivery_ack);
+        cfg.offline_messages_retention = RetentionPolicy::Immediate;
+        assert!(!cfg.server_config_snapshot().supports_delivery_ack);
+        cfg.delivery.backend = super::DeliveryBackendKind::JetStream;
+        assert!(cfg.server_config_snapshot().supports_delivery_ack);
     }
 }

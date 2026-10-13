@@ -8,6 +8,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::config::ServerConfigSnapshot;
 use crate::delivery::DeliveryBackend;
+use crate::delivery::sled_ack::{Offer, SledSession, WriteDecision};
 use crate::domain::priority::MessagePriority;
 use crate::domain::push::PushPlatform;
 use crate::domain::reject::SendRejectReason;
@@ -26,17 +27,15 @@ use crate::state::queues::{AllocateParams, QueueError, derive_queue_id, queue_fi
 use crate::state::{
     push_tokens::{PushTokenStore, RegisterOutcome},
     registry::{ConnRegistry, DeviceId, OutboundFrame, SessionRevocation, UserId},
-    storage::{EnqueueResult, QueueQuotaCeilings, Storage, StoredMessage},
+    storage::{EnqueueResult, InboxScope, QueueQuotaCeilings, Storage},
 };
 use crate::wire::QueueRejectReason as WireQueueRejectReason;
 use crate::wire::frame;
 
-const OFFLINE_REPLAY_LIMIT: usize = 10_000;
-
-enum ReplayScope {
-    Account,
-    Device(DeviceId),
-}
+/// Сколько записей очереди сессия дочитывает за один заход цикла. Между
+/// порциями цикл успевает прочитать кадры клиента — подтверждения в том
+/// числе, — а не пишет весь бэклог одним куском.
+const PULL_BATCH: usize = 64;
 
 struct RegistryCleanup {
     registry: ConnRegistry,
@@ -210,11 +209,9 @@ pub async fn handle_conn(
         Ok(_) => {
             return close_revoked_session(
                 &mut framed,
-                &storage,
                 &user_id,
                 device_id,
                 &mut rx_to_client,
-                None,
                 "confirm",
             )
             .await;
@@ -279,96 +276,70 @@ pub async fn handle_conn(
             send_final_frame(&mut framed, &err_frame).await?;
             bail!("delivery backend unavailable");
         }
-    } else {
-        // Реплей прерывается отзывом сертификата и истечением его срока:
-        // остаток очереди остаётся в хранилище, отозванной сессии не
-        // уходит ни одной записи.
-        let replay_guard = ReplayGuard {
-            revocation: &revocation,
-            cert_not_after,
+    }
+
+    // Прямой бэкенд с хранением: окно подтверждений этой сессии. Объявлено
+    // после `_registry_cleanup` и потому уничтожается раньше: уходя, сессия
+    // учитывает неподтверждённое и будит другие сессии получателя, пока
+    // сама ещё в реестре и в их число не попадает.
+    //
+    // Реплея на входе как отдельного шага нет: окно помечает очереди к
+    // чтению с начала, и цикл сессии дочитывает их порциями по мере места в
+    // окне, перемежая с подтверждениями клиента. Каждая сессия получателя
+    // читает свои очереди сама, а не только первая: запись остаётся в
+    // очереди до подтверждения, и вторая сессия аккаунта получает
+    // неподтверждённое первой так же, как получила бы его онлайн.
+    let mut sled = match delivery_backend.sled_ack_config() {
+        Some(ack_cfg) if server_config.supports_offline_messages() => Some(SledSession::new(
+            storage.clone(),
+            ack_cfg,
+            user_id,
+            device_id,
+            registry.clone(),
+            registration.connection_id,
+        )),
+        _ => None,
+    };
+    let resync = registration.resync.clone();
+
+    // Первая порция очередей уходит до первого ответа клиенту, как уходил
+    // реплей: до того как цикл возьмётся за подтверждающий кадр, клиент
+    // получает накопленное — столько, сколько помещается в окно. Хранилище,
+    // не ответившее здесь, — отказ на входе (503), как и прежде.
+    if let Some(session) = sled.as_mut() {
+        let mut counters = BacklogCounters {
+            delivered: &mut messages_delivered_offline,
+            failed: &mut messages_failed,
         };
-        if registration.is_first_for_user {
-            let inbox_messages = match storage.drain_inbox(&user_id, OFFLINE_REPLAY_LIMIT) {
-                Ok(messages) => messages,
-                Err(err) => {
+        while session.wants_pull() {
+            match deliver_backlog(
+                &mut framed,
+                &storage,
+                session,
+                &user_id,
+                device_id,
+                &revocation,
+                cert_not_after,
+                &mut counters,
+            )
+            .await
+            {
+                Ok(BacklogOutcome::Delivered) => {}
+                Ok(BacklogOutcome::Revoked) => {
+                    return close_revoked_session(
+                        &mut framed,
+                        &user_id,
+                        device_id,
+                        &mut rx_to_client,
+                        "live",
+                    )
+                    .await;
+                }
+                Ok(BacklogOutcome::Expired) => return Ok(()),
+                Err(DeliverError::Io(err)) => return Err(err.into()),
+                Err(DeliverError::Storage(err)) => {
                     return refuse_storage_unavailable(&mut framed, user_id, device_id, &err).await;
                 }
-            };
-            if !inbox_messages.is_empty() {
-                debug!(
-                    user = %hex::encode(user_id),
-                    ?device_id,
-                    count = inbox_messages.len(),
-                    "starting account-level offline message replay"
-                );
-            }
-            let outcome = replay_messages(
-                &mut framed,
-                &storage,
-                &user_id,
-                ReplayScope::Account,
-                inbox_messages,
-                &replay_guard,
-                &mut messages_delivered_offline,
-                &mut messages_failed,
-            )
-            .await?;
-            if let Some(closed) = finish_interrupted_replay(
-                outcome,
-                &mut framed,
-                &storage,
-                &user_id,
-                device_id,
-                &mut rx_to_client,
-            )
-            .await
-            {
-                return closed;
-            }
-        }
-
-        if let Some(current_device_id) = device_id
-            && registration.is_first_for_device
-        {
-            let inbox_messages =
-                match storage.drain_device_inbox(&user_id, current_device_id, OFFLINE_REPLAY_LIMIT)
-                {
-                    Ok(messages) => messages,
-                    Err(err) => {
-                        return refuse_storage_unavailable(&mut framed, user_id, device_id, &err)
-                            .await;
-                    }
-                };
-            if !inbox_messages.is_empty() {
-                debug!(
-                    user = %hex::encode(user_id),
-                    device_id = current_device_id,
-                    count = inbox_messages.len(),
-                    "starting device-level offline message replay"
-                );
-            }
-            let outcome = replay_messages(
-                &mut framed,
-                &storage,
-                &user_id,
-                ReplayScope::Device(current_device_id),
-                inbox_messages,
-                &replay_guard,
-                &mut messages_delivered_offline,
-                &mut messages_failed,
-            )
-            .await?;
-            if let Some(closed) = finish_interrupted_replay(
-                outcome,
-                &mut framed,
-                &storage,
-                &user_id,
-                device_id,
-                &mut rx_to_client,
-            )
-            .await
-            {
-                return closed;
             }
         }
     }
@@ -384,19 +355,19 @@ pub async fn handle_conn(
     tokio::pin!(cert_expiry);
     let mut confirming_frame = Some(confirming_frame);
 
-    loop {
+    'session: loop {
+        let pull_ready = sled.as_ref().is_some_and(SledSession::wants_pull);
+        let ack_deadline = sled.as_mut().and_then(SledSession::next_deadline);
         select! {
           () = revocation.revoked() => {
               return close_revoked_session(
-                      &mut framed,
-                      &storage,
-                      &user_id,
-                      device_id,
-                      &mut rx_to_client,
-                      None,
-                      "live",
-                  )
-                  .await;
+                  &mut framed,
+                  &user_id,
+                  device_id,
+                  &mut rx_to_client,
+                  "live",
+              )
+              .await;
           }
 
           maybe_in = next_client_frame(&mut framed, &mut confirming_frame) => {
@@ -418,11 +389,9 @@ pub async fn handle_conn(
               if revocation.is_revoked() {
                   return close_revoked_session(
                       &mut framed,
-                      &storage,
                       &user_id,
                       device_id,
                       &mut rx_to_client,
-                      None,
                       "live",
                   )
                   .await;
@@ -898,21 +867,127 @@ pub async fn handle_conn(
                               &online_device_ids,
                           );
                       } else {
-                          let incoming =
-                              encode_incoming(user_id, device_id, 0, &body, priority);
+                          // Прямой бэкенд с хранением пишет конверт в
+                          // очередь получателя всегда, а не только когда тот
+                          // офлайн: запись снимает `DeliveryAck` клиента, и
+                          // онлайн-сессии уходит лишь уведомление с её
+                          // `message_id` (см. `delivery::sled_ack`). Без
+                          // хранения (`OFFLINE_MESSAGES_RETENTION=instant`)
+                          // доставка только онлайн, `message_id = 0`, как до
+                          // подтверждений.
+                          let durable = server_config.supports_offline_messages();
                           let route_targets = registry.route_targets(&recipient, recipient_device_id);
+
+                          // Квоты очереди прямого бэкенда. С хранением они
+                          // меряют неподтверждённое и действуют и для живого
+                          // получателя: иначе не подтверждающая сессия копила
+                          // бы записи без предела. Брокерный путь ограничен
+                          // лимитами самого потока JetStream и сюда не
+                          // заходит.
+                          let mut depth_before = None;
+                          if durable || route_targets.is_empty() {
+                              let quota = match queue_quota_reason(
+                                  &storage,
+                                  &limits,
+                                  &recipient,
+                                  recipient_device_id,
+                                  &user_id,
+                              ) {
+                                  Ok(quota) => quota,
+                                  Err(err) => {
+                                      error!(
+                                          sender = %hex::encode(user_id),
+                                          recipient = %hex::encode(recipient),
+                                          ?recipient_device_id,
+                                          error = %err,
+                                          "queue quota scan failed; answering the sender with a reject"
+                                      );
+                                      reject_send(&mut framed, SendRejectReason::Internal).await?;
+                                      messages_rejected += 1;
+                                      continue;
+                                  }
+                              };
+                              if let Some(reason) = quota.reason {
+                                  warn!(
+                                      sender = %hex::encode(user_id),
+                                      recipient = %hex::encode(recipient),
+                                      ?recipient_device_id,
+                                      size = body.len(),
+                                      reason = reason.as_metric_label(),
+                                      "enqueue rejected by queue quota"
+                                  );
+                                  reject_send(&mut framed, reason).await?;
+                                  messages_rejected += 1;
+                                  continue;
+                              }
+                              depth_before = quota.depth_before;
+                          }
+
+                          let enqueue_result = if durable {
+                              let enqueued = match recipient_device_id {
+                                  Some(target_device_id) => storage.enqueue_device_inbox(
+                                      &recipient,
+                                      target_device_id,
+                                      &user_id,
+                                      device_id,
+                                      &body,
+                                      priority,
+                                      ttl_seconds,
+                                  ),
+                                  None => storage.enqueue_inbox(
+                                      &recipient,
+                                      &user_id,
+                                      device_id,
+                                      &body,
+                                      priority,
+                                      ttl_seconds,
+                                  ),
+                              };
+                              match enqueued {
+                                  Ok(result) => result,
+                                  Err(err) => {
+                                      // Диск кончился или БД повреждена.
+                                      // Сессия при этом остаётся живой:
+                                      // принимать входящие она может и с
+                                      // полным диском.
+                                      error!(
+                                          sender = %hex::encode(user_id),
+                                          recipient = %hex::encode(recipient),
+                                          ?recipient_device_id,
+                                          size = body.len(),
+                                          error = %err,
+                                          "enqueue failed; answering the sender with a reject"
+                                      );
+                                      reject_send(&mut framed, SendRejectReason::Internal).await?;
+                                      messages_rejected += 1;
+                                      continue;
+                                  }
+                              }
+                          } else {
+                              // Retention `instant`: хранить нельзя, а
+                              // офлайн-получателю — некуда.
+                              EnqueueResult { id: 0, stored: false }
+                          };
+                          let message_id = enqueue_result.stored.then_some(enqueue_result.id);
+                          let incoming = encode_incoming(
+                              user_id,
+                              device_id,
+                              message_id.unwrap_or(0),
+                              &body,
+                              priority,
+                          );
                           let mut delivered_count = 0usize;
 
                           // Канал получателя не ждём: отправитель не должен
                           // висеть на чужом медленном сокете. Переполненный
-                          // канал значит, что сессия не успевает читать, —
-                          // она выписывается из реестра (и этим закрывается,
-                          // см. регистрацию), а сообщение, не принятое ни
-                          // одной целью, уходит в офлайн-очередь.
+                          // канал значит, что сессия не успевает писать в
+                          // сокет, — она выписывается из реестра (и этим
+                          // закрывается, см. регистрацию). Записи в очереди
+                          // это не касается: её дочитает следующая сессия.
                           for target in route_targets {
                               let outgoing = OutboundFrame {
                                   bytes: incoming.clone(),
-                                  message_id: None,
+                                  message_id,
                                   close_after_send: false,
                                   sender_user_id: Some(user_id),
                                   sender_device_id: device_id,
@@ -947,8 +1022,12 @@ pub async fn handle_conn(
                           }
 
                           if delivered_count > 0 {
-                              let ack =
-                                  encode_send_ack(true, false, 0, SendRejectReason::Unspecified);
+                              let ack = encode_send_ack(
+                                  true,
+                                  false,
+                                  message_id.unwrap_or(0),
+                                  SendRejectReason::Unspecified,
+                              );
                               framed.send_frame(&ack).await?;
                               messages_delivered_online += delivered_count as u64;
                               observability::observe_message_route(match recipient_device_id {
@@ -959,93 +1038,17 @@ pub async fn handle_conn(
                                   sender = %hex::encode(user_id),
                                   recipient = %hex::encode(recipient),
                                   ?recipient_device_id,
+                                  ?message_id,
                                   delivered_count,
                                   size = body.len(),
                                   delivery_method = "online",
-                                  "message successfully delivered to online recipient"
+                                  "message handed to online recipient sessions"
                               );
                           } else {
-                              // Квоты очереди прямого бэкенда. Брокерный
-                              // путь ограничен лимитами самого потока
-                              // JetStream и сюда не заходит.
-                              let quota = match queue_quota_reason(
-                                  &storage,
-                                  &limits,
-                                  &recipient,
-                                  recipient_device_id,
-                                  &user_id,
-                              ) {
-                                  Ok(quota) => quota,
-                                  Err(err) => {
-                                      error!(
-                                          sender = %hex::encode(user_id),
-                                          recipient = %hex::encode(recipient),
-                                          ?recipient_device_id,
-                                          error = %err,
-                                          "queue quota scan failed; answering the sender with a reject"
-                                      );
-                                      reject_send(&mut framed, SendRejectReason::Internal).await?;
-                                      messages_rejected += 1;
-                                      continue;
-                                  }
-                              };
-                              if let Some(reason) = quota.reason {
-                                  warn!(
-                                      sender = %hex::encode(user_id),
-                                      recipient = %hex::encode(recipient),
-                                      ?recipient_device_id,
-                                      size = body.len(),
-                                      reason = reason.as_metric_label(),
-                                      "offline enqueue rejected by queue quota"
-                                  );
-                                  reject_send(&mut framed, reason).await?;
-                                  messages_rejected += 1;
-                                  continue;
-                              }
-
-                              let enqueued = match recipient_device_id {
-                                  Some(target_device_id) => storage.enqueue_device_inbox(
-                                      &recipient,
-                                      target_device_id,
-                                      &user_id,
-                                      device_id,
-                                      &body,
-                                      priority,
-                                      ttl_seconds,
-                                  ),
-                                  None => storage.enqueue_inbox(
-                                      &recipient,
-                                      &user_id,
-                                      device_id,
-                                      &body,
-                                      priority,
-                                      ttl_seconds,
-                                  ),
-                              };
-                              let enqueue_result = match enqueued {
-                                  Ok(result) => result,
-                                  Err(err) => {
-                                      // Диск кончился или БД повреждена.
-                                      // Сессия при этом остаётся живой:
-                                      // принимать входящие она может и с
-                                      // полным диском.
-                                      error!(
-                                          sender = %hex::encode(user_id),
-                                          recipient = %hex::encode(recipient),
-                                          ?recipient_device_id,
-                                          size = body.len(),
-                                          error = %err,
-                                          "offline enqueue failed; answering the sender with a reject"
-                                      );
-                                      reject_send(&mut framed, SendRejectReason::Internal).await?;
-                                      messages_rejected += 1;
-                                      continue;
-                                  }
-                              };
                               if enqueue_result.stored {
-                                  // Sled backend reaches this branch only when
-                                  // route_targets was empty, so nothing of this
-                                  // user is online — pass an empty online slice.
+                                  // Сюда доходит, только когда ни одна сессия
+                                  // получателя уведомления не приняла, — будить
+                                  // некого исключать.
                                   trigger_offline_pushes(
                                       &push_tokens,
                                       &push_scheduler,
@@ -1063,16 +1066,27 @@ pub async fn handle_conn(
                                   recipient_device_id,
                                   body.len(),
                                   enqueue_result,
-                                  quota.depth_before,
+                                  depth_before,
                                   &mut messages_queued,
                               ).await?;
                           }
                       }
                   }
                   ClientFrame::DeliveryAck { message_id } => {
-                      let acked = delivery_backend
-                          .ack_delivery(user_id, device_id, message_id)
-                          .await?;
+                      let acked = match sled.as_mut() {
+                          Some(session) => match session.ack(message_id) {
+                              Ok(acked) => acked,
+                              Err(err) => {
+                                  return close_on_storage_failure(&mut framed, user_id, device_id, &err)
+                                      .await;
+                              }
+                          },
+                          None => {
+                              delivery_backend
+                                  .ack_delivery(user_id, device_id, message_id)
+                                  .await?
+                          }
+                      };
                       if acked {
                           debug!(
                               user = %hex::encode(user_id),
@@ -1480,15 +1494,13 @@ pub async fn handle_conn(
                   // узнать о 403, а не о разрыве.
                   if revocation.is_revoked() {
                       return close_revoked_session(
-                      &mut framed,
-                      &storage,
-                      &user_id,
-                      device_id,
-                      &mut rx_to_client,
-                      None,
-                      "live",
-                  )
-                  .await;
+                          &mut framed,
+                          &user_id,
+                          device_id,
+                          &mut rx_to_client,
+                          "live",
+                      )
+                      .await;
                   }
                   warn!(
                       user = %hex::encode(user_id),
@@ -1499,16 +1511,15 @@ pub async fn handle_conn(
                   break;
               };
               // Ни одного кадра отозванной сессии: всё, что ещё лежит в её
-              // канале, ей не отдаётся (брокерный бэкенд вернёт
-              // неподтверждённое в поток при отключении).
+              // канале, ей не отдаётся (записи прямого бэкенда остаются в
+              // очередях, брокерный вернёт неподтверждённое в поток при
+              // отключении).
               if revocation.is_revoked() {
                   return close_revoked_session(
                       &mut framed,
-                      &storage,
                       &user_id,
                       device_id,
                       &mut rx_to_client,
-                      Some(outgoing),
                       "live",
                   )
                   .await;
@@ -1542,10 +1553,39 @@ pub async fn handle_conn(
                   );
                   continue;
               }
-              if let Err(err) = framed.send_frame(&outgoing.bytes).await {
+              // Уведомление прямого бэкенда: запись уже лежит в очереди
+              // получателя, и решает окно подтверждений — отдать сейчас,
+              // пропустить (уже отдана или снята) или отложить до места в
+              // окне. Брокерные конверты и кадры без `message_id` идут как
+              // есть.
+              let written = match (sled.as_mut(), outgoing.message_id) {
+                  (Some(session), Some(message_id)) => {
+                      let scope = outgoing
+                          .target_device_id
+                          .map_or(InboxScope::Account, InboxScope::Device);
+                      if session.offer(scope, message_id) != Offer::Accept {
+                          continue;
+                      }
+                      match deliver_stored(&mut framed, session, scope, message_id, &outgoing.bytes)
+                          .await
+                      {
+                          Ok(true) => Ok(()),
+                          Ok(false) => continue,
+                          Err(DeliverError::Io(err)) => Err(err),
+                          Err(DeliverError::Storage(err)) => {
+                              return close_on_storage_failure(&mut framed, user_id, device_id, &err)
+                                  .await;
+                          }
+                      }
+                  }
+                  _ => framed.send_frame(&outgoing.bytes).await,
+              };
+              if let Err(err) = written {
                   if is_connection_reset(&err) {
                       observability::observe_connection_reset_by_peer();
                   }
+                  // Запись прямого бэкенда остаётся в очереди и дойдёт
+                  // следующей сессией; брокерный конверт вернёт поток.
                   warn!(
                       recipient = %hex::encode(user_id),
                       recipient_device_id = ?device_id,
@@ -1553,7 +1593,7 @@ pub async fn handle_conn(
                       message_id = ?outgoing.message_id,
                       size,
                       error = %err,
-                      "TCP write to recipient failed; envelope lost on this connection"
+                      "TCP write to recipient failed; the envelope stays undelivered on this connection"
                   );
                   return Err(err.into());
               }
@@ -1579,6 +1619,57 @@ pub async fn handle_conn(
                       "closing session: delivery for it is no longer running"
                   );
                   break;
+              }
+          }
+
+          () = wait_until(ack_deadline), if ack_deadline.is_some() => {
+              if let Some(session) = sled.as_mut()
+                  && let Err(err) = session.expire(tokio::time::Instant::now())
+              {
+                  return close_on_storage_failure(&mut framed, user_id, device_id, &err).await;
+              }
+          }
+
+          () = resync.notified(), if sled.is_some() => {
+              if let Some(session) = sled.as_mut() {
+                  session.resync();
+              }
+          }
+
+          () = std::future::ready(()), if pull_ready => {
+              let Some(session) = sled.as_mut() else { continue };
+              let mut counters = BacklogCounters {
+                  delivered: &mut messages_delivered_offline,
+                  failed: &mut messages_failed,
+              };
+              match deliver_backlog(
+                  &mut framed,
+                  &storage,
+                  session,
+                  &user_id,
+                  device_id,
+                  &revocation,
+                  cert_not_after,
+                  &mut counters,
+              )
+              .await
+              {
+                  Ok(BacklogOutcome::Delivered) => {}
+                  Ok(BacklogOutcome::Revoked) => {
+                      return close_revoked_session(
+                          &mut framed,
+                          &user_id,
+                          device_id,
+                          &mut rx_to_client,
+                          "live",
+                      )
+                      .await;
+                  }
+                  Ok(BacklogOutcome::Expired) => break 'session,
+                  Err(DeliverError::Io(err)) => return Err(err.into()),
+                  Err(DeliverError::Storage(err)) => {
+                      return close_on_storage_failure(&mut framed, user_id, device_id, &err).await;
+                  }
               }
           }
 
@@ -2041,96 +2132,25 @@ async fn send_final_frame(framed: &mut NoiseFramed<TcpStream>, bytes: &[u8]) -> 
     }
 }
 
-/// Закрыть сессию, чей сертификат отозван: недоставленное из её канала
-/// вернуть в офлайн-очередь и ответить `AuthError(403)`.
+/// Закрыть сессию, чей сертификат отозван, ответом `AuthError(403)`.
 ///
 /// Канал закрывается первым: конверт, который параллельный отправитель
 /// успел направить в эту сессию, получает отказ записи и уходит
-/// офлайн-путём у самого отправителя, а уже лежащее в канале — кадры
-/// прямого бэкенда — перекладывается обратно в account- или device-очередь,
-/// по которой кадр сюда попал. Конверты брокера (`message_id`) не
-/// перекладываются: неподтверждённые вернутся в поток при отключении.
+/// офлайн-путём у самого отправителя. Лежащее в канале просто
+/// отбрасывается: на прямом бэкенде с хранением это уведомления о записях,
+/// которые остаются в очередях до `DeliveryAck`, брокерные конверты вернутся
+/// в поток при отключении, а без хранения (`immediate`) вернуть конверт
+/// некуда.
 async fn close_revoked_session(
     framed: &mut NoiseFramed<TcpStream>,
-    storage: &Storage,
     user_id: &UserId,
     device_id: Option<DeviceId>,
     rx_to_client: &mut mpsc::Receiver<OutboundFrame>,
-    pending: Option<OutboundFrame>,
     stage: &'static str,
 ) -> Result<()> {
     rx_to_client.close();
-    let mut requeued = 0usize;
-    let mut pending = pending;
-    loop {
-        let frame = match pending.take() {
-            Some(frame) => frame,
-            None => match rx_to_client.try_recv() {
-                Ok(frame) => frame,
-                Err(_) => break,
-            },
-        };
-        if requeue_outbound(storage, user_id, &frame) {
-            requeued += 1;
-        }
-    }
-    if requeued > 0 {
-        info!(
-            user = %hex::encode(user_id),
-            ?device_id,
-            requeued,
-            "returned undelivered envelopes of a revoked session to the offline queue"
-        );
-    }
+    while rx_to_client.try_recv().is_ok() {}
     refuse_revoked_cert(framed, user_id, device_id, stage).await
-}
-
-/// Вернуть кадр прямого бэкенда в офлайн-очередь получателя. `true` —
-/// кадр был конвертом и записан обратно.
-fn requeue_outbound(storage: &Storage, user_id: &UserId, frame: &OutboundFrame) -> bool {
-    if frame.close_after_send || frame.message_id.is_some() {
-        return false;
-    }
-    let Some(sender) = frame.sender_user_id else {
-        return false;
-    };
-    let Ok(Some(frame::Payload::Incoming(incoming))) =
-        decode_frame(&frame.bytes).map(|decoded| decoded.payload)
-    else {
-        return false;
-    };
-    let priority = MessagePriority::from_wire(incoming.priority);
-    let stored = match frame.target_device_id {
-        Some(target) => storage.enqueue_device_inbox(
-            user_id,
-            target,
-            &sender,
-            frame.sender_device_id,
-            &incoming.body,
-            priority,
-            0,
-        ),
-        None => storage.enqueue_inbox(
-            user_id,
-            &sender,
-            frame.sender_device_id,
-            &incoming.body,
-            priority,
-            0,
-        ),
-    };
-    match stored {
-        Ok(result) => result.stored,
-        Err(err) => {
-            error!(
-                user = %hex::encode(user_id),
-                sender = %hex::encode(sender),
-                error = %err,
-                "failed to return an envelope of a revoked session to the offline queue"
-            );
-            false
-        }
-    }
 }
 
 /// Отправить отказ и учесть его в `reject_total{reason=...}`. Отказ всегда
@@ -2201,80 +2221,85 @@ async fn handle_offline_enqueue_result(
     Ok(())
 }
 
-/// Когда офлайн-реплей обязан остановиться: сертификат сессии отозван или
-/// истёк.
-struct ReplayGuard<'a> {
-    revocation: &'a SessionRevocation,
-    cert_not_after: Option<u64>,
+/// Почему не удалось отдать запись очереди.
+enum DeliverError {
+    /// Запись в сокет: сессия кончилась, запись осталась в очереди.
+    Io(std::io::Error),
+    /// Хранилище не ответило.
+    Storage(anyhow::Error),
 }
 
-/// Чем кончился офлайн-реплей.
-#[derive(Debug, PartialEq, Eq)]
-enum ReplayOutcome {
-    Completed,
+/// Отдать запись очереди прямого бэкенда через окно подтверждений.
+/// `Ok(true)` — кадр записан в сокет; `Ok(false)` — записи уже нет
+/// (подтверждена другой сессией, истекла), писать нечего.
+async fn deliver_stored(
+    framed: &mut NoiseFramed<TcpStream>,
+    session: &mut SledSession,
+    scope: InboxScope,
+    message_id: u64,
+    frame: &[u8],
+) -> std::result::Result<bool, DeliverError> {
+    let (last, redelivery) = match session
+        .prepare(scope, message_id)
+        .map_err(DeliverError::Storage)?
+    {
+        WriteDecision::Skip => return Ok(false),
+        WriteDecision::Deliver { last, redelivery } => (last, redelivery),
+    };
+    framed.send_frame(frame).await.map_err(DeliverError::Io)?;
+    // Повторная выдача никого не будит: пушей на этом пути нет вовсе,
+    // разбудила уже приёмка конверта.
+    if redelivery {
+        observability::observe_message_redelivered();
+    }
+    session
+        .written(scope, message_id, last)
+        .map_err(DeliverError::Storage)?;
+    Ok(true)
+}
+
+/// Счётчики сводки сессии, которые трогает дочитывание очередей.
+struct BacklogCounters<'a> {
+    delivered: &'a mut u64,
+    failed: &'a mut u64,
+}
+
+/// Чем кончилась порция дочитывания.
+enum BacklogOutcome {
+    Delivered,
     /// Сертификат отозван — сессию закрывает `AuthError(403)`.
     Revoked,
     /// Сертификат истёк — сессия закрывается.
     Expired,
 }
 
-/// Реплей прервался — закрыть сессию так, как требует причина. `Some` —
-/// результат `handle_conn`, `None` — реплей дошёл до конца.
-async fn finish_interrupted_replay(
-    outcome: ReplayOutcome,
+/// Дочитать порцию очередей сессии (не больше [`PULL_BATCH`] и места в
+/// окне) и отдать её клиенту.
+#[allow(clippy::too_many_arguments)]
+async fn deliver_backlog(
     framed: &mut NoiseFramed<TcpStream>,
     storage: &Storage,
+    session: &mut SledSession,
     user_id: &UserId,
     device_id: Option<DeviceId>,
-    rx_to_client: &mut mpsc::Receiver<OutboundFrame>,
-) -> Option<Result<()>> {
-    match outcome {
-        ReplayOutcome::Completed => None,
-        ReplayOutcome::Revoked => Some(
-            close_revoked_session(
-                framed,
-                storage,
-                user_id,
-                device_id,
-                rx_to_client,
-                None,
-                "live",
-            )
-            .await,
-        ),
-        ReplayOutcome::Expired => {
+    revocation: &SessionRevocation,
+    cert_not_after: Option<u64>,
+    counters: &mut BacklogCounters<'_>,
+) -> std::result::Result<BacklogOutcome, DeliverError> {
+    let batch = session.pull(PULL_BATCH).map_err(DeliverError::Storage)?;
+    for (scope, message) in batch {
+        // Перед каждой записью: отозванной или истёкшей сессии не уходит
+        // ничего, остаток остаётся в очереди.
+        if revocation.is_revoked() {
+            return Ok(BacklogOutcome::Revoked);
+        }
+        if cert_not_after.is_some_and(|not_after| unix_now_secs() >= not_after) {
             info!(
                 user = %hex::encode(user_id),
                 ?device_id,
-                "device certificate expired during offline replay; closing delegated session"
+                "device certificate expired during offline delivery; closing delegated session"
             );
-            Some(Ok(()))
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn replay_messages(
-    framed: &mut NoiseFramed<TcpStream>,
-    storage: &Storage,
-    user_id: &[u8; 32],
-    scope: ReplayScope,
-    messages: Vec<StoredMessage>,
-    guard: &ReplayGuard<'_>,
-    messages_delivered_offline: &mut u64,
-    messages_failed: &mut u64,
-) -> Result<ReplayOutcome> {
-    for message in messages {
-        // Перед каждой записью: отозванной или истёкшей сессии не уходит
-        // ничего, остаток остаётся в очереди.
-        if guard.revocation.is_revoked() {
-            return Ok(ReplayOutcome::Revoked);
-        }
-        if guard
-            .cert_not_after
-            .is_some_and(|not_after| unix_now_secs() >= not_after)
-        {
-            return Ok(ReplayOutcome::Expired);
+            return Ok(BacklogOutcome::Expired);
         }
         let frame = encode_incoming(
             message.sender_id,
@@ -2291,7 +2316,7 @@ async fn replay_messages(
         // принята раньше либо потолок кадра с тех пор снизили.
         if frame.len() > framed.max_frame_len() {
             observability::observe_oversized_envelope("offline_replay");
-            *messages_failed += 1;
+            *counters.failed += 1;
             error!(
                 user = %hex::encode(user_id),
                 sender = %hex::encode(message.sender_id),
@@ -2300,13 +2325,7 @@ async fn replay_messages(
                 max_frame_len = framed.max_frame_len(),
                 "offline message does not fit max_frame_len; removing it from the queue"
             );
-            let removed = match scope {
-                ReplayScope::Account => storage.remove_inbox(user_id, message.id),
-                ReplayScope::Device(device_id) => {
-                    storage.remove_device_inbox(user_id, device_id, message.id)
-                }
-            };
-            if let Err(err) = removed {
+            if let Err(err) = storage.remove_inbox_record(user_id, scope, message.id) {
                 warn!(
                     user = %hex::encode(user_id),
                     message_id = message.id,
@@ -2317,29 +2336,12 @@ async fn replay_messages(
             continue;
         }
 
-        match framed.send_frame(&frame).await {
-            Ok(_) => {
-                let remove_result = match scope {
-                    ReplayScope::Account => storage.remove_inbox(user_id, message.id),
-                    ReplayScope::Device(device_id) => {
-                        storage.remove_device_inbox(user_id, device_id, message.id)
-                    }
-                };
-                if let Err(err) = remove_result {
-                    warn!(
-                        user = %hex::encode(user_id),
-                        sender = %hex::encode(message.sender_id),
-                        message_id = message.id,
-                        error = %err,
-                        operation = "offline_message_remove",
-                        "failed to remove offline message from storage after replay"
-                    );
-                }
-
-                *messages_delivered_offline += 1;
+        match deliver_stored(framed, session, scope, message.id, &frame).await {
+            Ok(true) => {
+                *counters.delivered += 1;
                 observability::observe_message_route(match scope {
-                    ReplayScope::Account => "offline_replay",
-                    ReplayScope::Device(_) => "offline_replay_device",
+                    InboxScope::Account => "offline_replay",
+                    InboxScope::Device(_) => "offline_replay_device",
                 });
                 debug!(
                     user = %hex::encode(user_id),
@@ -2347,54 +2349,55 @@ async fn replay_messages(
                     message_id = message.id,
                     ?message.sender_device_id,
                     size = message.body.len(),
-                    "successfully delivered offline message during replay"
+                    "delivered a queued message; awaiting DeliveryAck"
                 );
             }
-            Err(err) => {
+            Ok(false) => {}
+            Err(DeliverError::Io(err)) => {
                 if is_connection_reset(&err) {
                     observability::observe_connection_reset_by_peer();
                 }
-
-                let is_connection_error = matches!(
-                    err.kind(),
-                    std::io::ErrorKind::BrokenPipe
-                        | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::ConnectionAborted
-                        | std::io::ErrorKind::NotConnected
-                );
-
-                if is_connection_error {
-                    warn!(
-                        user = %hex::encode(user_id),
-                        sender = %hex::encode(message.sender_id),
-                        message_id = message.id,
-                        ?message.sender_device_id,
-                        size = message.body.len(),
-                        error = %err,
-                        operation = "offline_message_send",
-                        error_type = "connection_lost",
-                        "connection lost while sending offline message - aborting replay"
-                    );
-                    break;
-                }
-
-                *messages_failed += 1;
                 warn!(
                     user = %hex::encode(user_id),
                     sender = %hex::encode(message.sender_id),
                     message_id = message.id,
-                    ?message.sender_device_id,
-                    size = message.body.len(),
                     error = %err,
-                    operation = "offline_message_send",
-                    error_type = "send_failure",
-                    "failed to send offline message to client - continuing with next message"
+                    "connection lost while delivering a queued message; it stays in the queue"
                 );
+                return Err(DeliverError::Io(err));
             }
+            Err(err) => return Err(err),
         }
     }
+    Ok(BacklogOutcome::Delivered)
+}
 
-    Ok(ReplayOutcome::Completed)
+/// Хранилище перестало отвечать посреди сессии: отдавать и подтверждать
+/// записи очередей нечем. `AuthError(503)` переводит клиента на backoff, как
+/// и отказ на входе (см. [`refuse_storage_unavailable`]).
+async fn close_on_storage_failure(
+    framed: &mut NoiseFramed<TcpStream>,
+    user_id: UserId,
+    device_id: Option<DeviceId>,
+    err: &anyhow::Error,
+) -> Result<()> {
+    observability::observe_reject("storage_unavailable");
+    error!(
+        user = %hex::encode(user_id),
+        ?device_id,
+        error = %format!("{err:#}"),
+        "storage failed during the session; closing it"
+    );
+    send_final_frame(framed, &encode_auth_error(503, "storage unavailable")).await?;
+    bail!("storage unavailable")
+}
+
+/// Дождаться срока; `None` — никогда.
+async fn wait_until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Отказ операции над очередью — `QueueAck` с причиной на проводе.
