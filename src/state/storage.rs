@@ -16,6 +16,12 @@
 //! - `system` — `storage_version` → номер формата записей (сейчас 5).
 //!   При старте база переводится в v5 с v3 и v4; более старые форматы не
 //!   поддерживаются (см. `migrate_legacy_inbox`).
+//! - `delivery_failures` — сколько раз запись очереди была записана в
+//!   сессию и не подтверждена (`DeliveryAck`): ключ записи очереди как есть
+//!   (40 байт — account, 42 — устройство) → `failures(u32)`. Отдельное
+//!   дерево, а не поле записи: счётчик меняется на каждой неудачной выдаче,
+//!   и переписывать ради него запись с телом незачем. Ключ уходит вместе с
+//!   записью; осиротевшие ключи снимает периодическая чистка.
 
 use crate::config::RetentionPolicy;
 use crate::domain::priority::MessagePriority;
@@ -51,6 +57,23 @@ pub struct StoredMessage {
     pub sender_device_id: Option<DeviceId>,
     pub body: Vec<u8>,
     pub priority: Option<MessagePriority>,
+}
+
+/// Очередь получателя, в которой лежит запись: общая (account) или
+/// очередь устройства. Получатель задаётся отдельно.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum InboxScope {
+    Account,
+    Device(DeviceId),
+}
+
+/// Порция записей очереди, прочитанная с заданного идентификатора.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InboxScan {
+    pub messages: Vec<StoredMessage>,
+    /// `None` — очередь дочитана до конца; `Some(id)` — порция упёрлась в
+    /// лимит, и следующую читать с `id`.
+    pub next_from: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,6 +188,9 @@ pub struct Storage {
     queue_stats: Tree,
     meta: Tree,   // архив удалённых записей (removed_at + исходная запись)
     system: Tree, // служебные маркеры версии/миграции
+    /// Неподтверждённые выдачи записей очередей (формат — в документации
+    /// модуля).
+    delivery_failures: Tree,
     deleted_messages_retention: RetentionPolicy,
     offline_messages_retention: RetentionPolicy,
 }
@@ -182,6 +208,7 @@ impl Storage {
             queue_stats: db.open_tree("queue_stats")?,
             meta: db.open_tree("meta")?,
             system: db.open_tree("system")?,
+            delivery_failures: db.open_tree("delivery_failures")?,
             db,
             deleted_messages_retention,
             offline_messages_retention,
@@ -414,6 +441,203 @@ impl Storage {
             DEVICE_PREFIX_LEN,
             "remove_device_inbox",
         )
+    }
+
+    /// Дерево, ключ записи и длина префикса очереди `scope` получателя.
+    fn inbox_location(
+        &self,
+        recipient: &[u8; 32],
+        scope: InboxScope,
+        id: u64,
+    ) -> (&Tree, Vec<u8>, usize) {
+        match scope {
+            InboxScope::Account => (&self.inbox, build_user_key(recipient, id), USER_PREFIX_LEN),
+            InboxScope::Device(device_id) => (
+                &self.device_inbox,
+                build_device_key(recipient, device_id, id),
+                DEVICE_PREFIX_LEN,
+            ),
+        }
+    }
+
+    /// Записи очереди `scope` с идентификатором от `from_id` включительно,
+    /// не больше `limit`, по возрастанию идентификатора. Записи, для
+    /// которых `skip(id)` истинно, пропускаются и в лимит не входят;
+    /// протухшие удаляются по дороге, как при любом чтении очереди.
+    ///
+    /// Повреждённая запись — ошибка, а не пропуск: молча обойти её значило
+    /// бы так и не отдать получателю то, что за ней.
+    pub fn scan_inbox(
+        &self,
+        recipient: &[u8; 32],
+        scope: InboxScope,
+        from_id: u64,
+        limit: usize,
+        skip: impl Fn(u64) -> bool,
+    ) -> Result<InboxScan> {
+        let started = Instant::now();
+        let (tree, start, prefix_len) = self.inbox_location(recipient, scope, from_id);
+        let prefix = start[..prefix_len].to_vec();
+        let now_secs = unix_timestamp_secs()?;
+        let mut expired_keys = Vec::new();
+        let mut messages = Vec::new();
+        let mut next_from = None;
+
+        let result: Result<()> = (|| {
+            for entry in tree.range(start..) {
+                let (key, value) = entry?;
+                if !key.starts_with(&prefix) {
+                    break;
+                }
+                let id = u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap());
+                if skip(id) {
+                    continue;
+                }
+                if messages.len() >= limit {
+                    next_from = Some(id);
+                    break;
+                }
+                let decoded = decode_message_value(&value)?;
+                if self
+                    .offline_messages_retention
+                    .expires(decoded.created_at_secs, now_secs)
+                    || ttl_expired(decoded.ttl_seconds, decoded.created_at_secs, now_secs)
+                {
+                    expired_keys.push(key);
+                    continue;
+                }
+                messages.push(StoredMessage {
+                    id,
+                    sender_id: decoded.sender_id,
+                    sender_device_id: decoded.sender_device_id,
+                    body: decoded.body,
+                    priority: decoded.priority,
+                });
+            }
+            for key in expired_keys {
+                self.remove_and_note(tree, &key, prefix_len)?;
+            }
+            Ok(())
+        })();
+
+        let outcome = if result.is_ok() { "ok" } else { "error" };
+        observability::observe_storage_operation("scan_inbox", outcome, started.elapsed());
+        result.map(|()| InboxScan {
+            messages,
+            next_from,
+        })
+    }
+
+    /// Сколько раз запись уже выдавалась без подтверждения. `None` —
+    /// записи нет: её подтвердили, она истекла или удалена.
+    pub fn inbox_failures(
+        &self,
+        recipient: &[u8; 32],
+        scope: InboxScope,
+        id: u64,
+    ) -> Result<Option<u32>> {
+        let (tree, key, _) = self.inbox_location(recipient, scope, id);
+        if !tree.contains_key(&key)? {
+            return Ok(None);
+        }
+        Ok(Some(
+            self.delivery_failures
+                .get(&key)?
+                .as_deref()
+                .map_or(0, decode_failures),
+        ))
+    }
+
+    /// Учесть выдачу записи, которая не дождалась подтверждения. Записи
+    /// уже нет — учитывать нечего (`None`); иначе — новое число неудач.
+    ///
+    /// Проверка и счёт не атомарны с удалением записи: подтверждение,
+    /// пришедшее между ними, оставит осиротевший счётчик. Его снимет
+    /// [`Self::cleanup_orphan_delivery_failures`].
+    pub fn record_failed_delivery(
+        &self,
+        recipient: &[u8; 32],
+        scope: InboxScope,
+        id: u64,
+    ) -> Result<Option<u32>> {
+        let (tree, key, _) = self.inbox_location(recipient, scope, id);
+        if !tree.contains_key(&key)? {
+            return Ok(None);
+        }
+        let updated = self.delivery_failures.update_and_fetch(&key, |current| {
+            let next = current.map_or(0, decode_failures).saturating_add(1);
+            Some(next.to_be_bytes().to_vec())
+        })?;
+        Ok(Some(updated.as_deref().map_or(0, decode_failures)))
+    }
+
+    /// Удалить запись очереди `scope` (с архивом в `meta`, как и
+    /// доставленные). `true` — запись была.
+    pub fn remove_inbox_record(
+        &self,
+        recipient: &[u8; 32],
+        scope: InboxScope,
+        id: u64,
+    ) -> Result<bool> {
+        let (tree, key, prefix_len) = self.inbox_location(recipient, scope, id);
+        if !tree.contains_key(&key)? {
+            return Ok(false);
+        }
+        let op_name = match scope {
+            InboxScope::Account => "remove_inbox",
+            InboxScope::Device(_) => "remove_device_inbox",
+        };
+        self.remove_message(tree, key, prefix_len, op_name)?;
+        Ok(true)
+    }
+
+    /// `DeliveryAck` сессии получателя: снять подтверждённую запись.
+    /// Области — те же, что у брокерного бэкенда: account-запись
+    /// подтверждает любая сессия аккаунта, запись устройства — только
+    /// сессия этого устройства. Чужую запись подтвердить нельзя: ключ
+    /// строится от получателя сессии. `Some(scope)` — запись найдена и
+    /// удалена.
+    pub fn ack_inbox(
+        &self,
+        recipient: &[u8; 32],
+        device_id: Option<DeviceId>,
+        id: u64,
+    ) -> Result<Option<InboxScope>> {
+        if self.remove_inbox_record(recipient, InboxScope::Account, id)? {
+            return Ok(Some(InboxScope::Account));
+        }
+        if let Some(device_id) = device_id {
+            let scope = InboxScope::Device(device_id);
+            if self.remove_inbox_record(recipient, scope, id)? {
+                return Ok(Some(scope));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Снять счётчики неудачных выдач, чьих записей уже нет (см.
+    /// [`Self::record_failed_delivery`]). Возвращает число снятых.
+    pub fn cleanup_orphan_delivery_failures(&self) -> Result<usize> {
+        let mut orphans = Vec::new();
+        for entry in self.delivery_failures.iter() {
+            let (key, _) = entry?;
+            let tree = match key.len() {
+                40 => &self.inbox,
+                42 => &self.device_inbox,
+                _ => {
+                    orphans.push(key);
+                    continue;
+                }
+            };
+            if !tree.contains_key(&key)? {
+                orphans.push(key);
+            }
+        }
+        let removed = orphans.len();
+        for key in orphans {
+            self.delivery_failures.remove(key)?;
+        }
+        Ok(removed)
     }
 
     pub fn get_queue_depth(
@@ -761,10 +985,12 @@ impl Storage {
         // мусор в другом.
         let removed_meta = self.cleanup_expired_meta();
         let removed_messages = self.cleanup_expired_messages();
-        let (removed_meta, removed_messages) = (removed_meta?, removed_messages?);
+        let removed_failures = self.cleanup_orphan_delivery_failures();
+        let (removed_meta, removed_messages, removed_failures) =
+            (removed_meta?, removed_messages?, removed_failures?);
         info!(
             removed_meta,
-            removed_messages, "periodic storage cleanup completed"
+            removed_messages, removed_failures, "periodic storage cleanup completed"
         );
         Ok(())
     }
@@ -931,11 +1157,15 @@ impl Storage {
 
     /// Удалить запись и поправить счётчики. Значение приходит из самого
     /// `remove`, так что отдельного чтения не нужно.
+    ///
+    /// Счётчик неподтверждённых выдач уходит вместе с записью: через
+    /// эту функцию проходит любое удаление из очередей.
     fn remove_and_note(&self, tree: &Tree, key: &[u8], prefix_len: usize) -> Result<Option<IVec>> {
         let removed = tree.remove(key)?;
         if let Some(value) = &removed {
             self.note_removed(&key[..prefix_len.min(key.len())], value)?;
         }
+        self.delivery_failures.remove(key)?;
         Ok(removed)
     }
 
@@ -1254,6 +1484,12 @@ fn v4_record_to_v5(value: &[u8]) -> Option<Vec<u8>> {
     Some(migrated)
 }
 
+/// Счётчик неудачных выдач; значение неверной длины читается как ноль.
+fn decode_failures(raw: &[u8]) -> u32 {
+    raw.get(..4)
+        .map_or(0, |bytes| u32::from_be_bytes(bytes.try_into().unwrap()))
+}
+
 fn unix_timestamp_secs() -> Result<u64> {
     Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
@@ -1261,7 +1497,7 @@ fn unix_timestamp_secs() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        EnqueueResult, MESSAGE_HEADER_LEN_V5, QueueQuotaCeilings, QueueUsage, Storage,
+        EnqueueResult, InboxScope, MESSAGE_HEADER_LEN_V5, QueueQuotaCeilings, QueueUsage, Storage,
         build_device_key, build_user_key, encode_message_value, encode_queue_counters,
         unix_timestamp_secs,
     };
@@ -2253,6 +2489,104 @@ mod tests {
                 .unwrap(),
             1
         );
+
+        drop(storage);
+        cleanup(&path);
+    }
+
+    /// Счётчик неудачных выдач живёт ровно столько, сколько запись: уходит
+    /// с ней при любом удалении, а осиротевший снимает чистка.
+    #[test]
+    fn delivery_failures_follow_their_record() {
+        let path = temp_path("delivery_failures");
+        let storage = Storage::open(&path, keep_for_days(30), keep_for_days(30)).unwrap();
+        let recipient = user(5);
+        let sender = user(6);
+        let id = storage
+            .enqueue_device_inbox(&recipient, 3, &sender, None, b"x", None, 0)
+            .unwrap()
+            .id;
+        let scope = InboxScope::Device(3);
+        assert_eq!(
+            storage.inbox_failures(&recipient, scope, id).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            storage
+                .record_failed_delivery(&recipient, scope, id)
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            storage
+                .record_failed_delivery(&recipient, scope, id)
+                .unwrap(),
+            Some(2)
+        );
+        // Не та область — записи нет, считать нечего.
+        assert_eq!(
+            storage
+                .record_failed_delivery(&recipient, InboxScope::Account, id)
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            storage.ack_inbox(&recipient, Some(3), id).unwrap(),
+            Some(scope)
+        );
+        assert_eq!(storage.inbox_failures(&recipient, scope, id).unwrap(), None);
+        assert!(storage.delivery_failures.is_empty());
+
+        // Осиротевший счётчик (подтверждение между проверкой и счётом).
+        storage
+            .delivery_failures
+            .insert(build_user_key(&recipient, 99), 1u32.to_be_bytes().to_vec())
+            .unwrap();
+        storage
+            .delivery_failures
+            .insert(b"garbage", 1u32.to_be_bytes().to_vec())
+            .unwrap();
+        assert_eq!(storage.cleanup_orphan_delivery_failures().unwrap(), 2);
+        assert!(storage.delivery_failures.is_empty());
+
+        drop(storage);
+        cleanup(&path);
+    }
+
+    /// Порция читается с заданного идентификатора, пропуская отмеченные, и
+    /// говорит, откуда читать дальше.
+    #[test]
+    fn scan_inbox_pages_and_skips() {
+        let path = temp_path("scan_inbox");
+        let storage = Storage::open(&path, keep_for_days(30), keep_for_days(30)).unwrap();
+        let recipient = user(8);
+        let sender = user(9);
+        let ids: Vec<u64> = (0..5u8)
+            .map(|i| {
+                storage
+                    .enqueue_inbox(&recipient, &sender, None, &[i], None, 0)
+                    .unwrap()
+                    .id
+            })
+            .collect();
+        // Чужая очередь в скан не попадает.
+        storage
+            .enqueue_inbox(&user(10), &sender, None, b"other", None, 0)
+            .unwrap();
+
+        let page = storage
+            .scan_inbox(&recipient, InboxScope::Account, 0, 2, |id| id == ids[0])
+            .unwrap();
+        let got: Vec<u64> = page.messages.iter().map(|m| m.id).collect();
+        assert_eq!(got, vec![ids[1], ids[2]]);
+        assert_eq!(page.next_from, Some(ids[3]));
+
+        let rest = storage
+            .scan_inbox(&recipient, InboxScope::Account, ids[3], 10, |_| false)
+            .unwrap();
+        let got: Vec<u64> = rest.messages.iter().map(|m| m.id).collect();
+        assert_eq!(got, vec![ids[3], ids[4]]);
+        assert_eq!(rest.next_from, None);
 
         drop(storage);
         cleanup(&path);

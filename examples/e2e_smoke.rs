@@ -15,7 +15,8 @@
 //!   - offline_then_online   A sends while B is offline, B reconnects, expects replay/redelivery
 //!   - delivery_ack          like online_roundtrip, then B sends DeliveryAck (the node sends no confirmation)
 //!   - crash_before_ack      B receives Incoming, drops TCP without DeliveryAck, reconnects;
-//!     expects JetStream redelivery after ack_wait (NATS_ACK_WAIT_SECS, 30s by default)
+//!     expects redelivery: JetStream after ack_wait (NATS_ACK_WAIT_SECS, 30s by default),
+//!     the sled backend right at the reconnect (the record stays queued until acked)
 //!   - no_dup_after_ack      B receives, sends DeliveryAck, reconnects; expects NO redelivery for some grace window
 //!   - device_routing        B logs in twice with device_id=1 and device_id=2, A targets device 2;
 //!     expects only device-2 connection to receive

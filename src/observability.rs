@@ -162,6 +162,30 @@ pub fn observe_message_redelivered() {
     counter!("trust_message_tcp_message_redelivered_total").increment(1);
 }
 
+/// Прямой бэкенд: клиент подтвердил запись очереди, и она снята.
+pub fn observe_sled_delivery_acked() {
+    counter!("trust_message_tcp_sled_delivery_acked_total").increment(1);
+}
+
+/// Прямой бэкенд: `DeliveryAck` не пришёл за `SLED_ACK_WAIT_SECS`, запись
+/// будет выдана снова.
+pub fn observe_sled_ack_timeout() {
+    counter!("trust_message_tcp_sled_ack_timeout_total").increment(1);
+}
+
+/// Прямой бэкенд: запись выдана `SLED_MAX_DELIVERIES` раз без подтверждения
+/// и удалена после последней выдачи. Рост — клиенты без `DeliveryAck` или
+/// клиент, который падает, не успев подтвердить.
+pub fn observe_sled_delivery_given_up() {
+    counter!("trust_message_tcp_sled_delivery_given_up_total").increment(1);
+}
+
+/// Прямой бэкенд: окно неподтверждённых сессии полно, уведомление отложено
+/// до подтверждений (запись ждёт в очереди).
+pub fn observe_sled_window_full() {
+    counter!("trust_message_tcp_sled_window_full_total").increment(1);
+}
+
 pub fn observe_jetstream_no_targets(scope: &'static str) {
     counter!(
         "trust_message_tcp_jetstream_no_targets_total",

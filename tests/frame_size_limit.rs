@@ -14,8 +14,9 @@ use std::time::Duration;
 
 use anyhow::{Result, bail};
 use common::{
-    FRAME_MAX, connect, decode, encode_ping, expect_auth_ok, next_frame, next_incoming_within,
-    random_identity, send_and_read_ack, spawn_server, spawn_server_with_internals, user_id_of,
+    FRAME_MAX, connect, decode, encode_delivery_ack, encode_ping, expect_auth_ok, next_frame,
+    next_incoming_within, random_identity, send_and_read_ack, spawn_server,
+    spawn_server_with_internals, user_id_of,
 };
 use trust_message_tcp::config::LimitsConfig;
 use trust_message_tcp::domain::reject::SendRejectReason;
@@ -132,6 +133,11 @@ async fn oversized_offline_record_is_dropped_on_replay() -> Result<()> {
         .await?
         .expect("запись после негабаритной обязана дойти");
     assert_eq!(incoming.body, b"after the oversized");
+    // Запись снимает подтверждение клиента; `Pong` ниже приходит после его
+    // обработки.
+    bob_conn
+        .send_frame(&encode_delivery_ack(incoming.message_id))
+        .await?;
 
     expect_alive(&mut bob_conn).await?;
     assert!(

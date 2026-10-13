@@ -1,3 +1,5 @@
+pub mod sled_ack;
+
 use std::fmt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,7 +24,7 @@ use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
 use crate::broker::BrokerMessage;
-use crate::config::{Config, DeliveryBackendKind};
+use crate::config::{Config, DeliveryBackendKind, SledAckConfig};
 use crate::domain::priority::MessagePriority;
 use crate::domain::reject::SendRejectReason;
 use crate::domain::wake::WakeHint;
@@ -63,11 +65,22 @@ pub enum DeliveryBackend {
 #[derive(Clone)]
 pub struct SledBackend {
     storage: Storage,
+    ack: SledAckConfig,
 }
 
 impl SledBackend {
+    /// Прямой бэкенд с подтверждениями по умолчанию.
     pub fn new(storage: Storage) -> Self {
-        Self { storage }
+        Self::with_ack_config(storage, SledAckConfig::default())
+    }
+
+    pub fn with_ack_config(storage: Storage, ack: SledAckConfig) -> Self {
+        Self { storage, ack }
+    }
+
+    /// Параметры подтверждений доставки (см. [`sled_ack`]).
+    pub fn ack_config(&self) -> SledAckConfig {
+        self.ack
     }
 }
 
@@ -495,7 +508,10 @@ impl DeliveryBackend {
         push_scheduler: PushScheduler,
     ) -> Result<Self> {
         match cfg.delivery.backend {
-            DeliveryBackendKind::Sled => Ok(Self::Sled(SledBackend { storage })),
+            DeliveryBackendKind::Sled => Ok(Self::Sled(SledBackend::with_ack_config(
+                storage,
+                cfg.delivery.sled_ack,
+            ))),
             DeliveryBackendKind::JetStream => {
                 let client = async_nats::connect(&cfg.delivery.nats_url)
                     .await
@@ -534,6 +550,14 @@ impl DeliveryBackend {
 
     pub fn is_jetstream(&self) -> bool {
         matches!(self, Self::JetStream(_))
+    }
+
+    /// Параметры подтверждений прямого бэкенда; `None` — брокерный.
+    pub fn sled_ack_config(&self) -> Option<SledAckConfig> {
+        match self {
+            Self::Sled(backend) => Some(backend.ack_config()),
+            Self::JetStream(_) => None,
+        }
     }
 
     // Параметры зеркалят поля ClientSend.
@@ -595,6 +619,9 @@ impl DeliveryBackend {
         Ok(())
     }
 
+    /// Подтверждение брокерного конверта. Прямой бэкенд подтверждения
+    /// обрабатывает в окне сессии ([`sled_ack::SledSession::ack`]), сюда они
+    /// не приходят.
     pub async fn ack_delivery(
         &self,
         user_id: UserId,
@@ -1657,6 +1684,7 @@ mod tests {
                 nats_stream_max_bytes: 1024,
                 nats_max_msgs_per_subject: 10_000,
                 nats_publish_timeout: Duration::from_millis(500),
+                sled_ack: Default::default(),
             },
             push: push_off(),
             limits: crate::config::LimitsConfig::default(),

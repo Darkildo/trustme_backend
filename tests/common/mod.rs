@@ -18,7 +18,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::time::timeout;
 use trust_message_tcp::config::{
     Config, DeliveryBackendKind, DeliveryConfig, LimitsConfig, MetricsConfig, PushConfig,
-    RetentionPolicy, ServerConfigSnapshot,
+    RetentionPolicy, ServerConfigSnapshot, SledAckConfig,
 };
 use trust_message_tcp::delivery::{DeliveryBackend, SledBackend};
 use trust_message_tcp::domain::reject::SendRejectReason;
@@ -108,6 +108,7 @@ pub fn test_config(storage_path: &str, limits: LimitsConfig) -> Config {
             nats_stream_max_bytes: 1024 * 1024,
             nats_max_msgs_per_subject: 10_000,
             nats_publish_timeout: Duration::from_millis(500),
+            sled_ack: Default::default(),
         },
         push: disabled_push_config(),
         limits,
@@ -122,7 +123,7 @@ pub fn snapshot() -> ServerConfigSnapshot {
         supports_device_addressing: true,
         deleted_messages_retention: RetentionPolicy::KeepFor(Duration::from_secs(30 * 86_400)),
         offline_messages_retention: RetentionPolicy::KeepFor(Duration::from_secs(30 * 86_400)),
-        supports_delivery_ack: false,
+        supports_delivery_ack: true,
         config_ttl: Duration::from_secs(3600),
         advertised_address: None,
     }
@@ -303,6 +304,9 @@ pub struct NodeOptions {
     /// `Some` — потолок срока сертификата устройства вместо 30 суток
     /// (`Duration::ZERO` выключает делегированный вход).
     pub device_cert_max_ttl: Option<Duration>,
+    /// `Some` — подтверждения прямого бэкенда вместо значений по
+    /// умолчанию: передоставку с боевыми тридцатью секундами не проверить.
+    pub sled_ack: Option<SledAckConfig>,
 }
 
 /// Нода с произвольным набором опций и её внутренности.
@@ -370,6 +374,7 @@ async fn spawn_node_with_internals(
         max_frame_len,
         storage_path: external_storage,
         device_cert_max_ttl,
+        sled_ack,
     } = options;
     let owns_storage = external_storage.is_none();
     let storage_path = external_storage.unwrap_or_else(|| temp_storage_path(label));
@@ -401,6 +406,9 @@ async fn spawn_node_with_internals(
     if let Some(ttl) = device_cert_max_ttl {
         cfg.device_cert_max_ttl = ttl;
     }
+    if let Some(sled_ack) = sled_ack {
+        cfg.delivery.sled_ack = sled_ack;
+    }
     if let Some(setup) = &jetstream {
         cfg.delivery.backend = DeliveryBackendKind::JetStream;
         cfg.delivery.nats_url = setup.nats_url.clone();
@@ -417,7 +425,10 @@ async fn spawn_node_with_internals(
         )
         .await?
     } else {
-        DeliveryBackend::Sled(SledBackend::new(storage.clone()))
+        DeliveryBackend::Sled(SledBackend::with_ack_config(
+            storage.clone(),
+            cfg.delivery.sled_ack,
+        ))
     };
 
     let listener = TcpListener::bind(&cfg.bind_addr).await?;

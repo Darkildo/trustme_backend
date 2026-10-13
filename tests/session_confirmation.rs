@@ -25,7 +25,8 @@ use trust_message_tcp::wire::frame;
 
 /// Слать, пока отправка не ляжет в очередь: так видно, что нода забыла
 /// прежние сессии получателя. Попытки, ушедшие в закрывающуюся сессию,
-/// пропадают вместе с ней — в очереди остаётся ровно последняя.
+/// тоже лежат в очереди — их никто не подтвердил, — поэтому подряд идущие
+/// повторы одного тела сравниваются как одно (см. [`drain_bodies`]).
 async fn send_until_queued(conn: &mut Conn, recipient: &[u8; 32], body: &[u8]) -> Result<()> {
     for _ in 0..100 {
         let ack = send_and_read_ack(conn, recipient, body, 0).await?;
@@ -37,12 +38,14 @@ async fn send_until_queued(conn: &mut Conn, recipient: &[u8; 32], body: &[u8]) -
     bail!("the recipient's old session never left the registry")
 }
 
-/// Все входящие, которые нода отдаёт подряд, пока не замолчит.
+/// Все входящие, которые нода отдаёт подряд, пока не замолчит; подряд
+/// идущие одинаковые тела схлопываются в одно.
 async fn drain_bodies(conn: &mut Conn) -> Result<Vec<Vec<u8>>> {
     let mut bodies = Vec::new();
     while let Some(incoming) = next_incoming_within(conn, Duration::from_millis(300)).await? {
         bodies.push(incoming.body);
     }
+    bodies.dedup();
     Ok(bodies)
 }
 
