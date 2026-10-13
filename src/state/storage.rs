@@ -626,6 +626,23 @@ impl Storage {
         self.delivery_failures.is_empty()
     }
 
+    /// Лежит ли ещё запись, которую сессия получателя может подтвердить
+    /// (account или своего устройства).
+    pub fn ack_inbox_probe(
+        &self,
+        recipient: &[u8; 32],
+        device_id: Option<DeviceId>,
+        id: u64,
+    ) -> Result<bool> {
+        if self.inbox_contains(recipient, InboxScope::Account, id)? {
+            return Ok(true);
+        }
+        match device_id {
+            Some(device_id) => self.inbox_contains(recipient, InboxScope::Device(device_id), id),
+            None => Ok(false),
+        }
+    }
+
     /// Снять счётчики неудачных выдач, чьих записей уже нет (см.
     /// [`Self::record_failed_delivery`]). Возвращает число снятых.
     pub fn cleanup_orphan_delivery_failures(&self) -> Result<usize> {
