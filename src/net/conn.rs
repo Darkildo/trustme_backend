@@ -354,6 +354,9 @@ pub async fn handle_conn(
     };
     tokio::pin!(cert_expiry);
     let mut confirming_frame = Some(confirming_frame);
+    // Подтверждающий кадр клиент послал до первой выдачи, хотя читается он
+    // после неё: живости после выдачи он не доказывает.
+    let mut confirming_pending = true;
 
     'session: loop {
         let pull_ready = sled.as_ref().is_some_and(SledSession::wants_pull);
@@ -398,6 +401,13 @@ pub async fn handle_conn(
               }
               debug!(user = %hex::encode(user_id), size = bytes.len(), "received frame from client");
               frames_received += 1;
+              // Клиент жив на момент всех уже сделанных выдач — это нужно
+              // окну, чтобы не считать неудачей выдачу в мёртвый сокет.
+              if !std::mem::take(&mut confirming_pending)
+                  && let Some(session) = sled.as_mut()
+              {
+                  session.note_client_frame();
+              }
               observability::observe_frame_received();
 
               let incoming_frame = match decode_frame(bytes.as_ref()) {
@@ -876,22 +886,34 @@ pub async fn handle_conn(
                           // доставка только онлайн, `message_id = 0`, как до
                           // подтверждений.
                           let durable = server_config.supports_offline_messages();
-                          let route_targets = registry.route_targets(&recipient, recipient_device_id);
+                          let recipient_online = match recipient_device_id {
+                              Some(target_device_id) => {
+                                  registry.has_device(&recipient, target_device_id)
+                              }
+                              None => registry.has_user(&recipient),
+                          };
 
                           // Квоты очереди прямого бэкенда. С хранением они
                           // меряют неподтверждённое и действуют и для живого
                           // получателя: иначе не подтверждающая сессия копила
-                          // бы записи без предела. Брокерный путь ограничен
-                          // лимитами самого потока JetStream и сюда не
-                          // заходит.
+                          // бы записи без предела. Под-квота пары
+                          // отправитель→получатель для живого получателя не
+                          // действует: она защищает офлайн-очередь от одного
+                          // громкого отправителя, а у живого получателя записи
+                          // уходят по подтверждениям, и быстрый, но честный
+                          // поток одного отправителя упирался бы в неё ещё до
+                          // первого `DeliveryAck`. Общие потолки очереди
+                          // остаются. Брокерный путь ограничен лимитами самого
+                          // потока JetStream и сюда не заходит.
                           let mut depth_before = None;
-                          if durable || route_targets.is_empty() {
+                          if durable || !recipient_online {
                               let quota = match queue_quota_reason(
                                   &storage,
                                   &limits,
                                   &recipient,
                                   recipient_device_id,
                                   &user_id,
+                                  !recipient_online,
                               ) {
                                   Ok(quota) => quota,
                                   Err(err) => {
@@ -908,6 +930,11 @@ pub async fn handle_conn(
                                   }
                               };
                               if let Some(reason) = quota.reason {
+                                  observability::observe_queue_full(if recipient_online {
+                                      "online"
+                                  } else {
+                                      "offline"
+                                  });
                                   warn!(
                                       sender = %hex::encode(user_id),
                                       recipient = %hex::encode(recipient),
@@ -976,6 +1003,13 @@ pub async fn handle_conn(
                               &body,
                               priority,
                           );
+                          // Снимок целей — после записи в очередь: сессия,
+                          // зарегистрированная до снимка, получит уведомление,
+                          // а зарегистрированная после него — найдёт запись
+                          // своим дочитыванием при подключении. Снимок до
+                          // записи терял бы сессию, пришедшую между ними, до
+                          // её следующего перечитывания очереди.
+                          let route_targets = registry.route_targets(&recipient, recipient_device_id);
                           let mut delivered_count = 0usize;
 
                           // Канал получателя не ждём: отправитель не должен
@@ -1808,12 +1842,17 @@ fn queue_quota_reason(
     recipient: &UserId,
     recipient_device_id: Option<DeviceId>,
     sender: &UserId,
+    sender_pair: bool,
 ) -> Result<QuotaVerdict> {
     let cfg = &limits.cfg;
     let ceilings = QueueQuotaCeilings {
         messages: cfg.max_messages_per_queue as u64,
         bytes: cfg.max_bytes_per_queue,
-        from_sender: cfg.max_messages_sender_pair as u64,
+        from_sender: if sender_pair {
+            cfg.max_messages_sender_pair as u64
+        } else {
+            0
+        },
     };
 
     if ceilings.messages == 0 && ceilings.bytes == 0 && ceilings.from_sender == 0 {
@@ -1822,12 +1861,24 @@ fn queue_quota_reason(
             depth_before: None,
         });
     }
+    if limits
+        .queue_full
+        .is_full(recipient, recipient_device_id, sender)
+    {
+        return Ok(QuotaVerdict {
+            reason: Some(SendRejectReason::Full),
+            depth_before: None,
+        });
+    }
 
     let scan = storage.scan_queue_quota(recipient, recipient_device_id, sender, ceilings)?;
-    let reason = if (ceilings.messages > 0 && scan.messages >= ceilings.messages)
-        || (ceilings.bytes > 0 && scan.bytes >= ceilings.bytes)
-        || (ceilings.from_sender > 0 && scan.from_sender >= ceilings.from_sender)
-    {
+    let queue_full = (ceilings.messages > 0 && scan.messages >= ceilings.messages)
+        || (ceilings.bytes > 0 && scan.bytes >= ceilings.bytes);
+    let pair_full = ceilings.from_sender > 0 && scan.from_sender >= ceilings.from_sender;
+    let reason = if queue_full || pair_full {
+        limits
+            .queue_full
+            .remember(recipient, recipient_device_id, sender, !queue_full);
         Some(SendRejectReason::Full)
     } else {
         None
@@ -2806,14 +2857,14 @@ mod tests {
         }
 
         assert_eq!(
-            queue_quota_reason(&storage, &limits, &recipient, None, &sender)
+            queue_quota_reason(&storage, &limits, &recipient, None, &sender, true)
                 .unwrap()
                 .reason,
             Some(SendRejectReason::Full)
         );
         // Очередь другого получателя не затронута.
         assert_eq!(
-            queue_quota_reason(&storage, &limits, &[7u8; 32], None, &sender)
+            queue_quota_reason(&storage, &limits, &[7u8; 32], None, &sender, true)
                 .unwrap()
                 .reason,
             None
@@ -2841,7 +2892,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            queue_quota_reason(&storage, &limits, &recipient, None, &sender)
+            queue_quota_reason(&storage, &limits, &recipient, None, &sender, true)
                 .unwrap()
                 .reason,
             Some(SendRejectReason::Full)
@@ -2873,18 +2924,83 @@ mod tests {
         }
 
         assert_eq!(
-            queue_quota_reason(&storage, &limits, &recipient, None, &loud)
+            queue_quota_reason(&storage, &limits, &recipient, None, &loud, true)
                 .unwrap()
                 .reason,
             Some(SendRejectReason::Full)
         );
         // Другой отправитель в ту же очередь всё ещё проходит.
         assert_eq!(
-            queue_quota_reason(&storage, &limits, &recipient, None, &quiet)
+            queue_quota_reason(&storage, &limits, &recipient, None, &quiet, true)
                 .unwrap()
                 .reason,
             None
         );
+
+        drop(storage);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Для живого получателя под-квота пары не действует, общие потолки —
+    /// да.
+    #[test]
+    fn online_recipient_skips_only_the_sender_pair_quota() {
+        let (storage, path) = open_temp_storage("quota_online_pair");
+        let recipient = [20u8; 32];
+        let loud = [21u8; 32];
+        let limits = limits_with(LimitsConfig {
+            max_messages_per_queue: 3,
+            max_bytes_per_queue: 0,
+            max_messages_sender_pair: 2,
+            ..LimitsConfig::default()
+        });
+        for _ in 0..2 {
+            storage
+                .enqueue_inbox(&recipient, &loud, None, b"burst", None, 0)
+                .unwrap();
+        }
+        let online = |sender: &[u8; 32]| {
+            queue_quota_reason(&storage, &limits, &recipient, None, sender, false)
+                .unwrap()
+                .reason
+        };
+        assert_eq!(online(&loud), None);
+        storage
+            .enqueue_inbox(&recipient, &loud, None, b"burst", None, 0)
+            .unwrap();
+        assert_eq!(online(&loud), Some(SendRejectReason::Full));
+
+        drop(storage);
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    /// Вердикт «полна» живёт секунду: повторный приём к полной очереди её не
+    /// сканирует и отвергается, даже если место уже освободилось.
+    #[test]
+    fn full_verdict_is_cached_briefly() {
+        let (storage, path) = open_temp_storage("quota_cache");
+        let recipient = [22u8; 32];
+        let sender = [23u8; 32];
+        let limits = limits_with(LimitsConfig {
+            max_messages_per_queue: 1,
+            max_bytes_per_queue: 0,
+            max_messages_sender_pair: 0,
+            ..LimitsConfig::default()
+        });
+        let id = storage
+            .enqueue_inbox(&recipient, &sender, None, b"x", None, 0)
+            .unwrap()
+            .id;
+        let verdict = || {
+            queue_quota_reason(&storage, &limits, &recipient, None, &sender, true)
+                .unwrap()
+                .reason
+        };
+        assert_eq!(verdict(), Some(SendRejectReason::Full));
+        storage.remove_inbox(&recipient, id).unwrap();
+        assert_eq!(verdict(), Some(SendRejectReason::Full), "cached");
+        std::thread::sleep(crate::net::rate_limit::QueueFullCache::TTL);
+        assert_eq!(verdict(), None);
 
         drop(storage);
         let _ = std::fs::remove_dir_all(&path);
@@ -2908,13 +3024,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            queue_quota_reason(&storage, &limits, &recipient, None, &sender)
+            queue_quota_reason(&storage, &limits, &recipient, None, &sender, true)
                 .unwrap()
                 .reason,
             Some(SendRejectReason::Full)
         );
         assert_eq!(
-            queue_quota_reason(&storage, &limits, &recipient, Some(7), &sender)
+            queue_quota_reason(&storage, &limits, &recipient, Some(7), &sender, true)
                 .unwrap()
                 .reason,
             None
@@ -2944,7 +3060,7 @@ mod tests {
         }
 
         assert_eq!(
-            queue_quota_reason(&storage, &limits, &recipient, None, &sender)
+            queue_quota_reason(&storage, &limits, &recipient, None, &sender, true)
                 .unwrap()
                 .reason,
             None

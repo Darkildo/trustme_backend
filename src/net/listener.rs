@@ -63,6 +63,7 @@ pub async fn accept_loop(
         cfg.limits.max_connections
     }));
     let keepalive = tcp_keepalive_params(&cfg.limits);
+    let user_timeout = tcp_user_timeout(&cfg.limits);
     let mut backoff = AcceptBackoff::new(ACCEPT_BACKOFF_INITIAL, ACCEPT_BACKOFF_MAX);
 
     info!(
@@ -106,7 +107,7 @@ pub async fn accept_loop(
                 continue;
             }
         };
-        configure_accepted_socket(&stream, keepalive.as_ref());
+        configure_accepted_socket(&stream, keepalive.as_ref(), user_timeout);
 
         let registry = registry.clone();
         let storage = storage.clone();
@@ -169,9 +170,19 @@ fn tcp_keepalive_params(limits: &LimitsConfig) -> Option<TcpKeepalive> {
     Some(params)
 }
 
+/// `TCP_USER_TIMEOUT` из конфигурации; `None` — системное поведение
+/// (`TCP_USER_TIMEOUT_SECS=0`).
+fn tcp_user_timeout(limits: &LimitsConfig) -> Option<Duration> {
+    (limits.tcp_user_timeout_secs > 0).then(|| Duration::from_secs(limits.tcp_user_timeout_secs))
+}
+
 /// Опции принятого сокета. Ошибка любой из них не повод рвать соединение:
 /// сессия работает и без них, только хуже.
-fn configure_accepted_socket(stream: &TcpStream, keepalive: Option<&TcpKeepalive>) {
+fn configure_accepted_socket(
+    stream: &TcpStream,
+    keepalive: Option<&TcpKeepalive>,
+    user_timeout: Option<Duration>,
+) {
     // Кадры протокола маленькие (ack — десяток байт), и Nagle придерживает
     // их до подтверждения предыдущего сегмента; в паре с delayed-ACK
     // получателя это добавляет ~40 мс к каждому ответу.
@@ -186,6 +197,17 @@ fn configure_accepted_socket(stream: &TcpStream, keepalive: Option<&TcpKeepalive
     {
         warn!(error = %err, "failed to enable tcp keepalive on accepted socket");
     }
+    // Keepalive молчит, пока нода пишет: полуоткрытый сокет, в который
+    // идут повторы выдачи, живёт до системного таймаута ретрансмиссий
+    // (~15 мин) и держит неподтверждённые конверты за мёртвой сессией.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    if let Some(timeout) = user_timeout
+        && let Err(err) = SockRef::from(stream).set_tcp_user_timeout(Some(timeout))
+    {
+        warn!(error = %err, "failed to set tcp user timeout on accepted socket");
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    let _ = user_timeout;
 }
 
 /// Экспоненциальная пауза между неудачными `accept`.
@@ -268,6 +290,7 @@ where
 mod tests {
     use super::{
         AcceptBackoff, accept_with_backoff, configure_accepted_socket, tcp_keepalive_params,
+        tcp_user_timeout,
     };
     use crate::config::LimitsConfig;
     use socket2::SockRef;
@@ -377,11 +400,16 @@ mod tests {
         let params = tcp_keepalive_params(&limits).expect("keepalive is enabled");
         let (server, _client) = accepted_pair().await;
 
-        configure_accepted_socket(&server, Some(&params));
+        configure_accepted_socket(&server, Some(&params), tcp_user_timeout(&limits));
 
         let socket = SockRef::from(&server);
         assert!(socket.keepalive().unwrap());
         assert!(server.nodelay().unwrap());
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            socket.tcp_user_timeout().unwrap(),
+            Some(Duration::from_secs(120))
+        );
         #[cfg(target_os = "linux")]
         {
             assert_eq!(
@@ -407,7 +435,7 @@ mod tests {
         assert!(tcp_keepalive_params(&limits).is_none());
 
         let (server, _client) = accepted_pair().await;
-        configure_accepted_socket(&server, None);
+        configure_accepted_socket(&server, None, None);
         assert!(!SockRef::from(&server).keepalive().unwrap());
         assert!(server.nodelay().unwrap());
     }

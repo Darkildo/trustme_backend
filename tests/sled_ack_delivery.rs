@@ -23,7 +23,7 @@ use common::{
 use ed25519_dalek::SigningKey;
 use tokio::net::TcpSocket;
 use tokio::time::Instant;
-use trust_message_tcp::config::{LimitsConfig, SledAckConfig};
+use trust_message_tcp::config::{LimitsConfig, RetentionPolicy, SledAckConfig};
 use trust_message_tcp::net::noise::NoiseFramed;
 use trust_message_tcp::state::storage::InboxScope;
 use trust_message_tcp::wire::frame;
@@ -282,12 +282,44 @@ async fn envelopes_in_the_channel_survive_a_disconnect() -> Result<()> {
     Ok(())
 }
 
-/// Клиент, который `DeliveryAck` не шлёт (старый), получает конверт не
-/// больше `max_deliveries` раз; дальше запись удаляется, и круг
-/// повторов кончается.
+/// Прочитать сессию за `window`: тела входящих (Pong и прочее
+/// пропускаются). Пингует каждые `ping_every`, если задано.
+async fn collect(
+    conn: &mut Conn,
+    window: Duration,
+    ping_every: Option<Duration>,
+) -> Result<Vec<Vec<u8>>> {
+    let deadline = Instant::now() + window;
+    let mut bodies = Vec::new();
+    let mut next_ping = Instant::now();
+    while Instant::now() < deadline {
+        if let Some(every) = ping_every
+            && Instant::now() >= next_ping
+        {
+            conn.send_frame(&encode_ping()).await?;
+            next_ping = Instant::now() + every;
+        }
+        let step =
+            Duration::from_millis(50).min(deadline.saturating_duration_since(Instant::now()));
+        match tokio::time::timeout(step, conn.next_frame()).await {
+            Ok(Ok(Some(bytes))) => {
+                if let frame::Payload::Incoming(incoming) = common::decode(&bytes)? {
+                    bodies.push(incoming.body);
+                }
+            }
+            Ok(Ok(None)) | Ok(Err(_)) => bail!("session closed"),
+            Err(_) => {}
+        }
+    }
+    Ok(bodies)
+}
+
+/// Явный предел (`SLED_MAX_DELIVERIES`) для клиента, который
+/// `DeliveryAck` не шлёт: живая сессия пингует, конверт повторяется по
+/// `ack_wait`, и выдача номер три — последняя.
 #[tokio::test]
 async fn client_without_acks_gets_a_bounded_number_of_deliveries() -> Result<()> {
-    let (server, node) = node("ack_legacy", ack_cfg(Duration::from_secs(30), 3, 1024)).await?;
+    let (server, node) = node("ack_legacy", ack_cfg(Duration::from_millis(200), 3, 1024)).await?;
     let alice = random_identity();
     let bob = random_identity();
     let bob_id = user_id_of(&bob);
@@ -295,20 +327,82 @@ async fn client_without_acks_gets_a_bounded_number_of_deliveries() -> Result<()>
     let ack = send_and_read_ack(&mut alice_conn, &bob_id, b"legacy", 0).await?;
     assert!(ack.queued);
 
-    let mut deliveries = 0;
-    for _ in 0..6 {
-        let mut conn = session(&server, &bob, 1).await?;
-        while let Some(incoming) = next_incoming_within(&mut conn, SILENCE).await? {
-            assert_eq!(incoming.body, b"legacy");
-            deliveries += 1;
-        }
-    }
-    assert_eq!(deliveries, 3);
+    let mut conn = session(&server, &bob, 1).await?;
+    let bodies = collect(
+        &mut conn,
+        Duration::from_secs(2),
+        Some(Duration::from_millis(50)),
+    )
+    .await?;
+    assert_eq!(bodies, vec![b"legacy".to_vec(); 3]);
     assert_eq!(
         node.storage
             .inbox_failures(&bob_id, InboxScope::Account, ack.queue_id)?,
         None
     );
+    Ok(())
+}
+
+/// Полуоткрытый сокет: клиент молчит (ни кадров, ни подтверждений), повторы
+/// по `ack_wait` идут, но неудачами не считаются — даже с пределом выдач
+/// запись доживает до следующей сессии.
+#[tokio::test]
+async fn silent_session_does_not_burn_the_delivery_limit() -> Result<()> {
+    let (server, node) = node("ack_silent", ack_cfg(Duration::from_millis(100), 3, 1024)).await?;
+    let alice = random_identity();
+    let bob = random_identity();
+    let bob_id = user_id_of(&bob);
+    let mut alice_conn = session(&server, &alice, 1).await?;
+    let ack = send_and_read_ack(&mut alice_conn, &bob_id, b"keep me", 0).await?;
+
+    let mut silent = session(&server, &bob, 1).await?;
+    // Около пятнадцати сроков без единого кадра клиента.
+    let bodies = collect(&mut silent, Duration::from_millis(1500), None).await?;
+    assert!(bodies.len() > 3, "redelivery must go on: {}", bodies.len());
+    drop(silent);
+    assert_eq!(
+        node.storage
+            .inbox_failures(&bob_id, InboxScope::Account, ack.queue_id)?,
+        Some(0)
+    );
+
+    let mut back = session(&server, &bob, 1).await?;
+    let incoming = next_incoming_within(&mut back, ARRIVAL)
+        .await?
+        .context("the record must survive a silent session")?;
+    assert_eq!(incoming.body, b"keep me");
+    Ok(())
+}
+
+/// Большой бэклог и короткие пробуждения: за каждое клиент подтверждает
+/// одну запись и гибнет. Необработанный хвост неудачей не считается — с
+/// пределом в две выдачи доходит всё.
+#[tokio::test]
+async fn short_wakeups_keep_the_unprocessed_tail() -> Result<()> {
+    const QUEUED: usize = 8;
+    let (server, node) = node("ack_wakeups", ack_cfg(Duration::from_secs(30), 2, 4)).await?;
+    let alice = random_identity();
+    let bob = random_identity();
+    let bob_id = user_id_of(&bob);
+    let mut alice_conn = session(&server, &alice, 1).await?;
+    for index in 0..QUEUED {
+        let ack = send_and_read_ack(&mut alice_conn, &bob_id, &[index as u8], 0).await?;
+        assert!(ack.queued);
+    }
+
+    let mut processed = Vec::new();
+    for _ in 0..QUEUED {
+        let mut wake = session(&server, &bob, 1).await?;
+        let first = next_incoming_within(&mut wake, ARRIVAL)
+            .await?
+            .context("the backlog must still be there")?;
+        ack_and_sync(&mut wake, first.message_id).await?;
+        processed.push(first.body[0]);
+        // Процесс убит: окно с остальным не подтверждено.
+    }
+    processed.sort_unstable();
+    assert_eq!(processed, (0..QUEUED as u8).collect::<Vec<_>>());
+    assert_eq!(node.storage.queue_usage(&bob_id, None)?.messages, 0);
     Ok(())
 }
 
@@ -407,5 +501,45 @@ async fn second_device_reads_and_settles_an_unacked_account_envelope() -> Result
     drop(phone);
     let mut phone = session(&server, &bob, 1).await?;
     assert!(next_incoming_within(&mut phone, SILENCE).await?.is_none());
+    Ok(())
+}
+
+/// Хранение выключено (`OFFLINE_MESSAGES_RETENTION=instant`): подтверждения
+/// не объявляются, живой сессии конверт приходит с `messageId = 0`, окна нет,
+/// офлайн-получателю конверт не сохраняется.
+#[tokio::test]
+async fn immediate_retention_keeps_the_online_only_path() -> Result<()> {
+    let (server, node) = spawn_node_with(
+        "ack_instant",
+        open_limits(),
+        NodeOptions {
+            offline_retention: Some(RetentionPolicy::Immediate),
+            ..NodeOptions::default()
+        },
+    )
+    .await?;
+    let alice = random_identity();
+    let bob = random_identity();
+    let bob_id = user_id_of(&bob);
+
+    let mut bob_conn = session(&server, &bob, 1).await?;
+    bob_conn.send_frame(&encode_get_server_config()?).await?;
+    let config = expect_signed_config(&next_frame(&mut bob_conn).await?, &server.node_public)?;
+    assert!(!config.supports_delivery_ack);
+
+    let mut alice_conn = session(&server, &alice, 1).await?;
+    let ack = send_and_read_ack(&mut alice_conn, &bob_id, b"live only", 0).await?;
+    assert!(ack.ok && !ack.queued && ack.queue_id == 0, "{ack:?}");
+    let incoming = next_incoming_within(&mut bob_conn, ARRIVAL)
+        .await?
+        .context("online delivery")?;
+    assert_eq!(incoming.message_id, 0);
+    assert_eq!(incoming.body, b"live only");
+    assert_eq!(node.storage.queue_usage(&bob_id, None)?.messages, 0);
+
+    drop(bob_conn);
+    let stranger = random_identity();
+    let ack = send_and_read_ack(&mut alice_conn, &user_id_of(&stranger), b"nobody", 0).await?;
+    assert!(!ack.ok && !ack.queued, "nothing may be stored: {ack:?}");
     Ok(())
 }

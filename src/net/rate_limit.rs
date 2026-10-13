@@ -6,7 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::LimitsConfig;
-use crate::state::registry::UserId;
+use crate::state::registry::{DeviceId, UserId};
 
 /// Счётчики одного пользователя: фиксированное секундное окно для msg/s и
 /// UTC-суточное окно для байт.
@@ -306,14 +306,66 @@ impl HandshakeAdmission {
 pub struct SessionLimits {
     pub cfg: LimitsConfig,
     pub send: SendRateLimiter,
+    /// Недавние ответы «очередь полна» (см. [`QueueFullCache`]).
+    pub queue_full: QueueFullCache,
 }
 
 impl SessionLimits {
     pub fn new(cfg: LimitsConfig) -> Self {
         Self {
             send: SendRateLimiter::new(cfg.send_msgs_per_sec, cfg.send_bytes_per_day),
+            queue_full: QueueFullCache::default(),
             cfg,
         }
+    }
+}
+
+/// Ключ вердикта: очередь получателя и, для под-квоты пары, отправитель
+/// (`None` — переполнена вся очередь).
+type QueueFullKey = (UserId, Option<DeviceId>, Option<UserId>);
+
+/// Вердикт «очередь полна» на [`QueueFullCache::TTL`].
+///
+/// У полной очереди счётчики выше потолка, и быстрый путь квоты не
+/// срабатывает: без кэша каждый `ClientSend` к ней — полный проход по
+/// очереди. Отправитель, долбящий в полную очередь, получал бы скан на
+/// каждый кадр. Цена кэша — отказ `FULL` ещё до секунды после того, как
+/// подтверждения освободили место.
+#[derive(Default)]
+pub struct QueueFullCache {
+    until: DashMap<QueueFullKey, std::time::Instant>,
+}
+
+impl QueueFullCache {
+    pub const TTL: std::time::Duration = std::time::Duration::from_secs(1);
+    /// Сколько ключей держать, прежде чем вычистить истёкшие.
+    const SWEEP_AT: usize = 4096;
+
+    /// Свежий вердикт «полна» для очереди или для пары с `sender`.
+    pub fn is_full(&self, recipient: &UserId, device: Option<DeviceId>, sender: &UserId) -> bool {
+        let now = std::time::Instant::now();
+        [None, Some(*sender)].into_iter().any(|sender| {
+            self.until
+                .get(&(*recipient, device, sender))
+                .is_some_and(|until| *until > now)
+        })
+    }
+
+    /// Запомнить вердикт: `pair_only` — упёрлась только под-квота пары.
+    pub fn remember(
+        &self,
+        recipient: &UserId,
+        device: Option<DeviceId>,
+        sender: &UserId,
+        pair_only: bool,
+    ) {
+        let now = std::time::Instant::now();
+        if self.until.len() >= Self::SWEEP_AT {
+            self.until.retain(|_, until| *until > now);
+        }
+        let sender = pair_only.then_some(*sender);
+        self.until
+            .insert((*recipient, device, sender), now + Self::TTL);
     }
 }
 

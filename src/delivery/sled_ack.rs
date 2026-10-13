@@ -12,17 +12,29 @@
 //! подтверждённые, со сроком `ack_wait`. Окно ограничено `max_unacked`;
 //! полное окно не выписывает сессию, а откладывает выдачу — запись
 //! дочитается из очереди, когда подтверждения освободят место. Истёкшая
-//! запись выдаётся снова той же сессии. Неподтверждённые выдачи считаются в
-//! хранилище; выдача номер `max_deliveries` — последняя: после записи в
-//! сокет запись удаляется, как удалялась до подтверждений вовсе. Так клиент,
-//! который `DeliveryAck` не шлёт, получает каждый конверт ограниченное
-//! число раз.
+//! запись выдаётся снова той же сессии.
+//!
+//! По умолчанию повторы не ограничены, как у брокера: запись живёт до
+//! подтверждения или конца хранения. `max_deliveries > 0` — ручка для
+//! клиентов без `DeliveryAck`: неудачные выдачи считаются в хранилище, и
+//! выдача номер `max_deliveries` — последняя (после записи в сокет запись
+//! удаляется, как до подтверждений вовсе).
+//!
+//! Неудачей считается только выдача, про которую доказано, что клиент жив и
+//! её не подтвердил: «не успел обработать» — не неудача. Доказательство —
+//! клиент подтвердил то, что ему выдали позже (клиент обрабатывает по
+//! порядку, значит, этот конверт он отверг), либо, если сессия не прислала
+//! ни одного подтверждения вовсе, любой кадр клиента после выдачи (клиент
+//! без `DeliveryAck`). Мёртвый сокет (телефон пропал без FIN) кадров не
+//! шлёт и неудач не копит, а рвёт его `TCP_USER_TIMEOUT`. Сессия, ушедшая
+//! с хвостом необработанного (короткое фоновое пробуждение), засчитывает
+//! неудачу только записям раньше последней подтверждённой.
 //!
 //! Семантика повторяет брокерный бэкенд (`ack_wait`, `max_ack_pending`,
 //! области подтверждения); отличия — в документации `docs/architecture.md`.
 
 use std::cmp::Reverse;
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 use anyhow::Result;
 use tokio::time::Instant;
@@ -58,6 +70,8 @@ pub enum WriteDecision {
 struct Pending {
     scope: InboxScope,
     deadline: Instant,
+    /// Порядковый номер выдачи в этой сессии.
+    seq: u64,
 }
 
 /// Окно подтверждений одной сессии и курсоры дочитывания её очередей.
@@ -80,6 +94,16 @@ pub struct SledSession {
     device_from: Option<u64>,
     registry: ConnRegistry,
     connection_id: ConnectionId,
+    /// Номер следующей выдачи в сессии (с 1).
+    next_seq: u64,
+    /// Наибольший номер выдачи, подтверждённой этой сессией; 0 — ни одной.
+    acked_seq: u64,
+    /// `next_seq` на момент последнего кадра клиента: выдачи с меньшим
+    /// номером клиент застал живым.
+    frame_seq: u64,
+    /// Истёкшие и ждущие повторной выдачи — для метрики повторов, когда
+    /// счётчик неудач не ведётся.
+    expired: HashSet<u64>,
 }
 
 impl SledSession {
@@ -104,7 +128,27 @@ impl SledSession {
             device_from: device_id.map(|_| 0),
             registry,
             connection_id,
+            next_seq: 1,
+            acked_seq: 0,
+            frame_seq: 0,
+            expired: HashSet::new(),
         }
+    }
+
+    /// Кадр клиента прочитан: клиент жив на момент всех уже сделанных выдач.
+    pub fn note_client_frame(&mut self) {
+        self.frame_seq = self.next_seq;
+    }
+
+    /// Доказано ли, что живой клиент выдачу `seq` не подтвердил, а не просто
+    /// не успел обработать (см. документацию модуля).
+    fn proven_unacked(&self, seq: u64) -> bool {
+        seq < self.acked_seq || (self.acked_seq == 0 && seq < self.frame_seq)
+    }
+
+    /// Ведётся ли счёт неудач: только при заданном пределе выдач.
+    fn counts_failures(&self) -> bool {
+        self.cfg.max_deliveries > 0
     }
 
     pub fn unacked(&self) -> usize {
@@ -211,14 +255,28 @@ impl SledSession {
         Offer::Accept
     }
 
-    /// Проверить запись перед выдачей.
-    pub fn prepare(&self, scope: InboxScope, id: u64) -> Result<WriteDecision> {
+    /// Проверить запись перед выдачей. Без предела выдач счётчик неудач не
+    /// читается: одна точечная проверка, что запись на месте.
+    pub fn prepare(&mut self, scope: InboxScope, id: u64) -> Result<WriteDecision> {
+        if !self.counts_failures() {
+            if !self.storage.inbox_contains(&self.user_id, scope, id)? {
+                self.expired.remove(&id);
+                return Ok(WriteDecision::Skip);
+            }
+            return Ok(WriteDecision::Deliver {
+                last: false,
+                redelivery: self.expired.remove(&id),
+            });
+        }
         Ok(
             match self.storage.inbox_failures(&self.user_id, scope, id)? {
-                None => WriteDecision::Skip,
+                None => {
+                    self.expired.remove(&id);
+                    WriteDecision::Skip
+                }
                 Some(failures) => WriteDecision::Deliver {
-                    last: failures.saturating_add(1) >= self.cfg.max_deliveries.max(1),
-                    redelivery: failures > 0,
+                    last: failures.saturating_add(1) >= self.cfg.max_deliveries,
+                    redelivery: self.expired.remove(&id) || failures > 0,
                 },
             },
         )
@@ -241,7 +299,16 @@ impl SledSession {
             return Ok(());
         }
         let deadline = Instant::now() + self.cfg.ack_wait;
-        self.pending.insert(id, Pending { scope, deadline });
+        let seq = self.next_seq;
+        self.next_seq += 1;
+        self.pending.insert(
+            id,
+            Pending {
+                scope,
+                deadline,
+                seq,
+            },
+        );
         self.deadlines.push(Reverse((deadline, id)));
         Ok(())
     }
@@ -249,7 +316,9 @@ impl SledSession {
     /// `DeliveryAck` этой сессии. Место в окне освобождается в любом
     /// случае; `true` — запись была и снята.
     pub fn ack(&mut self, id: u64) -> Result<bool> {
-        self.pending.remove(&id);
+        if let Some(pending) = self.pending.remove(&id) {
+            self.acked_seq = self.acked_seq.max(pending.seq);
+        }
         let acked = self.storage.ack_inbox(&self.user_id, self.device_id, id)?;
         if acked.is_some() {
             observability::observe_sled_delivery_acked();
@@ -270,8 +339,10 @@ impl SledSession {
         None
     }
 
-    /// Снять из окна всё, что не подтверждено к `now`, учесть неудачу и
-    /// пометить к повторной выдаче. Возвращает число истёкших записей.
+    /// Снять из окна всё, что не подтверждено к `now`, и пометить к
+    /// повторной выдаче. Неудача учитывается, только если доказана (см.
+    /// документацию модуля) и задан предел выдач. Возвращает число истёкших
+    /// записей.
     pub fn expire(&mut self, now: Instant) -> Result<usize> {
         let mut expired = 0usize;
         while let Some(Reverse((deadline, id))) = self.deadlines.peek().copied() {
@@ -286,17 +357,17 @@ impl SledSession {
                 continue;
             }
             self.pending.remove(&id);
-            // Записи нет — её подтвердила другая сессия аккаунта или она
-            // истекла: выдавать снова нечего.
-            if self
-                .storage
-                .record_failed_delivery(&self.user_id, pending.scope, id)?
-                .is_some()
-            {
-                expired += 1;
-                observability::observe_sled_ack_timeout();
-                self.mark(pending.scope, id);
+            if self.counts_failures() && self.proven_unacked(pending.seq) {
+                // Записи нет — её подтвердила другая сессия аккаунта или
+                // она истекла; счёт тогда ничего не меняет.
+                self.storage
+                    .record_failed_delivery(&self.user_id, pending.scope, id)?;
             }
+            // Запись, которой уже нет, дочитывание просто не найдёт.
+            expired += 1;
+            observability::observe_sled_ack_timeout();
+            self.expired.insert(id);
+            self.mark(pending.scope, id);
         }
         if expired > 0 {
             debug!(
@@ -311,13 +382,19 @@ impl SledSession {
 }
 
 impl Drop for SledSession {
-    /// Сессия кончилась. Отданное и неподтверждённое — неудачная выдача; всё
-    /// это (и недочитанное) лежит в очереди. Другие сессии получателя
-    /// перечитывают очереди, чтобы забрать его сразу, а не на следующем
-    /// подключении.
+    /// Сессия кончилась. Отданное и неподтверждённое (и недочитанное) лежит
+    /// в очереди. Неудачей считаются только записи раньше последней
+    /// подтверждённой: хвост после неё клиент мог просто не успеть
+    /// обработать. Другие сессии получателя перечитывают очереди, чтобы
+    /// забрать оставленное сразу, а не на следующем подключении.
     fn drop(&mut self) {
         let had_work = !self.pending.is_empty() || self.wants_pull_ignoring_room();
-        for (id, pending) in std::mem::take(&mut self.pending) {
+        let pending = std::mem::take(&mut self.pending);
+        let counts = self.counts_failures();
+        for (id, pending) in pending {
+            if !counts || pending.seq >= self.acked_seq {
+                continue;
+            }
             if let Err(err) = self
                 .storage
                 .record_failed_delivery(&self.user_id, pending.scope, id)
@@ -470,7 +547,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn ack_timeout_redelivers_and_counts_the_failure() {
+    async fn ack_timeout_redelivers_in_the_same_session() {
         let (storage, path) = storage("timeout");
         let id = enqueue(&storage, b"slow");
         let mut s = session(&storage, cfg(10, 4), None);
@@ -502,24 +579,29 @@ mod tests {
         // Другая сессия аккаунта подтвердила запись.
         storage.ack_inbox(&ME, Some(9), id).unwrap();
         let deadline = s.next_deadline().unwrap();
-        assert_eq!(s.expire(deadline).unwrap(), 0);
+        s.expire(deadline).unwrap();
         assert_eq!(
             s.prepare(InboxScope::Account, id).unwrap(),
             WriteDecision::Skip
         );
+        assert!(s.pull(usize::MAX).unwrap().is_empty());
         drop(s);
         let _ = std::fs::remove_dir_all(path);
     }
 
     #[tokio::test]
     async fn client_without_acks_gets_a_bounded_number_of_deliveries() {
+        // Живая сессия старого клиента: пингует, но ничего не подтверждает.
         let (storage, path) = storage("no_acks");
         let id = enqueue(&storage, b"legacy");
+        let mut s = session(&storage, cfg(3, 4), None);
         let mut deliveries = 0;
         for _ in 0..10 {
-            let mut s = session(&storage, cfg(3, 4), None);
             deliveries += deliver_all(&mut s).len();
-            // Сессия рвётся, ничего не подтвердив.
+            s.note_client_frame();
+            if let Some(deadline) = s.next_deadline() {
+                s.expire(deadline).unwrap();
+            }
         }
         assert_eq!(deliveries, 3);
         assert_eq!(
@@ -530,6 +612,151 @@ mod tests {
             "после последней выдачи запись удалена"
         );
         assert_eq!(storage.cleanup_orphan_delivery_failures().unwrap(), 0);
+        drop(s);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// Без предела (по умолчанию) неудачи не считаются вовсе: повтор идёт,
+    /// пока запись не подтвердят или она не истечёт.
+    #[tokio::test]
+    async fn without_a_limit_redelivery_never_gives_up() {
+        let (storage, path) = storage("unlimited");
+        let id = enqueue(&storage, b"forever");
+        let mut s = session(&storage, cfg(0, 4), None);
+        for round in 0..20 {
+            assert_eq!(deliver_all(&mut s), vec![id], "round {round}");
+            s.note_client_frame();
+            let deadline = s.next_deadline().unwrap();
+            s.expire(deadline).unwrap();
+        }
+        assert!(storage.delivery_failures_is_empty_for_tests());
+        drop(s);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// Полуоткрытый сокет: клиент пропал без FIN, кадров от него нет.
+    /// Повторы в такую сессию неудачами не считаются, и даже с пределом
+    /// запись доживает до возвращения клиента.
+    #[tokio::test]
+    async fn dead_socket_does_not_burn_the_delivery_limit() {
+        let (storage, path) = storage("dead_socket");
+        let id = enqueue(&storage, b"later");
+        {
+            let mut s = session(&storage, cfg(3, 4), None);
+            for _ in 0..20 {
+                assert_eq!(deliver_all(&mut s), vec![id]);
+                let deadline = s.next_deadline().unwrap();
+                s.expire(deadline).unwrap();
+            }
+            assert_eq!(deliver_all(&mut s), vec![id]);
+        }
+        assert_eq!(
+            storage
+                .inbox_failures(&ME, InboxScope::Account, id)
+                .unwrap(),
+            Some(0)
+        );
+        let mut back = session(&storage, cfg(3, 4), None);
+        assert_eq!(deliver_all(&mut back), vec![id]);
+        assert!(back.ack(id).unwrap());
+        drop(back);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// Большой бэклог и короткое фоновое пробуждение: клиент успел
+    /// обработать и подтвердить начало, процесс убит. Хвост после последней
+    /// подтверждённой неудачей не считается, сколько бы пробуждений ни было.
+    #[tokio::test]
+    async fn short_wakeups_do_not_burn_the_unprocessed_tail() {
+        let (storage, path) = storage("short_wakeups");
+        let ids: Vec<u64> = (0..40u8).map(|i| enqueue(&storage, &[i])).collect();
+        for wake in 0..20usize {
+            let mut s = session(&storage, cfg(3, 16), None);
+            let delivered = deliver_all(&mut s);
+            // За пробуждение обработаны и подтверждены два первых.
+            for id in delivered.iter().take(2) {
+                assert!(s.ack(*id).unwrap(), "wake {wake}");
+            }
+        }
+        // 40 записей по две за пробуждение — всё дошло, ничего не потеряно.
+        for id in ids {
+            assert_eq!(
+                storage
+                    .inbox_failures(&ME, InboxScope::Account, id)
+                    .unwrap(),
+                None
+            );
+        }
+        assert!(storage.delivery_failures_is_empty_for_tests());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// «Ядовитый» конверт: клиент подтвердил выданное позже, а этот — нет.
+    /// Это доказанная неудача, и она считается и по истечении срока, и при
+    /// уходе сессии.
+    #[tokio::test]
+    async fn skipped_envelope_counts_as_a_failure() {
+        let (storage, path) = storage("poison");
+        let poison = enqueue(&storage, b"poison");
+        let good = enqueue(&storage, b"good");
+        {
+            let mut s = session(&storage, cfg(3, 4), None);
+            assert_eq!(deliver_all(&mut s), vec![poison, good]);
+            assert!(s.ack(good).unwrap());
+        }
+        assert_eq!(
+            storage
+                .inbox_failures(&ME, InboxScope::Account, poison)
+                .unwrap(),
+            Some(1)
+        );
+        let mut s = session(&storage, cfg(3, 4), None);
+        let fresh = enqueue(&storage, b"fresh");
+        assert_eq!(deliver_all(&mut s), vec![poison, fresh]);
+        assert!(s.ack(fresh).unwrap());
+        let deadline = s.next_deadline().unwrap();
+        s.expire(deadline).unwrap();
+        assert_eq!(
+            storage
+                .inbox_failures(&ME, InboxScope::Account, poison)
+                .unwrap(),
+            Some(2)
+        );
+        // Третья выдача последняя.
+        assert_eq!(deliver_all(&mut s), vec![poison]);
+        assert_eq!(
+            storage
+                .inbox_failures(&ME, InboxScope::Account, poison)
+                .unwrap(),
+            None
+        );
+        drop(s);
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    /// Запись, пришедшая и уведомлением, и дочитыванием, выдаётся одной
+    /// сессии ровно один раз — в каком порядке ни приди.
+    #[tokio::test]
+    async fn notification_and_scan_of_one_record_deliver_it_once() {
+        let (storage, path) = storage("once");
+        let mut s = session(&storage, cfg(0, 4), None);
+        assert!(deliver_all(&mut s).is_empty());
+        // Уведомление первым, дочитывание после.
+        let first = enqueue(&storage, b"first");
+        assert_eq!(s.offer(InboxScope::Account, first), Offer::Accept);
+        assert!(matches!(
+            s.prepare(InboxScope::Account, first).unwrap(),
+            WriteDecision::Deliver { .. }
+        ));
+        s.written(InboxScope::Account, first, false).unwrap();
+        s.resync();
+        assert!(deliver_all(&mut s).is_empty());
+        // Дочитывание первым, уведомление после.
+        let second = enqueue(&storage, b"second");
+        s.resync();
+        assert_eq!(deliver_all(&mut s), vec![second]);
+        assert_eq!(s.offer(InboxScope::Account, second), Offer::Duplicate);
+        drop(s);
         let _ = std::fs::remove_dir_all(path);
     }
 

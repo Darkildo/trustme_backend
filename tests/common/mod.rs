@@ -307,6 +307,8 @@ pub struct NodeOptions {
     /// `Some` — подтверждения прямого бэкенда вместо значений по
     /// умолчанию: передоставку с боевыми тридцатью секундами не проверить.
     pub sled_ack: Option<SledAckConfig>,
+    /// `Some` — политика офлайн-хранения вместо 30 суток.
+    pub offline_retention: Option<RetentionPolicy>,
 }
 
 /// Нода с произвольным набором опций и её внутренности.
@@ -330,13 +332,13 @@ pub fn stop_node(internals: NodeInternals) {
 /// не пускает второй экземпляр в тот же каталог. Ожидание асинхронное:
 /// тестовый рантайм однопоточный, и блокирующий сон не дал бы остановленным
 /// задачам ноды завершиться.
-async fn open_storage_with_retry(path: &str) -> Result<Storage> {
+async fn open_storage_with_retry(path: &str, offline: RetentionPolicy) -> Result<Storage> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         match Storage::open(
             path,
             RetentionPolicy::KeepFor(Duration::from_secs(30 * 86_400)),
-            RetentionPolicy::KeepFor(Duration::from_secs(30 * 86_400)),
+            offline,
         ) {
             Ok(storage) => return Ok(storage),
             Err(_) if Instant::now() < deadline => {
@@ -375,10 +377,13 @@ async fn spawn_node_with_internals(
         storage_path: external_storage,
         device_cert_max_ttl,
         sled_ack,
+        offline_retention,
     } = options;
     let owns_storage = external_storage.is_none();
     let storage_path = external_storage.unwrap_or_else(|| temp_storage_path(label));
-    let storage = open_storage_with_retry(&storage_path).await?;
+    let offline_retention =
+        offline_retention.unwrap_or(RetentionPolicy::KeepFor(Duration::from_secs(30 * 86_400)));
+    let storage = open_storage_with_retry(&storage_path, offline_retention).await?;
     let registry = ConnRegistry::default();
     let push_tokens = storage.push_token_store()?;
     let push_scheduler = match push {
@@ -409,6 +414,7 @@ async fn spawn_node_with_internals(
     if let Some(sled_ack) = sled_ack {
         cfg.delivery.sled_ack = sled_ack;
     }
+    cfg.offline_messages_retention = offline_retention;
     if let Some(setup) = &jetstream {
         cfg.delivery.backend = DeliveryBackendKind::JetStream;
         cfg.delivery.nats_url = setup.nats_url.clone();
