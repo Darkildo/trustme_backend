@@ -36,7 +36,9 @@ pub struct Config {
     pub metrics: MetricsConfig,
     /// Сколько хранить удалённые сообщения (`DELETED_MESSAGES_RETENTION`:
     /// число дней, `disabled` — бессрочно, `instant` — не хранить).
-    /// Default: 30 дней.
+    /// Default: 7 дней. С 0.4.0 в архив попадает и онлайн-трафик прямого
+    /// бэкенда (каждая подтверждённая запись очереди), поэтому срок короче
+    /// срока очередей.
     pub deleted_messages_retention: RetentionPolicy,
     /// Сколько хранить недоставленные сообщения
     /// (`OFFLINE_MESSAGES_RETENTION`, формат тот же). Default: 30 дней.
@@ -171,6 +173,17 @@ pub struct LimitsConfig {
     /// примерно через `60 + 4 × 15 = 120` с простоя. На платформах без
     /// `TCP_KEEPCNT` действует системное значение.
     pub tcp_keepalive_retries: u32,
+    /// `TCP_USER_TIMEOUT` принятых сокетов (`TCP_USER_TIMEOUT_SECS`), сек:
+    /// сколько записанные нодой данные могут оставаться без TCP-подтверждения,
+    /// прежде чем ядро порвёт соединение. Default: 120 — четыре `ack_wait`
+    /// прямого бэкенда. `0` — системное поведение. Только Linux/Android.
+    ///
+    /// Keepalive не помогает, пока нода пишет: пробы идут только при
+    /// простое, а повторы выдачи в полуоткрытый сокет (телефон пропал без
+    /// FIN) держат его «занятым» до системного таймаута ретрансмиссий —
+    /// около 15 минут. Всё это время неподтверждённые записи числятся за
+    /// мёртвой сессией; оборванная, она отдаёт их следующей.
+    pub tcp_user_timeout_secs: u64,
 }
 
 impl Default for LimitsConfig {
@@ -194,6 +207,7 @@ impl Default for LimitsConfig {
             tcp_keepalive_secs: 60,
             tcp_keepalive_interval_secs: 15,
             tcp_keepalive_retries: 4,
+            tcp_user_timeout_secs: 120,
         }
     }
 }
@@ -315,10 +329,13 @@ pub struct SledAckConfig {
     /// снова (`SLED_ACK_WAIT_SECS`), сек. Default: 30 с — как `ack_wait`
     /// брокерного бэкенда.
     pub ack_wait: Duration,
-    /// Сколько раз запись выдаётся без подтверждения
-    /// (`SLED_MAX_DELIVERIES`). Последняя выдача удаляет запись после
-    /// записи в сокет. `1` — поведение до подтверждений: удаление сразу
-    /// после записи. Default: 10.
+    /// Предел выдач без подтверждения (`SLED_MAX_DELIVERIES`). Default: `0`
+    /// — без предела, как у брокера: запись живёт до подтверждения или
+    /// конца хранения. Ненулевое значение — ручка для клиентов без
+    /// `DeliveryAck`: выдача с этим номером последняя и удаляет запись после
+    /// записи в сокет; `1` — поведение до подтверждений. Неудачей считается
+    /// только выдача, про которую доказано, что живой клиент её не
+    /// подтвердил (см. `delivery::sled_ack`).
     pub max_deliveries: u32,
     /// Сколько записей сессия держит отданными и неподтверждёнными
     /// (`SLED_MAX_UNACKED_PER_SESSION`). Дальше выдача ждёт подтверждений.
@@ -330,7 +347,7 @@ impl Default for SledAckConfig {
     fn default() -> Self {
         Self {
             ack_wait: Duration::from_secs(30),
-            max_deliveries: 10,
+            max_deliveries: 0,
             max_unacked: 1024,
         }
     }
@@ -735,7 +752,13 @@ struct RawConfig {
     tcp_keepalive_interval_secs: Option<u64>,
     #[serde(default)]
     tcp_keepalive_retries: Option<u32>,
+    #[serde(default)]
+    tcp_user_timeout_secs: Option<u64>,
 }
+
+/// Срок архива удалённых записей по умолчанию, сутки. Короче срока очередей:
+/// с 0.4.0 в архив попадает и онлайн-трафик прямого бэкенда.
+const DEFAULT_DELETED_RETENTION_DAYS: u64 = 7;
 
 pub fn load() -> anyhow::Result<Config> {
     let env_file = Path::new(".env");
@@ -814,6 +837,7 @@ pub fn load() -> anyhow::Result<Config> {
         tcp_keepalive_secs,
         tcp_keepalive_interval_secs,
         tcp_keepalive_retries,
+        tcp_user_timeout_secs,
     } = raw;
 
     let bind_addr = resolve_bind_addr(bind_addr, bind_host, bind_port)?;
@@ -839,8 +863,11 @@ pub fn load() -> anyhow::Result<Config> {
 
     let max_frame_len = max_frame_len.unwrap_or(8 * 1024 * 1024);
     let metrics = resolve_metrics(metrics_enabled, metrics_addr)?;
-    let deleted_messages_retention =
-        parse_retention_policy(deleted_messages_retention, 30, "DELETED_MESSAGES_RETENTION")?;
+    let deleted_messages_retention = parse_retention_policy(
+        deleted_messages_retention,
+        DEFAULT_DELETED_RETENTION_DAYS,
+        "DELETED_MESSAGES_RETENTION",
+    )?;
     let offline_messages_retention =
         parse_retention_policy(offline_messages_retention, 30, "OFFLINE_MESSAGES_RETENTION")?;
     let mut delivery = resolve_delivery(
@@ -922,6 +949,7 @@ pub fn load() -> anyhow::Result<Config> {
         tcp_keepalive_interval_secs: tcp_keepalive_interval_secs
             .unwrap_or(defaults.tcp_keepalive_interval_secs),
         tcp_keepalive_retries: tcp_keepalive_retries.unwrap_or(defaults.tcp_keepalive_retries),
+        tcp_user_timeout_secs: tcp_user_timeout_secs.unwrap_or(defaults.tcp_user_timeout_secs),
     };
     check_tcp_keepalive(&limits)?;
 
@@ -1336,11 +1364,7 @@ fn resolve_sled_ack(
         Some(0) => bail!("SLED_ACK_WAIT_SECS must be greater than 0"),
         Some(secs) => Duration::from_secs(secs),
     };
-    let max_deliveries = match max_deliveries {
-        None => defaults.max_deliveries,
-        Some(0) => bail!("SLED_MAX_DELIVERIES must be at least 1 (1 = no redelivery)"),
-        Some(value) => value,
-    };
+    let max_deliveries = max_deliveries.unwrap_or(defaults.max_deliveries);
     let max_unacked = match max_unacked {
         None => defaults.max_unacked,
         Some(0) => bail!("SLED_MAX_UNACKED_PER_SESSION must be greater than 0"),
@@ -1429,8 +1453,9 @@ fn check_tcp_keepalive(limits: &LimitsConfig) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        LimitsConfig, PushRawConfig, RetentionPolicy, SledAckConfig, check_tcp_keepalive,
-        parse_retention_policy, read_raw, resolve_delivery, resolve_push, resolve_sled_ack,
+        DEFAULT_DELETED_RETENTION_DAYS, LimitsConfig, PushRawConfig, RetentionPolicy,
+        SledAckConfig, check_tcp_keepalive, parse_retention_policy, read_raw, resolve_delivery,
+        resolve_push, resolve_sled_ack,
     };
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1644,6 +1669,14 @@ mod tests {
     }
 
     #[test]
+    fn deleted_archive_defaults_to_a_week() {
+        assert_eq!(
+            parse_retention_policy(None, DEFAULT_DELETED_RETENTION_DAYS, "TEST").unwrap(),
+            RetentionPolicy::KeepFor(Duration::from_secs(7 * 24 * 60 * 60))
+        );
+    }
+
+    #[test]
     fn parses_disabled_retention_policy_aliases() {
         assert_eq!(
             parse_retention_policy(Some("disabled".to_string()), 30, "TEST_RETENTION").unwrap(),
@@ -1749,14 +1782,13 @@ mod tests {
         let cfg = resolve_sled_ack(None, None, None).unwrap();
         assert_eq!(cfg, SledAckConfig::default());
         assert_eq!(cfg.ack_wait, Duration::from_secs(30));
-        assert_eq!(cfg.max_deliveries, 10);
+        assert_eq!(cfg.max_deliveries, 0, "unlimited, as with the broker");
         assert_eq!(cfg.max_unacked, 1024);
     }
 
     #[test]
     fn sled_ack_rejects_zeroes_and_takes_overrides() {
         assert!(resolve_sled_ack(Some(0), None, None).is_err());
-        assert!(resolve_sled_ack(None, Some(0), None).is_err());
         assert!(resolve_sled_ack(None, None, Some(0)).is_err());
         let cfg = resolve_sled_ack(Some(5), Some(1), Some(16)).unwrap();
         assert_eq!(cfg.ack_wait, Duration::from_secs(5));

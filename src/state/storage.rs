@@ -528,6 +528,12 @@ impl Storage {
         })
     }
 
+    /// Лежит ли запись в очереди.
+    pub fn inbox_contains(&self, recipient: &[u8; 32], scope: InboxScope, id: u64) -> Result<bool> {
+        let (tree, key, _) = self.inbox_location(recipient, scope, id);
+        Ok(tree.contains_key(&key)?)
+    }
+
     /// Сколько раз запись уже выдавалась без подтверждения. `None` —
     /// записи нет: её подтвердили, она истекла или удалена.
     pub fn inbox_failures(
@@ -613,6 +619,11 @@ impl Storage {
             }
         }
         Ok(None)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn delivery_failures_is_empty_for_tests(&self) -> bool {
+        self.delivery_failures.is_empty()
     }
 
     /// Снять счётчики неудачных выдач, чьих записей уже нет (см.
@@ -1164,8 +1175,8 @@ impl Storage {
         let removed = tree.remove(key)?;
         if let Some(value) = &removed {
             self.note_removed(&key[..prefix_len.min(key.len())], value)?;
+            self.delivery_failures.remove(key)?;
         }
-        self.delivery_failures.remove(key)?;
         Ok(removed)
     }
 

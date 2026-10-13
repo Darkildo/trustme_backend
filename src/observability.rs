@@ -162,6 +162,13 @@ pub fn observe_message_redelivered() {
     counter!("trust_message_tcp_message_redelivered_total").increment(1);
 }
 
+/// Прямой бэкенд: приём отвергнут квотой очереди (`FULL`). `path`:
+/// `online` — получатель в сети (очередь копит неподтверждённое),
+/// `offline` — обычная офлайн-очередь.
+pub fn observe_queue_full(path: &'static str) {
+    counter!("trust_message_tcp_queue_full_total", "path" => path).increment(1);
+}
+
 /// Прямой бэкенд: клиент подтвердил запись очереди, и она снята.
 pub fn observe_sled_delivery_acked() {
     counter!("trust_message_tcp_sled_delivery_acked_total").increment(1);

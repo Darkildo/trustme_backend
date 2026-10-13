@@ -14,13 +14,13 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use common::{
-    FRAME_MAX, HANDSHAKE_TIMEOUT, confirm, connect, connect_as, encode_delivery_ack,
+    FRAME_MAX, HANDSHAKE_TIMEOUT, NodeOptions, confirm, connect, connect_as, encode_delivery_ack,
     expect_auth_ok, expect_incoming, next_frame, next_incoming_within, random_identity,
-    send_and_read_ack, spawn_server, user_id_of,
+    send_and_read_ack, spawn_node_with, spawn_server, user_id_of,
 };
 use tokio::net::TcpSocket;
 use tokio::time::{Instant, timeout};
-use trust_message_tcp::config::LimitsConfig;
+use trust_message_tcp::config::{LimitsConfig, SledAckConfig};
 use trust_message_tcp::net::noise::NoiseFramed;
 
 /// Лимиты не мешают: тест меряет канал получателя, а не квоты.
@@ -131,5 +131,90 @@ async fn slow_recipient_does_not_stall_the_sender_or_lose_messages() -> Result<(
             .is_none(),
         "acknowledged envelopes must not come back"
     );
+    Ok(())
+}
+
+/// Встал сам сокет получателя, а окно неподтверждённых больше канала
+/// сессии: сессия упирается в запись, канал уведомлений переполняется, и
+/// сессия выписывается из реестра (`SendAck` приходит с `queued`) и
+/// закрывается. Конверты при этом не теряются — всё неподтверждённое
+/// приходит следующей сессии.
+#[tokio::test]
+async fn stuck_socket_is_evicted_by_a_full_channel_without_losing_envelopes() -> Result<()> {
+    let (server, _node) = spawn_node_with(
+        "slow_recipient_evict",
+        open_limits(),
+        NodeOptions {
+            sled_ack: Some(SledAckConfig {
+                max_unacked: 1_000_000,
+                ..SledAckConfig::default()
+            }),
+            ..NodeOptions::default()
+        },
+    )
+    .await?;
+    let sender = random_identity();
+    let recipient = random_identity();
+    let recipient_id = user_id_of(&recipient);
+
+    let socket = TcpSocket::new_v4()?;
+    socket.set_recv_buffer_size(4096)?;
+    let stream = socket.connect(server.addr).await?;
+    let raw = NoiseFramed::connect(
+        stream,
+        &server.node_public,
+        &recipient,
+        Some(1),
+        HANDSHAKE_TIMEOUT,
+        FRAME_MAX,
+    )
+    .await?;
+    let mut stuck = confirm(raw).await?;
+    expect_auth_ok(&next_frame(&mut stuck).await?, &recipient_id)?;
+
+    let mut sender_conn = connect(&server, &sender).await?;
+    expect_auth_ok(&next_frame(&mut sender_conn).await?, &user_id_of(&sender))?;
+    let filler = vec![0x5Au8; 1024];
+    let mut sent = HashSet::new();
+    let mut evicted = false;
+    for index in 0..20_000usize {
+        let mut body = format!("{index:08}:").into_bytes();
+        body.extend_from_slice(&filler);
+        let ack = send_and_read_ack(&mut sender_conn, &recipient_id, &body, 0)
+            .await
+            .with_context(|| format!("sender stalled on message {index}"))?;
+        assert!(ack.ok || ack.queued, "unexpected reject: {ack:?}");
+        sent.insert(body);
+        if !ack.ok {
+            evicted = true;
+            break;
+        }
+    }
+    assert!(evicted, "a full channel must evict the stuck session");
+
+    // Выписанная сессия закрывается, а не остаётся живой и недостижимой.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match timeout(left, stuck.next_frame()).await {
+            Ok(Ok(Some(_))) => continue,
+            Ok(Ok(None)) | Ok(Err(_)) => break,
+            Err(_) => anyhow::bail!("the evicted session stayed open"),
+        }
+    }
+
+    let mut again = connect_as(&server, &recipient, Some(1), FRAME_MAX).await?;
+    expect_auth_ok(&next_frame(&mut again).await?, &recipient_id)?;
+    let mut received = HashSet::new();
+    while received.len() < sent.len() {
+        let incoming = next_incoming_within(&mut again, Duration::from_secs(5))
+            .await?
+            .with_context(|| format!("lost: {} of {} arrived", received.len(), sent.len()))?;
+        again
+            .send_frame(&encode_delivery_ack(incoming.message_id))
+            .await?;
+        received.insert(incoming.body);
+    }
+    assert_eq!(received, sent);
     Ok(())
 }
