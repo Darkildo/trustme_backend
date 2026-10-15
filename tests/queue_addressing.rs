@@ -112,6 +112,44 @@ async fn a_queue_addressed_deposit_reaches_the_queue_owner() -> Result<()> {
     Ok(())
 }
 
+/// A mailbox statement cannot redirect a named recipient into another
+/// account's live queue. The rejection is indistinguishable from an unknown
+/// queue, and the sender can still send a correctly bound deposit.
+#[tokio::test]
+async fn a_queue_owner_must_match_a_named_recipient() -> Result<()> {
+    let server =
+        spawn_server_with_queue_addressing("qa_owner_binding", LimitsConfig::default()).await?;
+    let owner = random_identity();
+    let other = random_identity();
+    let sender = random_identity();
+    let mut owner_conn = connect(&server, &owner).await?;
+    expect_auth_ok(&next_frame(&mut owner_conn).await?, &user_id_of(&owner))?;
+    let queue = allocate_queue(&mut owner_conn).await?;
+    let mut other_conn = connect(&server, &other).await?;
+    expect_auth_ok(&next_frame(&mut other_conn).await?, &user_id_of(&other))?;
+    let mut sender_conn = connect(&server, &sender).await?;
+    expect_auth_ok(&next_frame(&mut sender_conn).await?, &user_id_of(&sender))?;
+    let bad = send_by_recipient(user_id_of(&other), queue.clone(), "wrong owner");
+    let ack = send_raw_and_read_ack(&mut sender_conn, &bad).await?;
+    assert!(!ack.ok && !ack.queued);
+    assert_eq!(ack.reason, SendRejectReason::NoPermit);
+    assert!(
+        next_incoming_within(&mut owner_conn, SILENCE)
+            .await?
+            .is_none()
+    );
+    assert!(
+        next_incoming_within(&mut other_conn, SILENCE)
+            .await?
+            .is_none()
+    );
+    let good = send_by_recipient(user_id_of(&owner), queue, "bound owner");
+    let ack = send_raw_and_read_ack(&mut sender_conn, &good).await?;
+    assert!(ack.ok || ack.queued);
+    assert_eq!(expect_incoming(&mut owner_conn).await?.body, b"bound owner");
+    Ok(())
+}
+
 /// Депозит в неизвестную очередь отвергается, а не уходит по `recipientId`.
 /// Иначе отзыв очереди ничего не значил бы: заблокированный контакт просто
 /// вернулся бы к прямой адресации.
