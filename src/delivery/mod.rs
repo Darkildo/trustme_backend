@@ -28,7 +28,9 @@ use crate::config::{Config, DeliveryBackendKind, SledAckConfig};
 use crate::domain::priority::MessagePriority;
 use crate::domain::reject::SendRejectReason;
 use crate::domain::wake::WakeHint;
-use crate::net::framing::{decode_device_id, encode_auth_error, encode_device_id, encode_incoming};
+use crate::net::framing::{
+    decode_device_id, encode_auth_error, encode_device_id, encode_incoming_via_queue,
+};
 use crate::observability;
 use crate::push::PushScheduler;
 use crate::state::push_tokens::PushTokenStore;
@@ -485,6 +487,7 @@ pub struct JetStreamBackend {
 
 #[derive(Debug, Clone)]
 struct BrokerPayload {
+    queue_id: Option<[u8; 32]>,
     message_id: u64,
     sender_user_id: UserId,
     sender_device_id: Option<DeviceId>,
@@ -574,6 +577,35 @@ impl DeliveryBackend {
         wake_hint: Option<WakeHint>,
         ttl_seconds: u64,
     ) -> Result<PublishedMessage, PublishError> {
+        self.publish_via_queue(
+            message_id,
+            sender_user_id,
+            sender_device_id,
+            recipient_user_id,
+            recipient_device_id,
+            body,
+            priority,
+            wake_hint,
+            ttl_seconds,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn publish_via_queue(
+        &self,
+        message_id: u64,
+        sender_user_id: UserId,
+        sender_device_id: Option<DeviceId>,
+        recipient_user_id: UserId,
+        recipient_device_id: Option<DeviceId>,
+        body: &[u8],
+        priority: Option<MessagePriority>,
+        wake_hint: Option<WakeHint>,
+        ttl_seconds: u64,
+        queue_id: Option<[u8; 32]>,
+    ) -> Result<PublishedMessage, PublishError> {
         match self {
             Self::Sled(_) => Ok(PublishedMessage { message_id }),
             Self::JetStream(backend) => {
@@ -588,6 +620,7 @@ impl DeliveryBackend {
                         priority,
                         wake_hint,
                         ttl_seconds,
+                        queue_id,
                     )
                     .await?;
                 observability::observe_message_accepted();
@@ -841,9 +874,11 @@ impl JetStreamBackend {
         priority: Option<MessagePriority>,
         wake_hint: Option<WakeHint>,
         ttl_seconds: u64,
+        queue_id: Option<[u8; 32]>,
     ) -> Result<(), PublishError> {
         let subject = scope_subject(recipient_user_id, recipient_device_id);
         let payload = encode_broker_message(BrokerPayload {
+            queue_id,
             message_id,
             sender_user_id,
             sender_device_id,
@@ -1056,12 +1091,13 @@ impl JetStreamBackend {
             // `max_age` потока. Поэтому он снимается с потока так же, как
             // неразбираемый, и никого не будит. Свежие конверты такими не
             // бывают: тело ограничено на входе (`max_send_body_len`).
-            let frame_bytes = encode_incoming(
+            let frame_bytes = encode_incoming_via_queue(
                 payload.sender_user_id,
                 payload.sender_device_id,
                 payload.message_id,
                 &payload.body,
                 payload.priority,
+                payload.queue_id,
             );
             if frame_bytes.len() > self.max_frame_len {
                 observability::observe_oversized_envelope("broker");
@@ -1517,6 +1553,7 @@ fn scope_subject(user_id: UserId, device_id: Option<DeviceId>) -> String {
 
 fn encode_broker_message(payload: BrokerPayload) -> Vec<u8> {
     BrokerMessage {
+        queue_id: payload.queue_id.map(|id| id.to_vec()).unwrap_or_default(),
         message_id: payload.message_id,
         sender_user_id: payload.sender_user_id.to_vec(),
         sender_device_id: encode_device_id(payload.sender_device_id),
@@ -1534,6 +1571,11 @@ fn encode_broker_message(payload: BrokerPayload) -> Vec<u8> {
 fn decode_broker_message(bytes: &[u8]) -> Result<BrokerPayload> {
     let message = BrokerMessage::decode(bytes).context("decode broker message")?;
     Ok(BrokerPayload {
+        queue_id: if message.queue_id.is_empty() {
+            None
+        } else {
+            Some(data_to_fixed(&message.queue_id)?)
+        },
         message_id: message.message_id,
         sender_user_id: data_to_fixed(&message.sender_user_id)?,
         sender_device_id: decode_device_id(message.sender_device_id)?,
@@ -1740,6 +1782,7 @@ mod tests {
     #[test]
     fn broker_payload_roundtrips() {
         let payload = BrokerPayload {
+            queue_id: Some(user(3)),
             message_id: 99,
             sender_user_id: user(1),
             sender_device_id: Some(7),
@@ -1765,6 +1808,7 @@ mod tests {
         assert_eq!(decoded.priority, payload.priority);
         assert_eq!(decoded.wake_hint, payload.wake_hint);
         assert_eq!(decoded.ttl_seconds, payload.ttl_seconds);
+        assert_eq!(decoded.queue_id, payload.queue_id);
     }
 
     #[test]

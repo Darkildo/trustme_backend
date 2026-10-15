@@ -15,7 +15,7 @@ use crate::domain::reject::SendRejectReason;
 use crate::domain::wake::WakeHint;
 use crate::net::framing::{
     PROTO_VERSION, QueueListing, as_fixed_32, decode_device_id, decode_frame, encode_auth_error,
-    encode_auth_ok, encode_incoming, encode_pong, encode_push_token_ack, encode_queue_ack,
+    encode_auth_ok, encode_incoming_via_queue, encode_pong, encode_push_token_ack, encode_queue_ack,
     encode_queue_list, encode_send_ack, encode_signed_server_config, max_send_body_len,
 };
 use crate::net::noise::{HandshakePolicy, NodeIdentity, NoiseFramed};
@@ -700,6 +700,8 @@ pub async fn handle_conn(
                           bail!("clientSend carries neither a routable queueId nor a recipientId");
                       };
 
+                      let used_queue_id = if addressed_by_queue { queue_id } else { None };
+
                       // Режим «только по очередям» получателя (§6.9
                       // контракта): кадр, адресованный по `recipientId`,
                       // отвергается так же, как депозит в отозванную
@@ -782,7 +784,7 @@ pub async fn handle_conn(
                           let published = async {
                               let message_id = storage.generate_id()?;
                               delivery_backend
-                                  .publish(
+                                  .publish_via_queue(
                                       message_id,
                                       user_id,
                                       device_id,
@@ -792,6 +794,7 @@ pub async fn handle_conn(
                                       priority,
                                       wake_hint,
                                       ttl_seconds,
+                                      used_queue_id,
                                   )
                                   .await?;
                               anyhow::Ok(message_id)
@@ -951,7 +954,7 @@ pub async fn handle_conn(
 
                           let enqueue_result = if durable {
                               let enqueued = match recipient_device_id {
-                                  Some(target_device_id) => storage.enqueue_device_inbox(
+                                  Some(target_device_id) => storage.enqueue_device_inbox_with_queue(
                                       &recipient,
                                       target_device_id,
                                       &user_id,
@@ -959,14 +962,16 @@ pub async fn handle_conn(
                                       &body,
                                       priority,
                                       ttl_seconds,
+                                      used_queue_id,
                                   ),
-                                  None => storage.enqueue_inbox(
+                                  None => storage.enqueue_inbox_with_queue(
                                       &recipient,
                                       &user_id,
                                       device_id,
                                       &body,
                                       priority,
                                       ttl_seconds,
+                                      used_queue_id,
                                   ),
                               };
                               match enqueued {
@@ -995,12 +1000,13 @@ pub async fn handle_conn(
                               EnqueueResult { id: 0, stored: false }
                           };
                           let message_id = enqueue_result.stored.then_some(enqueue_result.id);
-                          let incoming = encode_incoming(
+                          let incoming = encode_incoming_via_queue(
                               user_id,
                               device_id,
                               message_id.unwrap_or(0),
                               &body,
                               priority,
+                              used_queue_id,
                           );
                           // Снимок целей — после записи в очередь: сессия,
                           // зарегистрированная до снимка, получит уведомление,
@@ -2368,12 +2374,13 @@ async fn deliver_backlog(
             );
             return Ok(BacklogOutcome::Expired);
         }
-        let frame = encode_incoming(
+        let frame = encode_incoming_via_queue(
             message.sender_id,
             message.sender_device_id,
             message.id,
             &message.body,
             message.priority,
+            message.queue_id,
         );
 
         // Запись, которую нельзя доставить ни в одной сессии: кадр длиннее

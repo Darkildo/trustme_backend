@@ -34,4 +34,6 @@ message BrokerMessage {
   // значение переносит, но не применяет: срок хранения задаёт `max_age`
   // потока.
   uint64 ttl_seconds = 10;
+  // Actual resolved mailbox capability, retained across broker redelivery.
+  bytes queue_id = 11;
 }
