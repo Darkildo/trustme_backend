@@ -102,12 +102,16 @@ async fn a_queue_addressed_deposit_reaches_the_queue_owner() -> Result<()> {
         &sender.verifying_key().to_bytes(),
     )?;
 
-    let ack =
-        send_raw_and_read_ack(&mut sender_conn, &send_by_queue(queue_id, "via-queue")).await?;
+    let ack = send_raw_and_read_ack(
+        &mut sender_conn,
+        &send_by_queue(queue_id.clone(), "via-queue"),
+    )
+    .await?;
     assert!(ack.ok || ack.queued, "unexpected ack: {ack:?}");
 
     let incoming = expect_incoming(&mut owner_conn).await?;
     assert_eq!(incoming.body, b"via-queue");
+    assert_eq!(incoming.queue_id, queue_id);
     assert_eq!(incoming.from_user_id, sender.verifying_key().to_bytes());
     Ok(())
 }
@@ -256,7 +260,9 @@ async fn with_the_flag_down_the_queue_id_is_still_ignored() -> Result<()> {
     let frame = send_by_recipient(owner.verifying_key().to_bytes(), vec![9u8; 32], "direct");
     let ack = send_raw_and_read_ack(&mut sender_conn, &frame).await?;
     assert!(ack.ok || ack.queued, "unexpected ack: {ack:?}");
-    assert_eq!(expect_incoming(&mut owner_conn).await?.body, b"direct");
+    let incoming = expect_incoming(&mut owner_conn).await?;
+    assert_eq!(incoming.body, b"direct");
+    assert!(incoming.queue_id.is_empty());
     Ok(())
 }
 
@@ -303,7 +309,9 @@ async fn a_queue_deposit_with_a_device_reaches_only_that_device() -> Result<()> 
     )
     .await?;
     assert!(ack.ok, "online device must receive it: {ack:?}");
-    assert_eq!(expect_incoming(&mut tablet).await?.body, b"to-tablet");
+    let incoming = expect_incoming(&mut tablet).await?;
+    assert_eq!(incoming.body, b"to-tablet");
+    assert_eq!(incoming.queue_id, queue_id);
     assert_eq!(next_incoming_within(&mut phone, SILENCE).await?, None);
     Ok(())
 }
@@ -337,6 +345,7 @@ async fn a_queue_deposit_for_an_offline_device_waits_for_it() -> Result<()> {
         .await?
         .expect("the device inbox must be replayed to that device");
     assert_eq!(replayed.body, b"for-tablet");
+    assert_eq!(replayed.queue_id, queue_id);
     assert_eq!(next_incoming_within(&mut phone, SILENCE).await?, None);
     Ok(())
 }
@@ -429,5 +438,60 @@ async fn a_queue_deposit_with_a_device_wakes_only_that_device() -> Result<()> {
         .collect();
     assert_eq!(woken, vec![7]);
     assert_eq!(woken_after, vec![7], "no other device may be woken");
+    Ok(())
+}
+
+/// Broker delivery must preserve queue identity through redelivery as well.
+#[tokio::test]
+#[ignore = "requires a live NATS with JetStream"]
+async fn broker_redelivery_preserves_queue_provenance() -> Result<()> {
+    let (server, internals) = spawn_node_with(
+        "qa_broker_provenance",
+        LimitsConfig::default(),
+        NodeOptions {
+            queue_addressing: true,
+            jetstream: Some(common::JetStreamSetup {
+                nats_url: std::env::var("TRUST_MESSAGE_TEST_NATS_URL")
+                    .unwrap_or_else(|_| "nats://127.0.0.1:4222".into()),
+                ack_wait: Duration::from_secs(1),
+            }),
+            ..Default::default()
+        },
+    )
+    .await?;
+    let owner = random_identity();
+    let sender = random_identity();
+    let mut owner_conn = connect(&server, &owner).await?;
+    expect_auth_ok(&next_frame(&mut owner_conn).await?, &user_id_of(&owner))?;
+    let queue = allocate_queue(&mut owner_conn).await?;
+    let mut sender_conn = connect(&server, &sender).await?;
+    expect_auth_ok(&next_frame(&mut sender_conn).await?, &user_id_of(&sender))?;
+    let ack = send_raw_and_read_ack(
+        &mut sender_conn,
+        &send_by_queue(queue.clone(), "broker-provenance"),
+    )
+    .await?;
+    assert!(ack.ok || ack.queued);
+    let first = next_incoming_within(&mut owner_conn, Duration::from_secs(8))
+        .await?
+        .expect("initial delivery");
+    let second = next_incoming_within(&mut owner_conn, Duration::from_secs(8))
+        .await?
+        .expect("redelivery");
+    assert_eq!(first.body, b"broker-provenance");
+    assert_eq!(first.queue_id, queue);
+    assert_eq!(second.queue_id, queue);
+    assert_eq!(second.message_id, first.message_id);
+    owner_conn
+        .send_frame(&common::encode_delivery_ack(first.message_id))
+        .await?;
+    assert!(
+        next_incoming_within(&mut owner_conn, Duration::from_secs(3))
+            .await?
+            .is_none()
+    );
+    drop(owner_conn);
+    drop(sender_conn);
+    common::stop_node(internals);
     Ok(())
 }

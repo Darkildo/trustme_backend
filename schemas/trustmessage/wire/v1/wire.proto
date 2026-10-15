@@ -246,6 +246,10 @@ message DeliveryAck {
 
 // Нода → клиент: входящее сообщение.
 message IncomingMessage {
+  // Mailbox capability actually used at deposit. Empty for recipientId
+  // addressing and for legacy records without provenance. Never copied from
+  // an ignored/unresolved ClientSend.queue_id (N-8).
+  bytes queue_id = 6;
   bytes from_user_id = 1;
   bytes body = 2;
   optional uint32 from_device_id = 3;
@@ -440,6 +444,10 @@ message ServerConfig {
   // входе (server-contract.md, §6.10). Не зависит от адресации по очередям
   // и от `device_cert_max_ttl_secs`.
   bool supports_device_cert_revocation = 22;
+  // New queue-addressed messages retain IncomingMessage.queue_id through
+  // online/offline/replay delivery; a named recipient is checked against the
+  // owner. Old stored records may have no provenance. Requires queue routing.
+  bool supports_queue_provenance = 23;
 
   // Номера 9–11 зарезервированы под удалённые поля версий клиента и ссылки
   // на обновление. Оператор ноды не должен влиять на дистрибуцию

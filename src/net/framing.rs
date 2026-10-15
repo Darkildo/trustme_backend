@@ -78,6 +78,7 @@ pub fn encode_signed_server_config(
         deleted_messages_retention: Some(retention_config(config.deleted_messages_retention)),
         supports_delivery_ack: config.supports_delivery_ack,
         supports_queue_addressing: config.supports_queue_addressing,
+        supports_queue_provenance: config.supports_queue_addressing,
         supports_queue_only: config.supports_queue_only(),
         supports_derived_queues: config.supports_derived_queues(),
         supports_queue_device_scope: config.supports_queue_device_scope(),
@@ -169,7 +170,19 @@ pub fn encode_incoming(
     body: &[u8],
     priority: Option<MessagePriority>,
 ) -> Vec<u8> {
+    encode_incoming_via_queue(from, from_device_id, message_id, body, priority, None)
+}
+
+pub fn encode_incoming_via_queue(
+    from: [u8; 32],
+    from_device_id: Option<DeviceId>,
+    message_id: u64,
+    body: &[u8],
+    priority: Option<MessagePriority>,
+    queue_id: Option<[u8; 32]>,
+) -> Vec<u8> {
     encode_frame(frame::Payload::Incoming(wire::IncomingMessage {
+        queue_id: queue_id.map(|id| id.to_vec()).unwrap_or_default(),
         from_user_id: from.to_vec(),
         body: body.to_vec(),
         from_device_id: encode_device_id(from_device_id),
@@ -414,6 +427,7 @@ mod tests {
         assert!(config.supports_offline_messages);
         assert!(config.supports_deleted_message_archive);
         assert!(config.supports_delivery_ack);
+        assert!(!config.supports_queue_provenance);
         assert_eq!(config.node_static_key, node.public());
         assert_eq!(config.node_identity_key, node.identity_public());
         assert_eq!(config.issued_at, NOW);
@@ -426,6 +440,16 @@ mod tests {
         let deleted = config.deleted_messages_retention.unwrap();
         assert_eq!(deleted.mode, RetentionMode::Disabled as i32);
         assert_eq!(deleted.retention_seconds, 0);
+    }
+
+    #[test]
+    fn queue_provenance_capability_is_signed_and_requires_routing() {
+        let node = node(9);
+        let mut configured = snapshot();
+        configured.supports_queue_addressing = true;
+        let encoded = encode_signed_server_config(&configured, &node, NOW);
+        let config = verify_signed_server_config(&signed(&encoded), &node.public(), NOW).unwrap();
+        assert!(config.supports_queue_provenance);
     }
 
     /// Ключевое свойство схемы: identity-ключ ноды birational-конвертируется
@@ -602,6 +626,18 @@ mod tests {
                 frame.len() <= max_frame_len,
                 "delivery frame of {} bytes exceeds max_frame_len {max_frame_len}",
                 frame.len()
+            );
+            let queued = super::encode_incoming_via_queue(
+                user(1),
+                Some(u16::MAX),
+                u64::MAX,
+                &body,
+                Some(MessagePriority::High),
+                Some([0xff; 32]),
+            );
+            assert!(
+                queued.len() <= max_frame_len,
+                "queue provenance must fit the delivery budget"
             );
         }
     }

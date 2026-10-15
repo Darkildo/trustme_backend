@@ -91,6 +91,7 @@ fn every_payload_variant_roundtrips() {
             reason: SendRejectReason::RateLimited as i32,
         }),
         frame::Payload::Incoming(IncomingMessage {
+            queue_id: vec![8; 32],
             from_user_id: vec![4u8; 32],
             body: b"ciphertext".to_vec(),
             from_device_id: None,
@@ -103,6 +104,7 @@ fn every_payload_variant_roundtrips() {
         frame::Payload::GetServerConfig(GetServerConfig {}),
         frame::Payload::SignedServerConfig(SignedServerConfig {
             config: ServerConfig {
+                supports_queue_provenance: true,
                 supports_queue_addressing: true,
                 supports_queue_only: true,
                 supports_derived_queues: true,
@@ -387,6 +389,22 @@ fn device_cert_revocation_wire_numbers_are_pinned() {
     };
     // ServerConfig.supports_device_cert_revocation = 22: ключ 176.
     assert_eq!(config.encode_to_vec(), [0xb0, 0x01, 0x01]);
+}
+
+#[test]
+fn queue_provenance_wire_numbers_are_pinned() {
+    let incoming = IncomingMessage {
+        queue_id: vec![7; 32],
+        ..Default::default()
+    };
+    let mut expected = vec![0x32, 32];
+    expected.extend_from_slice(&[7; 32]);
+    assert_eq!(incoming.encode_to_vec(), expected);
+    let config = ServerConfig {
+        supports_queue_provenance: true,
+        ..Default::default()
+    };
+    assert_eq!(config.encode_to_vec(), [0xb8, 0x01, 0x01]);
 }
 
 /// Номер возможности N-3 (очередь плюс устройство).

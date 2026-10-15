@@ -36,6 +36,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::{task::JoinHandle, time::sleep};
 use tracing::{info, warn};
 
+mod provenance;
 mod sender_quota;
 use sender_quota::aggregate_prefix;
 
@@ -57,6 +58,7 @@ const UNSUPPORTED_LEGACY_HINT: &str = "this build migrates only v3 and newer. \
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StoredMessage {
+    pub queue_id: Option<[u8; 32]>,
     pub id: u64,
     pub sender_id: [u8; 32],
     pub sender_device_id: Option<DeviceId>,
@@ -181,8 +183,9 @@ fn ttl_expired(ttl_seconds: u64, created_at_secs: u64, now_secs: u64) -> bool {
 #[derive(Clone)]
 pub struct Storage {
     db: Db,
-    inbox: Tree,        // ключ: [recipientId 32] + u64(be) msgId
-    device_inbox: Tree, // ключ: [recipientId 32] + deviceId(be) + u64(be) msgId
+    inbox: Tree,          // ключ: [recipientId 32] + u64(be) msgId
+    device_inbox: Tree,   // ключ: [recipientId 32] + deviceId(be) + u64(be) msgId
+    message_queues: Tree, // exact inbox key → resolved mailbox queue id (N-8)
     /// Счётчики очередей: сколько записей и байт лежит в каждой и сколько
     /// из них от каждого отправителя (форматы — в документации модуля).
     ///
@@ -210,6 +213,7 @@ impl Storage {
         let storage = Self {
             inbox: db.open_tree("inbox")?,
             device_inbox: db.open_tree("device_inbox")?,
+            message_queues: db.open_tree("message_queues")?,
             queue_stats: db.open_tree("queue_stats")?,
             meta: db.open_tree("meta")?,
             system: db.open_tree("system")?,
@@ -224,6 +228,7 @@ impl Storage {
         // необратимо: любой сбой посреди обновления счётчика заживает при
         // следующем запуске. Цена — один проход по очередям на старте.
         storage.rebuild_queue_stats()?;
+        storage.prune_provenance_orphans()?;
         Ok(storage)
     }
 
@@ -324,7 +329,8 @@ impl Storage {
         crate::state::push_state::PushStateStore::open(&self.db)
     }
 
-    pub fn enqueue_inbox(
+    #[allow(clippy::too_many_arguments)]
+    pub fn enqueue_inbox_with_queue(
         &self,
         recipient: &[u8; 32],
         sender: &[u8; 32],
@@ -332,6 +338,7 @@ impl Storage {
         body: &[u8],
         priority: Option<MessagePriority>,
         ttl_seconds: u64,
+        queue_id: Option<[u8; 32]>,
     ) -> Result<EnqueueResult> {
         let started = Instant::now();
         let id = self.generate_id()?;
@@ -357,13 +364,14 @@ impl Storage {
             USER_PREFIX_LEN,
             "enqueue_inbox",
             started,
+            queue_id,
         )?;
         Ok(EnqueueResult { id, stored: true })
     }
 
     // Поля конверта; отдельная структура ради одного вызова не нужна.
     #[allow(clippy::too_many_arguments)]
-    pub fn enqueue_device_inbox(
+    pub fn enqueue_device_inbox_with_queue(
         &self,
         recipient: &[u8; 32],
         recipient_device_id: DeviceId,
@@ -372,6 +380,7 @@ impl Storage {
         body: &[u8],
         priority: Option<MessagePriority>,
         ttl_seconds: u64,
+        queue_id: Option<[u8; 32]>,
     ) -> Result<EnqueueResult> {
         let started = Instant::now();
         let id = self.generate_id()?;
@@ -401,6 +410,7 @@ impl Storage {
             DEVICE_PREFIX_LEN,
             "enqueue_device_inbox",
             started,
+            queue_id,
         )?;
         Ok(EnqueueResult { id, stored: true })
     }
@@ -520,6 +530,7 @@ impl Storage {
                     continue;
                 }
                 messages.push(StoredMessage {
+                    queue_id: self.queue_id_for(&key)?,
                     id,
                     sender_id: decoded.sender_id,
                     sender_device_id: decoded.sender_device_id,
@@ -1204,14 +1215,23 @@ impl Storage {
     /// Счётчик неподтверждённых выдач уходит вместе с записью: через
     /// эту функцию проходит любое удаление из очередей.
     fn remove_and_note(&self, tree: &Tree, key: &[u8], prefix_len: usize) -> Result<Option<IVec>> {
-        let removed = tree.remove(key)?;
+        let removed: Result<Option<IVec>, TransactionError> =
+            (tree, &self.message_queues, &self.delivery_failures).transaction(
+                |(messages, queues, failures)| {
+                    let old = messages.remove(key)?;
+                    queues.remove(key)?;
+                    failures.remove(key)?;
+                    Ok(old)
+                },
+            );
+        let removed = removed.context("remove message and queue provenance")?;
         if let Some(value) = &removed {
             self.note_removed(&key[..prefix_len.min(key.len())], value)?;
-            self.delivery_failures.remove(key)?;
         }
         Ok(removed)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn insert_message(
         &self,
         tree: &Tree,
@@ -1220,11 +1240,22 @@ impl Storage {
         prefix_len: usize,
         op_name: &'static str,
         started: Instant,
+        queue_id: Option<[u8; 32]>,
     ) -> Result<()> {
         let prefix = key[..prefix_len.min(key.len())].to_vec();
         let stored_len = value.len();
         let sender = sender_of(&value).map(|sender| sender.to_vec());
-        match tree.insert(key, value) {
+        let inserted: Result<(), TransactionError> =
+            (tree, &self.message_queues).transaction(|(messages, queues)| {
+                messages.insert(key.as_slice(), value.as_slice())?;
+                if let Some(id) = queue_id {
+                    queues.insert(key.as_slice(), id.as_slice())?;
+                } else {
+                    queues.remove(key.as_slice())?;
+                }
+                Ok(())
+            });
+        match inserted {
             Ok(_) => {
                 self.note_stored(&prefix, stored_len, sender.as_deref())?;
                 observability::observe_storage_operation(op_name, "ok", started.elapsed());
@@ -1263,6 +1294,7 @@ impl Storage {
             }
 
             messages.push(StoredMessage {
+                queue_id: self.queue_id_for(&key)?,
                 id: u64::from_be_bytes(key[key.len() - 8..].try_into().unwrap()),
                 sender_id: decoded.sender_id,
                 sender_device_id: decoded.sender_device_id,

@@ -739,6 +739,7 @@ pub fn encode_delivery_ack(message_id: u64) -> Vec<u8> {
 /// Входящий конверт, разобранный до полей.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Incoming {
+    pub queue_id: Vec<u8>,
     pub from_user_id: Vec<u8>,
     pub message_id: u64,
     pub body: Vec<u8>,
@@ -747,6 +748,7 @@ pub struct Incoming {
 pub fn expect_incoming(bytes: &[u8]) -> Result<Incoming> {
     match decode(bytes)? {
         frame::Payload::Incoming(incoming) => Ok(Incoming {
+            queue_id: incoming.queue_id,
             from_user_id: incoming.from_user_id,
             message_id: incoming.message_id,
             body: incoming.body,
