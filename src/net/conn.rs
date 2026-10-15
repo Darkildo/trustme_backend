@@ -633,22 +633,10 @@ pub async fn handle_conn(
                       // принимается и игнорируется; поднят — очередь
                       // определяет получателя.
                       //
-                      // Когда очередь разрешилась, `recipientId` из кадра
-                      // не используется вовсе, даже если указывает на
-                      // кого-то другого: в целевой модели отправитель
-                      // личности получателя не знает. Назвать чужую
-                      // очередь можно, только зная её идентификатор, а
-                      // знание идентификатора и есть право в неё писать.
-                      //
-                      // `recipientDeviceId` при этом сохраняется и сужает
-                      // доставку до этого устройства владельца очереди —
-                      // ровно как рядом с `recipientId` (§6.8 контракта).
-                      // Прав это не расширяет: знание очереди и так даёт
-                      // право писать её владельцу, а одно устройство —
-                      // подмножество аккаунта. Дальше по коду разницы
-                      // между адресацией по очереди и по `recipientId` нет:
-                      // и прямой бэкенд, и брокер, и пуши получают уже
-                      // разрешённую пару «получатель, устройство».
+                      // Очередь определяет владельца. Если отправитель также
+                      // назвал recipientId, оба адреса должны совпадать (N-8).
+                      // Пустой recipientId сохраняет capability-адресацию.
+                      // recipientDeviceId только сужает область владельца.
                       let mut resolved = recipient;
                       // Определён ли получатель очередью. `false` — по
                       // `recipientId`: очереди в кадре нет либо нода её
@@ -665,6 +653,12 @@ pub async fn handle_conn(
                           } else {
                               match queues.owner_of(&id, unix_now_secs()) {
                                   Ok(Some(owner)) => {
+                                      if recipient.is_some_and(|claimed| claimed != owner) {
+                                          observability::observe_queue_addressed_reject();
+                                          reject_send(&mut framed, SendRejectReason::NoPermit).await?;
+                                          messages_rejected += 1;
+                                          continue;
+                                      }
                                       resolved = Some(owner);
                                       addressed_by_queue = true;
                                       observability::observe_queue_addressed_send();
