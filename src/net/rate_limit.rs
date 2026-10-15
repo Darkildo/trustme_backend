@@ -322,7 +322,8 @@ impl SessionLimits {
 
 /// Ключ вердикта: очередь получателя и, для под-квоты пары, отправитель с
 /// потолком, по которому вердикт вынесен (`None` — переполнена вся
-/// очередь). Потолок в ключе: у живого и офлайн-получателя он разный.
+/// очередь). Под-квота пары использует device=None для всех устройств
+/// (SEC-43); потолок в ключе у живого и офлайн-получателя разный.
 type QueueFullKey = (UserId, Option<DeviceId>, Option<(UserId, u64)>);
 
 /// Вердикт «очередь полна» на [`QueueFullCache::TTL`].
@@ -352,14 +353,14 @@ impl QueueFullCache {
         pair_ceiling: u64,
     ) -> bool {
         let now = std::time::Instant::now();
-        let pair = (pair_ceiling > 0).then_some((*sender, pair_ceiling));
-        [None, pair].into_iter().enumerate().any(|(index, key)| {
-            (index == 0 || key.is_some())
+        self.until
+            .get(&(*recipient, device, None))
+            .is_some_and(|until| *until > now)
+            || (pair_ceiling > 0
                 && self
                     .until
-                    .get(&(*recipient, device, key))
-                    .is_some_and(|until| *until > now)
-        })
+                    .get(&(*recipient, None, Some((*sender, pair_ceiling))))
+                    .is_some_and(|until| *until > now))
     }
 
     /// Запомнить вердикт: `pair_only` — упёрлась только под-квота пары с
@@ -377,6 +378,7 @@ impl QueueFullCache {
             self.until.retain(|_, until| *until > now);
         }
         let sender = pair_only.then_some((*sender, pair_ceiling));
+        let device = if pair_only { None } else { device };
         self.until
             .insert((*recipient, device, sender), now + Self::TTL);
     }
@@ -397,6 +399,23 @@ mod tests {
 
     fn user(seed: u8) -> crate::state::registry::UserId {
         [seed; 32]
+    }
+
+    #[test]
+    fn sender_pair_full_cache_is_shared_across_devices_but_queue_full_is_local() {
+        let cache = super::QueueFullCache::default();
+        let recipient = user(1);
+        let sender = user(2);
+        cache.remember(&recipient, Some(7), &sender, 2, true);
+        assert!(cache.is_full(&recipient, None, &sender, 2));
+        assert!(cache.is_full(&recipient, Some(65535), &sender, 2));
+        assert!(!cache.is_full(&recipient, Some(7), &user(3), 2));
+        assert!(!cache.is_full(&recipient, Some(7), &sender, 5));
+        let cache = super::QueueFullCache::default();
+        cache.remember(&recipient, Some(7), &sender, 2, false);
+        assert!(cache.is_full(&recipient, Some(7), &user(3), 2));
+        assert!(!cache.is_full(&recipient, Some(8), &sender, 2));
+        assert!(!cache.is_full(&recipient, None, &sender, 2));
     }
 
     #[test]
