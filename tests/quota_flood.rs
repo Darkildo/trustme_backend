@@ -209,3 +209,57 @@ async fn sender_pair_subquota_is_reported_as_full() -> Result<()> {
 
     Ok(())
 }
+
+#[tokio::test]
+async fn sender_cannot_multiply_pair_quota_by_changing_recipient_device() -> Result<()> {
+    use prost::Message;
+    use trust_message_tcp::wire::{ClientSend, Frame};
+    let limits = LimitsConfig {
+        max_messages_sender_pair: 2,
+        ..open_limits()
+    };
+    let server = spawn_server("flood_device_pair", limits).await?;
+    let sender = SigningKey::from_bytes(&[32; 32]);
+    let target = recipient(33);
+    let mut conn = connect(&server, &sender).await?;
+    next_frame(&mut conn).await?;
+    assert!(
+        send_and_read_ack(&mut conn, &target, b"account", 0)
+            .await?
+            .queued
+    );
+    let frame = |device| {
+        Frame {
+            proto_version: 1,
+            payload: Some(frame::Payload::ClientSend(ClientSend {
+                recipient_id: target.to_vec(),
+                recipient_device_id: Some(device),
+                body: b"device".to_vec(),
+                priority: 0,
+                wake_hint: 0,
+                queue_id: vec![],
+                ttl_seconds: 0,
+            })),
+        }
+        .encode_to_vec()
+    };
+    assert!(
+        common::send_raw_and_read_ack(&mut conn, &frame(7))
+            .await?
+            .queued
+    );
+    for device in [8, 65535] {
+        let rejected = common::send_raw_and_read_ack(&mut conn, &frame(device)).await?;
+        assert!(!rejected.ok && !rejected.queued);
+        assert_eq!(rejected.reason, SendRejectReason::Full);
+    }
+    let quiet = SigningKey::from_bytes(&[34; 32]);
+    let mut quiet_conn = connect(&server, &quiet).await?;
+    next_frame(&mut quiet_conn).await?;
+    assert!(
+        common::send_raw_and_read_ack(&mut quiet_conn, &frame(8))
+            .await?
+            .queued
+    );
+    Ok(())
+}

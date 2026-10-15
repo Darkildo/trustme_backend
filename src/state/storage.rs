@@ -10,6 +10,8 @@
 //! - `queue_stats` — счётчики очередей; пересобираются при каждом старте.
 //!   Ключ `prefix` (32 или 34 байта) → `messages(u64) || bytes(u64)`;
 //!   ключ `prefix || sender_id` (64 или 66 байт) → `count(u64)`.
+//!   Общая под-квота пары: `0xff || recipient(32) || sender(32)` (65 байт)
+//!   → число записей этого отправителя в account и всех device-очередях.
 //! - `meta` — архив удалённых записей: тот же ключ →
 //!   `removed_at_secs(u64) || исходная запись`, живёт по
 //!   `deleted_messages_retention`.
@@ -33,6 +35,9 @@ use sled::{Db, IVec, Transactional, Tree};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use tokio::{task::JoinHandle, time::sleep};
 use tracing::{info, warn};
+
+mod sender_quota;
+use sender_quota::aggregate_prefix;
 
 const STORAGE_VERSION_KEY: &[u8] = b"storage_version";
 const STORAGE_VERSION_V3: u8 = 3;
@@ -229,6 +234,8 @@ impl Storage {
 
         let mut totals: std::collections::HashMap<Vec<u8>, QueueCounters> =
             std::collections::HashMap::new();
+        let mut sender_totals: std::collections::HashMap<Vec<u8>, u64> =
+            std::collections::HashMap::new();
         for (tree, prefix_len) in [
             (&self.inbox, USER_PREFIX_LEN),
             (&self.device_inbox, DEVICE_PREFIX_LEN),
@@ -245,6 +252,9 @@ impl Storage {
                     let mut sender_key = key[..prefix_len].to_vec();
                     sender_key.extend_from_slice(sender);
                     *counters.per_sender.entry(sender_key).or_insert(0) += 1;
+                    let mut aggregate = aggregate_prefix(&key)?;
+                    aggregate.extend_from_slice(sender);
+                    *sender_totals.entry(aggregate).or_insert(0) += 1;
                 }
             }
         }
@@ -258,6 +268,9 @@ impl Storage {
             for (sender_key, count) in counters.per_sender {
                 batch.insert(sender_key, count.to_be_bytes().to_vec());
             }
+        }
+        for (key, count) in sender_totals {
+            batch.insert(key, count.to_be_bytes().to_vec());
         }
         self.queue_stats.apply_batch(batch)?;
 
@@ -1109,6 +1122,7 @@ impl Storage {
         self.bump_queue_counters(prefix, 1, len as i64)?;
         if let Some(sender) = sender {
             self.bump_sender_counter(prefix, sender, 1)?;
+            self.bump_sender_counter(&aggregate_prefix(prefix)?, sender, 1)?;
         }
         Ok(())
     }
@@ -1118,6 +1132,7 @@ impl Storage {
         self.bump_queue_counters(prefix, -1, -(value.len() as i64))?;
         if let Some(sender) = sender_of(value) {
             self.bump_sender_counter(prefix, sender, -1)?;
+            self.bump_sender_counter(&aggregate_prefix(prefix)?, sender, -1)?;
         }
         Ok(())
     }

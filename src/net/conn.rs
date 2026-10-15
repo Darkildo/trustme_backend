@@ -1847,10 +1847,11 @@ fn queue_quota_reason(
     let ceilings = QueueQuotaCeilings {
         messages: cfg.max_messages_per_queue as u64,
         bytes: cfg.max_bytes_per_queue,
-        from_sender: pair_ceiling,
+        // Sender budget is checked across all scopes below (SEC-43).
+        from_sender: 0,
     };
 
-    if ceilings.messages == 0 && ceilings.bytes == 0 && ceilings.from_sender == 0 {
+    if ceilings.messages == 0 && ceilings.bytes == 0 && pair_ceiling == 0 {
         return Ok(QuotaVerdict {
             reason: None,
             depth_before: None,
@@ -1869,7 +1870,8 @@ fn queue_quota_reason(
     let scan = storage.scan_queue_quota(recipient, recipient_device_id, sender, ceilings)?;
     let queue_full = (ceilings.messages > 0 && scan.messages >= ceilings.messages)
         || (ceilings.bytes > 0 && scan.bytes >= ceilings.bytes);
-    let pair_full = ceilings.from_sender > 0 && scan.from_sender >= ceilings.from_sender;
+    let pair_full = !queue_full && pair_ceiling > 0
+        && storage.scan_sender_pair_quota(recipient,sender,pair_ceiling)? >= pair_ceiling;
     let reason = if queue_full || pair_full {
         limits.queue_full.remember(
             recipient,
