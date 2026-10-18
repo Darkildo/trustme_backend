@@ -820,8 +820,15 @@ impl BlobStore {
         }
         let completes = live.released_by.len() + 1 >= live.max_releases as usize;
         if !completes {
-            let _meta = self.meta();
-            return self.add_releaser_locked(id, releaser, now);
+            // Пока ждали замок, другие устройства могли отпустить блоб, и
+            // этот релиз стал последним: тогда — путь с удержанием ворот.
+            let added = {
+                let _meta = self.meta();
+                self.add_releaser_locked(id, releaser, now)?
+            };
+            if let Some(result) = added {
+                return Ok(result);
+            }
         }
         let exclusive = self.exclusive(id).await;
         let outcome = self.last_release_locked(id, releaser, now);
@@ -844,30 +851,43 @@ impl BlobStore {
                 observability::observe_blob_removed("released");
                 Ok((Ok(()), Some(BlobReject::NotFound)))
             }
-            _ => Ok((self.add_releaser_locked(id, releaser, now)?, None)),
+            // Последний релиз разобран выше, сюда он не доходит.
+            _ => Ok((
+                self.add_releaser_locked(id, releaser, now)?
+                    .unwrap_or(Ok(())),
+                None,
+            )),
         }
     }
 
+    /// Учесть релиз, который не последний. `None` — релиз оказался
+    /// последним: стирать блоб можно только с удержанием ворот, а они под
+    /// замком метаданных не берутся. Под замком метаданных.
     fn add_releaser_locked(
         &self,
         id: &BlobId,
         releaser: Releaser,
         now: u64,
-    ) -> Result<Result<(), BlobReject>> {
+    ) -> Result<Option<Result<(), BlobReject>>> {
         let mut live = match self.get_record(id)? {
             Some(BlobRecord::Live(live)) if live.ready && live.expires_at > now => live,
-            Some(BlobRecord::Live(live)) if live.ready => return Ok(Err(BlobReject::Expired)),
-            Some(BlobRecord::Live(_)) => return Ok(Err(BlobReject::NotReady)),
-            Some(BlobRecord::Tomb(tomb)) => return Ok(Err(tomb_reject(&tomb))),
-            None => return Ok(Err(BlobReject::NotFound)),
+            Some(BlobRecord::Live(live)) if live.ready => {
+                return Ok(Some(Err(BlobReject::Expired)));
+            }
+            Some(BlobRecord::Live(_)) => return Ok(Some(Err(BlobReject::NotReady))),
+            Some(BlobRecord::Tomb(tomb)) => return Ok(Some(Err(tomb_reject(&tomb)))),
+            None => return Ok(Some(Err(BlobReject::NotFound))),
         };
-        if live.released_by.contains(&releaser) {
-            return Ok(Ok(()));
+        if live.max_releases == 0 || live.released_by.contains(&releaser) {
+            return Ok(Some(Ok(())));
+        }
+        if live.released_by.len() + 1 >= live.max_releases as usize {
+            return Ok(None);
         }
         let old = BlobRecord::Live(live.clone());
         live.released_by.push(releaser);
         self.put_record(id, Some(&old), &BlobRecord::Live(live))?;
-        Ok(Ok(()))
+        Ok(Some(Ok(())))
     }
 
     // --- Управление по токену ---
@@ -2173,6 +2193,35 @@ mod tests {
                 .unwrap(),
             Err(BlobReject::NotReady)
         ));
+    }
+
+    /// Устройства отпускают блоб одновременно: последний релиз стирает его,
+    /// даже если каждое при первом взгляде видело себя не последним.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_releases_remove_the_blob_exactly_once() {
+        let fx = fixture("concurrent_releases");
+        let data = payload(100, 16);
+        for seed in 0..20u8 {
+            let mut req = request(None, &data, 120 + seed);
+            req.max_releases = 3;
+            upload(&fx.store, &SENDER, &req, &data).await;
+            let releases: Vec<_> = (0..3u8)
+                .map(|device| {
+                    let store = fx.store.clone();
+                    let id = req.blob_id;
+                    tokio::spawn(async move { store.release(&id, reader_of(device), NOW).await })
+                })
+                .collect();
+            for release in releases {
+                release.await.unwrap().unwrap().unwrap();
+            }
+            assert_eq!(
+                fx.store.status(&SENDER, &req.blob_id, NOW).unwrap(),
+                Err(BlobReject::NotFound),
+                "блоб {seed} пережил все релизы"
+            );
+        }
+        assert_eq!(usage(&fx, &owner_usage_key(&SENDER)), 0);
     }
 
     #[tokio::test]
