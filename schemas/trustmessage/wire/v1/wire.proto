@@ -283,6 +283,23 @@ message NoiseClientHello {
   // обязателен: сертификат выписан на конкретное устройство. При неудачной
   // проверке сертификата отката к прямой сверке нет.
   optional DeviceCertificate device_cert = 3;
+  // Роль сессии (server-contract.md, §6.11). Лежит здесь, а не в открытом
+  // прологе: payload хендшейка зашифрован и входит в transcript, поэтому
+  // подменить роль на проводе нельзя. Незнакомое значение — отказ
+  // хендшейка: нода не может обслужить роль, о которой не знает.
+  SessionRole role = 4;
+}
+
+// Роль Noise-сессии.
+enum SessionRole {
+  // Сессия сообщений: доставка, отправка, очереди, push-токены. Это же
+  // значение приходит от клиентов, не знающих про роли.
+  SESSION_ROLE_UNSPECIFIED = 0;
+  // Сессия передачи файлов (server-contract.md, §6.11): кадры хранилища,
+  // Ping и GetServerConfig. Для доставки не регистрируется, входящих не
+  // получает, «в сети» для пушей не делает и в `max_sessions_per_user` не
+  // считается — у неё свой потолок.
+  SESSION_ROLE_BLOB = 1;
 }
 
 // Сертификат устройства: ключ аккаунта поручает отдельной X25519-паре
@@ -448,6 +465,26 @@ message ServerConfig {
   // online/offline/replay delivery; a named recipient is checked against the
   // owner. Old stored records may have no provenance. Requires queue routing.
   bool supports_queue_provenance = 23;
+
+  // Хранилище файлов (server-contract.md, §6.11). `false` — оператор его
+  // выключил: кадры хранилища получают `UNSUPPORTED`, а остальные поля
+  // `blob_*` равны нулю.
+  bool supports_blobs = 24;
+  // Потолок размера одного блоба, байт шифротекста. Больше — `TOO_LARGE`.
+  uint64 blob_max_size = 25;
+  // Потолок срока жизни блоба, секунды. Запрошенный срок нода зажимает им
+  // и при загрузке, и при продлении; 0 в запросе — сам потолок.
+  uint64 blob_max_ttl_secs = 26;
+  // Максимум данных в одном `BlobUploadChunk.data` и `BlobData.data`, байт.
+  // Вместе со служебными полями кадра всегда влезает в `max_frame_len`.
+  uint64 blob_chunk_max = 27;
+  // Сколько байт может храниться на один ящик или аккаунт: владельца
+  // очереди для личных файлов, загрузившего — для своих.
+  uint64 blob_quota_per_owner = 28;
+  // Сколько байт нода отдаёт в ответ на один `BlobGet`. Более длинный
+  // диапазон отдаётся началом этой длины, остальное клиент запрашивает
+  // следующим `BlobGet`.
+  uint64 blob_get_window = 29;
 
   // Номера 9–11 зарезервированы под удалённые поля версий клиента и ссылки
   // на обновление. Оператор ноды не должен влиять на дистрибуцию
@@ -646,6 +683,236 @@ message RevokeDeviceCerts {
   bool all = 3;
 }
 
+// --- Хранилище файлов (server-contract.md, §6.11) ---
+//
+// Блоб — непрозрачные байты (шифротекст контейнера TMV1) с метаданными.
+// Клиент загружает файл один раз, а в сообщении через очередь едет только
+// E2E-указатель: `blob_secret`, адрес ноды и ключ файла. Нода хранит блоб под
+// `blob_id = SHA-256(blob_secret)`; сам секрет знают только клиенты, и его
+// предъявление — право на чтение. Хранимый id права не даёт, поэтому может
+// попадать в имена файлов, надгробия и метрики.
+//
+// Байты блобов ходят только по сессии роли `BLOB` (см. SessionRole): так
+// мегабайтные кадры не стоят в одном TCP-канале перед сообщениями.
+// Сессия сообщений принимает из этих кадров только `BlobStat`.
+//
+// Ответ на любую операцию — `BlobAck` (на `BlobGet` — поток `BlobData`, на
+// `BlobStat` — `BlobStatResult`). Отказ не рвёт сессию: разрыв — только на
+// нарушение формата кадра.
+
+// Состояние блоба в `BlobStatEntry`.
+enum BlobState {
+  BLOB_STATE_UNSPECIFIED = 0;
+  // Загружен и проверен; можно скачивать.
+  BLOB_STATE_READY = 1;
+  // Загрузка не завершена.
+  BLOB_STATE_UPLOADING = 2;
+  // Надгробие: истёк срок. Отправителя можно попросить загрузить заново.
+  BLOB_STATE_EXPIRED = 3;
+  // Надгробие: удалён загрузившим. Просить заново не нужно — файл отозван.
+  BLOB_STATE_DELETED = 4;
+  // Не было, стёрт после релизов всеми читателями или надгробие истекло.
+  BLOB_STATE_NOT_FOUND = 5;
+  // Блоб живой, но токен управления не подошёл.
+  BLOB_STATE_FORBIDDEN = 6;
+}
+
+// Причина отказа в `BlobAck`. Как и у `SendRejectReason`, пара `ok = false,
+// reason = UNSPECIFIED` читается как родовой отказ.
+enum BlobRejectReason {
+  BLOB_REJECT_REASON_UNSPECIFIED = 0;
+  // Блоба нет и не было, стёрт после релизов всеми читателями, его
+  // надгробие истекло или незавершённая загрузка протухла. Неверный
+  // `blob_secret` неотличим от несуществующего блоба.
+  BLOB_REJECT_REASON_NOT_FOUND = 1;
+  // Истёк срок (надгробие). Можно попросить отправителя перезалить.
+  BLOB_REJECT_REASON_EXPIRED = 2;
+  // Токен управления не подошёл; очередь получателя неизвестна, отозвана
+  // или истекла; загрузку дописывает не загрузивший; делегированной сессии
+  // не хватает права SEND.
+  BLOB_REJECT_REASON_FORBIDDEN = 3;
+  // `size` больше `ServerConfig.blob_max_size`.
+  BLOB_REJECT_REASON_TOO_LARGE = 4;
+  // Квота ящика, пары «загрузивший → владелец», суточный объём загрузок
+  // пользователя или резерв диска ноды.
+  BLOB_REJECT_REASON_QUOTA = 5;
+  // Превышен rate-limit операций хранилища. Повтор через секунду осмыслен.
+  BLOB_REJECT_REASON_RATE_LIMITED = 6;
+  // Негодные параметры: длины полей, смещение не там (с актуальным
+  // `committed_offset`), диапазон за пределами блоба, размер или SHA-256
+  // при `Commit` не сошлись (блоб тогда удалён).
+  BLOB_REJECT_REASON_INVALID = 7;
+  // Операция над блобом, загрузка которого не завершена.
+  BLOB_REJECT_REASON_NOT_READY = 8;
+  // Хранилище выключено оператором либо кадр пришёл в сессию не той роли.
+  BLOB_REJECT_REASON_UNSUPPORTED = 9;
+  // Ошибка ноды: диск, база. Повтор через паузу осмыслен.
+  BLOB_REJECT_REASON_INTERNAL = 10;
+  // Удалён загрузившим (надгробие). Просить заново не нужно.
+  BLOB_REJECT_REASON_DELETED = 11;
+  // `BlobUploadInit`: `blob_id` уже занят — живым блобом или надгробием.
+  BLOB_REJECT_REASON_CONFLICT = 12;
+}
+
+// Клиент → нода: начать загрузку. Ответ — `BlobAck` с `blob_id`,
+// `committed_offset = 0` и предварительным `expires_at`.
+message BlobUploadInit {
+  // 32 байта — личный файл (scope RECIPIENT): кладётся в ящик владельца
+  // этой очереди и считается его квотой; нужна живая очередь, как для
+  // депозита. Пусто — свой файл (scope OWN): группы и свои устройства,
+  // квота загрузившего. Другая длина — INVALID.
+  bytes queue_id = 1;
+  // Размер шифротекста, байт; > 0 и не больше `blob_max_size`. Квоты
+  // резервируются по нему сразу.
+  uint64 size = 2;
+  // SHA-256 шифротекста (32 байта); нода сверяет при `BlobUploadCommit`.
+  bytes sha256 = 3;
+  // Срок жизни после `Commit`, секунды. 0 — потолок ноды; больше потолка
+  // — зажимается им.
+  uint64 ttl_seconds = 4;
+  // Сколько разных устройств (`user_id`, `device_id`) должны отпустить
+  // блоб `BlobRelease`, чтобы нода его стёрла. 0 — только срок. Не больше
+  // 256, иначе INVALID.
+  uint32 max_releases = 5;
+  // SHA-256(blob_secret), 32 байта. Занят живым блобом или надгробием —
+  // CONFLICT. Связь id с секретом нода проверить не может: неверный id
+  // вредит только загрузившему.
+  bytes blob_id = 6;
+  // SHA-256 токена управления (32 байта). Сам токен — у отправителя; им
+  // блоб удаляют и продлевают.
+  bytes delete_token_hash = 7;
+  uint64 request_id = 8;
+}
+
+// Клиент → нода: очередной кусок загрузки. Принимается только со
+// смещения, которое нода ждёт (последовательно, без дыр); иначе `BlobAck`
+// INVALID с ожидаемым `committed_offset`. Ответа на каждый кусок нет:
+// прогресс приходит `BlobAck` (`ok = true`, `request_id = 0`, `blob_id`,
+// `committed_offset`) после каждого сброса на диск и после последнего
+// куска. Отказы по кускам тоже несут `request_id = 0` и `blob_id`.
+message BlobUploadChunk {
+  bytes blob_id = 1;
+  uint64 offset = 2;
+  // Не пусто и не длиннее `ServerConfig.blob_chunk_max`.
+  bytes data = 3;
+}
+
+// Клиент → нода: загрузка закончена. Размер и SHA-256 сошлись — блоб READY,
+// `BlobAck` несёт окончательный `expires_at`. Иначе INVALID, и блоб
+// удаляется без надгробия.
+message BlobUploadCommit {
+  bytes blob_id = 1;
+  uint64 request_id = 2;
+}
+
+// Клиент → нода: где остановилась загрузка (докачка после разрыва).
+// `BlobAck.committed_offset` — сколько байт сброшено на диск; с него и
+// продолжать.
+message BlobUploadStatus {
+  bytes blob_id = 1;
+  uint64 request_id = 2;
+}
+
+// Клиент → нода: скачать диапазон. Ответ — поток `BlobData` с тем же
+// `request_id`; отказ (в том числе посреди потока, если блоб удалили или он
+// истёк) — `BlobAck`. Срок и счётчик релизов не меняются.
+message BlobGet {
+  // 32 байта. Нода считает SHA-256 и ищет блоб по нему.
+  bytes blob_secret = 1;
+  uint64 offset = 3;
+  // 0 — до конца блоба. Ответ не длиннее `ServerConfig.blob_get_window`.
+  // Диапазон за пределами блоба — INVALID.
+  uint64 length = 4;
+  uint64 request_id = 5;
+}
+
+// Клиент → нода: файл получен и проверен, этому устройству он больше не
+// нужен. Учитывается один раз на (`user_id`, `device_id`) сессии; повтор —
+// `ok`. Когда отпустили `max_releases` устройств, блоб стирается (дальше —
+// NOT_FOUND).
+message BlobRelease {
+  bytes blob_secret = 1;
+  uint64 request_id = 3;
+}
+
+// Клиент → нода: удалить блоб (только загрузивший — по токену управления).
+// Разрешено в любом состоянии: загрузка обрывается, файл стирается, идущие
+// скачивания прерываются `BlobAck` DELETED. Остаётся надгробие DELETED.
+// Повтор с верным токеном — `ok`, с неверным — FORBIDDEN.
+message BlobDelete {
+  bytes blob_id = 1;
+  bytes delete_token = 2;
+  uint64 request_id = 3;
+}
+
+// Клиент → нода: продлить срок готового блоба: `expires_at = now +
+// min(ttl_seconds, потолок)`; 0 — потолок.
+message BlobExtend {
+  bytes blob_id = 1;
+  bytes delete_token = 2;
+  uint64 ttl_seconds = 3;
+  uint64 request_id = 4;
+}
+
+// Одна запись `BlobStat`: ровно одно из — `blob_secret` (читатель) или
+// `blob_id` + `delete_token` (загрузивший).
+message BlobStatQuery {
+  bytes blob_secret = 1;
+  bytes blob_id = 2;
+  bytes delete_token = 3;
+}
+
+// Клиент → нода: проверить наличие пачкой, ничего не меняя. Принимается в
+// сессиях обеих ролей. Больше 64 записей или негодная запись — `BlobAck`
+// INVALID на весь запрос.
+message BlobStat {
+  repeated BlobStatQuery items = 1;
+  uint64 request_id = 2;
+}
+
+// Нода → клиент: исход операции хранилища.
+message BlobAck {
+  uint64 request_id = 1;
+  bool ok = 2;
+  BlobRejectReason reason = 3;
+  // Init, Status, прогресс и отказы по `BlobUploadChunk`.
+  bytes blob_id = 4;
+  // Init, Status, прогресс загрузки; при INVALID по смещению — с какого
+  // смещения нода ждёт следующий кусок.
+  uint64 committed_offset = 5;
+  // Init (предварительный), Commit, Extend, Status: срок после зажима,
+  // Unix-секунды.
+  uint64 expires_at = 6;
+}
+
+// Нода → клиент: кусок ответа на `BlobGet`.
+message BlobData {
+  uint64 request_id = 1;
+  // Смещение куска в блобе.
+  uint64 offset = 2;
+  // Не длиннее `ServerConfig.blob_chunk_max`.
+  bytes data = 3;
+  // Последний кусок этого ответа. Блоб получен целиком, когда
+  // `offset + len(data)` равно его размеру.
+  bool eof = 4;
+}
+
+message BlobStatEntry {
+  BlobState state = 1;
+  // READY — срок блоба; UPLOADING — когда незавершённая загрузка будет
+  // удалена, если её не продолжить. Иначе 0.
+  uint64 expires_at = 2;
+  // Только для запроса по токену управления (видит лишь загрузивший).
+  uint32 releases_done = 3;
+  uint32 max_releases = 4;
+}
+
+// Нода → клиент: ответ на `BlobStat`; порядок записей — порядок `items`.
+message BlobStatResult {
+  uint64 request_id = 1;
+  repeated BlobStatEntry entries = 2;
+}
+
 message Ping {}
 
 message Pong {}
@@ -678,5 +945,17 @@ message Frame {
     SetQueueOnly set_queue_only = 20;
     SetAccountRecord set_account_record = 21;
     RevokeDeviceCerts revoke_device_certs = 22;
+    BlobUploadInit blob_upload_init = 23;
+    BlobUploadChunk blob_upload_chunk = 24;
+    BlobUploadCommit blob_upload_commit = 25;
+    BlobUploadStatus blob_upload_status = 26;
+    BlobGet blob_get = 27;
+    BlobRelease blob_release = 28;
+    BlobDelete blob_delete = 29;
+    BlobExtend blob_extend = 30;
+    BlobStat blob_stat = 31;
+    BlobAck blob_ack = 32;
+    BlobData blob_data = 33;
+    BlobStatResult blob_stat_result = 34;
   }
 }

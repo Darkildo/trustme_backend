@@ -1074,6 +1074,7 @@ fn encode_client_hello(
         identity_key: identity_key.to_vec(),
         device_id: crate::net::framing::encode_device_id(device_id),
         device_cert,
+        role: crate::wire::SessionRole::Unspecified as i32,
     }
     .encode_to_vec())
 }

@@ -300,6 +300,7 @@ fn main() -> Result<()> {
                 identity_key: client.verifying_key().to_bytes().to_vec(),
                 device_id,
                 device_cert: None,
+                role: wire::SessionRole::Unspecified as i32,
             }
             .encode_to_vec(),
         )?;
@@ -338,6 +339,7 @@ fn main() -> Result<()> {
                     signature: client.sign(&message).to_bytes().to_vec(),
                     device_id: 7,
                 }),
+                role: wire::SessionRole::Unspecified as i32,
             }
             .encode_to_vec(),
         )?;
