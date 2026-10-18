@@ -112,6 +112,21 @@ pub fn test_config(storage_path: &str, limits: LimitsConfig) -> Config {
         },
         push: disabled_push_config(),
         limits,
+        blobs: test_blob_config(storage_path),
+    }
+}
+
+/// Хранилище файлов тестовой ноды: каталог внутри её хранилища, кусок
+/// меньше тестового потолка кадра, резерв диска выключен — тестам нужен
+/// исход операций, а не место на машине разработчика.
+pub fn test_blob_config(storage_path: &str) -> trust_message_tcp::config::BlobConfig {
+    trust_message_tcp::config::BlobConfig {
+        dir: format!("{storage_path}/blobs"),
+        chunk_max: 64 * 1024,
+        get_window: 256 * 1024,
+        sync_every: 128 * 1024,
+        disk_reserve: 0,
+        ..Default::default()
     }
 }
 

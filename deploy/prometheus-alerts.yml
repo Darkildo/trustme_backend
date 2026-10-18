@@ -156,6 +156,34 @@ groups:
             Проверить место под STORAGE_PATH в первую очередь.
           runbook: docs/runbook-failure-modes.md
 
+      - alert: BlobStoreErrors
+        expr: sum(rate(trust_message_tcp_blob_ops_total{result="internal"}[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Хранилище файлов отвечает ошибками"
+          description: >-
+            Диск или база под BLOB_DIR отвечают ошибками: загрузки и
+            скачивания файлов получают INTERNAL. Сообщения при этом
+            ходят. Проверить место и права на BLOB_DIR.
+          runbook: docs/runbook-failure-modes.md
+
+      - alert: BlobStoreReconciled
+        # Сверка при старте исправила расхождения метаданных и файлов:
+        # нода упала посреди коммита или удаления либо в каталог
+        # вмешались руками. Разовое событие после аварии — норма.
+        expr: sum(increase(trust_message_tcp_blob_reconcile_total[1h])) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "Хранилище файлов сверено после некорректной остановки"
+          description: >-
+            Счётчики по видам — в метрике blob_reconcile_total. Если это
+            повторяется на каждом штатном рестарте, остановка ноды
+            обрывает запись — проверить таймаут остановки контейнера.
+          runbook: docs/runbook-failure-modes.md
+
       - alert: QuotaScanSlow
         # Скан квоты на горячем пути офлайн-депозита; его p99 растёт
         # вместе с глубиной очередей.

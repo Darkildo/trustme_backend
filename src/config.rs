@@ -62,6 +62,94 @@ pub struct Config {
     /// `issued_before`, а при `0` не устаревает вовсе — снижение потолка не
     /// стирает отзывы.
     pub device_cert_max_ttl: Duration,
+    /// Хранилище файлов (`BLOB_*`, server-contract.md §6.11).
+    pub blobs: BlobConfig,
+}
+
+/// Хранилище файлов: каталог, потолки, квоты и лимиты (`BLOB_*`). Квоты
+/// резервируются по объявленному размеру при `BlobUploadInit`; `0` у квот и
+/// лимитов — «не ограничено». На блобы не распространяются ни квоты
+/// очередей, ни `send_bytes_per_day`.
+#[derive(Clone, Debug)]
+pub struct BlobConfig {
+    /// Выключатель хранилища (`BLOB_ENABLED`). Default: `true`. Выключенное
+    /// не объявляется в `ServerConfig`, а его кадры получают `UNSUPPORTED`.
+    pub enabled: bool,
+    /// Каталог файлов (`BLOB_DIR`). Default: `<STORAGE_PATH>/blobs`.
+    pub dir: String,
+    /// Потолок одного блоба, байт (`BLOB_MAX_SIZE_BYTES`). Default: 2 GiB.
+    pub max_size: u64,
+    /// Потолок срока жизни блоба, сек (`BLOB_MAX_TTL_SECS`). Default: 30
+    /// суток; `0` недопустим.
+    pub max_ttl_secs: u64,
+    /// Сколько всего хранится на один ящик или аккаунт, байт
+    /// (`BLOB_QUOTA_PER_OWNER_BYTES`). Default: 2 GiB.
+    pub quota_per_owner: u64,
+    /// Сколько один загрузивший держит в ящике одного владельца, байт
+    /// (`BLOB_QUOTA_PER_PAIR_BYTES`): один контакт не забивает ящик. Для
+    /// своих файлов (загрузивший = владелец) не действует. Default: 1 GiB.
+    pub quota_per_pair: u64,
+    /// Сколько байт пользователь может загрузить за UTC-сутки
+    /// (`BLOB_UPLOAD_BYTES_PER_DAY`). Считается по объявленному размеру при
+    /// `Init`. Default: 4 GiB.
+    pub upload_bytes_per_day: u64,
+    /// Свободное место на диске каталога, ниже которого новые загрузки
+    /// получают `QUOTA`, байт (`BLOB_DISK_RESERVE_BYTES`). Default: 5 GiB.
+    pub disk_reserve: u64,
+    /// Сколько живёт незавершённая загрузка после последнего сброса на
+    /// диск, сек (`BLOB_UPLOAD_STALE_SECS`). Default: 86 400.
+    pub upload_stale_secs: u64,
+    /// Сколько помнить надгробия истёкших и удалённых блобов, сек
+    /// (`BLOB_TOMBSTONE_SECS`). Default: `BLOB_MAX_TTL_SECS`.
+    pub tombstone_secs: u64,
+    /// Потолок одновременных сессий роли `BLOB` на пользователя
+    /// (`MAX_BLOB_SESSIONS_PER_USER`). Не входит в `max_sessions_per_user`.
+    /// Default: 4, `0` = без ограничения.
+    pub max_sessions_per_user: usize,
+    /// Максимум данных в одном `BlobUploadChunk` / `BlobData`, байт
+    /// (`BLOB_CHUNK_MAX_BYTES`). Вместе с запасом под служебные поля обязан
+    /// влезать в `MAX_FRAME_LEN`. Default: 1 MiB.
+    pub chunk_max: usize,
+    /// Сколько байт отдаётся в ответ на один `BlobGet`
+    /// (`BLOB_GET_WINDOW_BYTES`): ответ не должен надолго занимать сессию.
+    /// Default: 8 MiB.
+    pub get_window: u64,
+    /// Через сколько загруженных байт сбрасывать файл на диск (`fsync`) и
+    /// подтверждать прогресс клиенту (`BLOB_SYNC_EVERY_BYTES`). Default:
+    /// 4 MiB.
+    pub sync_every: u64,
+    /// Операций хранилища в секунду на пользователя (`BLOB_OPS_PER_SEC`):
+    /// `Init`, `Commit`, `Status`, `Get`, `Release`, `Delete`, `Extend`.
+    /// Сверх — `RATE_LIMITED`. Куски загрузки не считаются: их ограничивает
+    /// суточный объём. Default: 50, `0` = без ограничения.
+    pub ops_per_sec: u32,
+    /// Запросов `BlobStat` в секунду на пользователя (`BLOB_STAT_PER_SEC`).
+    /// Default: 20, `0` = без ограничения.
+    pub stat_per_sec: u32,
+}
+
+impl Default for BlobConfig {
+    fn default() -> Self {
+        const GIB: u64 = 1024 * 1024 * 1024;
+        Self {
+            enabled: true,
+            dir: "data/blobs".to_string(),
+            max_size: 2 * GIB,
+            max_ttl_secs: 30 * 86_400,
+            quota_per_owner: 2 * GIB,
+            quota_per_pair: GIB,
+            upload_bytes_per_day: 4 * GIB,
+            disk_reserve: 5 * GIB,
+            upload_stale_secs: 86_400,
+            tombstone_secs: 30 * 86_400,
+            max_sessions_per_user: 4,
+            chunk_max: 1024 * 1024,
+            get_window: 8 * 1024 * 1024,
+            sync_every: 4 * 1024 * 1024,
+            ops_per_sec: 50,
+            stat_per_sec: 20,
+        }
+    }
 }
 
 /// Лимиты и квоты. Все значения `0` означают «не ограничено», кроме
@@ -959,7 +1047,16 @@ pub fn load() -> anyhow::Result<Config> {
     };
     check_tcp_keepalive(&limits)?;
 
+    let blobs = BlobConfig {
+        dir: Path::new(&storage_path)
+            .join("blobs")
+            .to_string_lossy()
+            .into_owned(),
+        ..BlobConfig::default()
+    };
+
     Ok(Config {
+        blobs,
         queue_addressing_enabled: queue_addressing_enabled.unwrap_or(false),
         device_cert_max_ttl: Duration::from_secs(
             device_cert_max_ttl_seconds.unwrap_or(30 * 24 * 3600),
@@ -1823,6 +1920,7 @@ mod tests {
     #[test]
     fn sled_advertises_delivery_acks_unless_retention_is_immediate() {
         let mut cfg = super::Config {
+            blobs: super::BlobConfig::default(),
             queue_addressing_enabled: false,
             device_cert_max_ttl: Duration::ZERO,
             bind_addr: "127.0.0.1:0".to_string(),

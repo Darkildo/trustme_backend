@@ -456,3 +456,46 @@ pub fn observe_push_token_removed(reason: &'static str) {
 pub fn observe_push_latency(elapsed: Duration) {
     histogram!("trust_message_tcp_push_latency_seconds").record(elapsed.as_secs_f64());
 }
+
+/// Операция хранилища файлов и её исход: `result` — `ok` или причина
+/// отказа (`BlobRejectReason` в нижнем регистре). `op`: `init`, `chunk`,
+/// `commit`, `status`, `get`, `release`, `delete`, `extend`, `stat`.
+pub fn observe_blob_op(op: &'static str, result: &'static str) {
+    counter!("trust_message_tcp_blob_ops_total", "op" => op, "result" => result).increment(1);
+}
+
+/// Байты блобов через ноду: `direction` — `upload` (записано на диск) или
+/// `download` (прочитано для `BlobData`).
+pub fn observe_blob_bytes(direction: &'static str, bytes: u64) {
+    counter!("trust_message_tcp_blob_bytes_total", "direction" => direction).increment(bytes);
+}
+
+/// Блоб стёрт. `cause`: `released` (отпустили все читатели), `expired`
+/// (срок, остаётся надгробие), `deleted` (загрузившим, надгробие), `stale`
+/// (незавершённая загрузка протухла), `invalid` (размер или SHA-256 не
+/// сошлись при `Commit`, либо очередь получателя отозвали).
+pub fn observe_blob_removed(cause: &'static str) {
+    counter!("trust_message_tcp_blob_removed_total", "cause" => cause).increment(1);
+}
+
+/// Расхождения, исправленные сверкой хранилища при старте: `orphan_file`,
+/// `missing_file`, `rewound_upload`, `corrupt_record`. Ненулевое значение —
+/// след некорректной остановки или ручного вмешательства в каталог.
+pub fn observe_blob_reconcile(kind: &'static str, count: u64) {
+    counter!("trust_message_tcp_blob_reconcile_total", "kind" => kind).increment(count);
+}
+
+/// Занятое хранилищем: готовые блобы и незавершённые загрузки (последние —
+/// по объявленному размеру: квоты резервируются при `Init`).
+pub fn set_blob_usage(
+    ready_bytes: u64,
+    ready_count: u64,
+    uploading_bytes: u64,
+    uploading_count: u64,
+) {
+    gauge!("trust_message_tcp_blob_stored_bytes", "state" => "ready").set(ready_bytes as f64);
+    gauge!("trust_message_tcp_blob_stored_bytes", "state" => "uploading")
+        .set(uploading_bytes as f64);
+    gauge!("trust_message_tcp_blob_count", "state" => "ready").set(ready_count as f64);
+    gauge!("trust_message_tcp_blob_count", "state" => "uploading").set(uploading_count as f64);
+}
