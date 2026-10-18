@@ -50,6 +50,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::time::timeout;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{debug, info, warn};
+use zeroize::Zeroize;
 
 use crate::net::device_cert::{self, SessionScope};
 use crate::net::framing::PROTO_VERSION;
@@ -144,7 +145,7 @@ const NOISE_MAX_PAYLOAD_LEN: usize = NOISE_MAX_MESSAGE_LEN - NOISE_TAG_LEN;
 /// Заголовок логического кадра внутри шифрованного потока (u32 LE длина).
 const LOGICAL_HEADER_LEN: usize = 4;
 /// Имя файла с identity-ключом ноды внутри каталога хранилища.
-const NODE_KEY_FILE: &str = "node_identity_key";
+pub const NODE_KEY_FILE: &str = "node_identity_key";
 
 /// Человекочитаемый отпечаток статика ноды.
 ///
@@ -278,6 +279,17 @@ impl NodeIdentity {
             "generated a NEW node key; clients pinned to the previous key \
              can no longer connect — expected only on a fresh node"
         );
+        Ok(identity)
+    }
+
+    /// Собрать identity из hex-записи секрета — формы, в которой он лежит в
+    /// файле и в `NODE_IDENTITY_KEY`. В отличие от `load_or_generate`, ничего
+    /// не создаёт и не пишет: этим путём внешняя проверка (`tmnode`) сверяет
+    /// пин, не рискуя подменить ключ ноды.
+    pub fn from_secret_hex(raw: &str, source: NodeKeySource) -> Result<Self> {
+        let mut seed = parse_hex_secret(raw)?;
+        let identity = Self::from_seed(seed, source);
+        seed.zeroize();
         Ok(identity)
     }
 
@@ -1972,6 +1984,27 @@ mod tests {
         assert_ne!(pinned.public(), generated.public());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Секрет из hex даёт ту же identity, что и seed, и ничего не пишет на
+    /// диск: этим путём пин сверяется снаружи.
+    #[test]
+    fn secret_hex_yields_the_same_identity() {
+        let seed = [5u8; 32];
+        let from_hex = NodeIdentity::from_secret_hex(
+            &format!(" {}\n", hex::encode(seed)),
+            NodeKeySource::File,
+        )
+        .unwrap();
+        let from_seed = NodeIdentity::from_seed(seed, NodeKeySource::File);
+        assert_eq!(from_hex.public(), from_seed.public());
+        assert_eq!(from_hex.identity_public(), from_seed.identity_public());
+        assert_eq!(from_hex.source(), NodeKeySource::File);
+
+        assert!(NodeIdentity::from_secret_hex("zz", NodeKeySource::File).is_err());
+        assert!(
+            NodeIdentity::from_secret_hex(&hex::encode([1u8; 16]), NodeKeySource::File).is_err()
+        );
     }
 
     /// Сгенерированный ключ ложится на диск с правами 0600: файл, который
