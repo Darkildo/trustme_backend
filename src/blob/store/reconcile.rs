@@ -198,13 +198,14 @@ impl BlobStore {
             let BlobRecord::Live(live) = record else {
                 continue;
             };
+            let charge = self.charge(live.size);
             *usage
                 .entry(owner_usage_key(&live.owner).to_vec())
-                .or_default() += live.size;
+                .or_default() += charge;
             if !live.is_own() {
                 *usage
                     .entry(pair_usage_key(&live.owner, &live.uploader).to_vec())
-                    .or_default() += live.size;
+                    .or_default() += charge;
             }
             if live.ready {
                 ready_bytes += live.size;

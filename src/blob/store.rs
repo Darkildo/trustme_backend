@@ -243,6 +243,14 @@ impl BlobStore {
         &self.inner.cfg
     }
 
+    /// Сколько блоб занимает в квотах: не меньше `BLOB_MIN_CHARGE_BYTES`.
+    /// Иначе квоты в байтах не ограничивали бы число записей: миллион
+    /// однобайтовых блобов уложился бы в мегабайт. Резерв диска и метрики
+    /// считают настоящий размер.
+    pub fn charge(&self, size: u64) -> u64 {
+        size.max(self.inner.cfg.min_charge)
+    }
+
     /// Срок после зажима потолком: `0` — потолок.
     pub fn clamp_ttl(&self, requested: u64) -> u64 {
         let ceiling = self.inner.cfg.max_ttl_secs;
@@ -358,7 +366,8 @@ impl BlobStore {
         now: u64,
     ) -> Result<Option<BlobReject>> {
         let cfg = &self.inner.cfg;
-        let over = |used: u64, ceiling: u64| ceiling > 0 && used.saturating_add(size) > ceiling;
+        let charge = self.charge(size);
+        let over = |used: u64, ceiling: u64| ceiling > 0 && used.saturating_add(charge) > ceiling;
         if over(self.usage_of(&owner_usage_key(owner))?, cfg.quota_per_owner) {
             return Ok(Some(BlobReject::Quota));
         }
@@ -380,7 +389,7 @@ impl BlobStore {
         if available.saturating_sub(pending) < cfg.disk_reserve.saturating_add(size) {
             return Ok(Some(BlobReject::Quota));
         }
-        let size_for_budget = usize::try_from(size).unwrap_or(usize::MAX);
+        let size_for_budget = usize::try_from(charge).unwrap_or(usize::MAX);
         if !self
             .inner
             .upload_budget
@@ -1309,12 +1318,10 @@ impl BlobStore {
             Sign::Add => i128::from(value),
             Sign::Sub => -i128::from(value),
         };
-        self.adjust_usage(&owner_usage_key(&live.owner), delta(live.size))?;
+        let charge = self.charge(live.size);
+        self.adjust_usage(&owner_usage_key(&live.owner), delta(charge))?;
         if !live.is_own() {
-            self.adjust_usage(
-                &pair_usage_key(&live.owner, &live.uploader),
-                delta(live.size),
-            )?;
+            self.adjust_usage(&pair_usage_key(&live.owner, &live.uploader), delta(charge))?;
         }
         let totals = &self.inner.totals;
         let (bytes, count) = if live.ready {
@@ -1613,6 +1620,9 @@ mod tests {
             tombstone_secs: 1_200,
             get_window: 4 * 1024,
             sync_every: 1024,
+            // Квоты в этих тестах меряются настоящими размерами; минимальный
+            // учётный размер — в своём тесте.
+            min_charge: 0,
             ..BlobConfig::default()
         }
     }
@@ -2077,6 +2087,64 @@ mod tests {
             .init(&heavy, &declared(19, 1024, None), NOW + 86_400)
             .unwrap()
             .unwrap();
+    }
+
+    /// Мелкий блоб занимает в квотах не меньше минимального учётного
+    /// размера: байтовая квота ограничивает и число файлов.
+    #[tokio::test]
+    async fn tiny_blobs_are_charged_the_minimum() {
+        let mut fx = fixture_with("min_charge", |path| BlobConfig {
+            min_charge: 16 * 1024,
+            upload_bytes_per_day: 48 * 1024,
+            ..config(path)
+        });
+        let tiny = payload(10, 1);
+        // Пара (32 КиБ): два крошечных по 16 КиБ — и всё.
+        for seed in 0..2 {
+            fx.store
+                .init(&SENDER, &request(Some(fx.queue), &tiny, 140 + seed), NOW)
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            fx.store
+                .init(&SENDER, &request(Some(fx.queue), &tiny, 142), NOW)
+                .unwrap(),
+            Err(BlobReject::Quota)
+        );
+        assert_eq!(usage(&fx, &owner_usage_key(&OWNER)), 32 * 1024);
+        // Крупный считается по размеру.
+        let big = payload(20 * 1024, 2);
+        fx.store
+            .init(&STRANGER, &request(Some(fx.queue), &big, 143), NOW)
+            .unwrap()
+            .unwrap();
+        assert_eq!(usage(&fx, &owner_usage_key(&OWNER)), 52 * 1024);
+        // Удаление возвращает учтённое; сверка при старте считает так же.
+        fx.store
+            .delete(&blob_id_of(&secret(140)), &TOKEN, NOW)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(usage(&fx, &owner_usage_key(&OWNER)), 36 * 1024);
+        fx.reopen();
+        assert_eq!(usage(&fx, &owner_usage_key(&OWNER)), 36 * 1024);
+        // Суточный бюджет (48 КиБ) — тоже по учётному размеру: три
+        // крошечных по 16 КиБ проходят, четвёртый — нет, хотя квота
+        // владельца (64 КиБ) его бы пропустила.
+        let heavy = [5u8; 32];
+        for seed in 0..3 {
+            fx.store
+                .init(&heavy, &request(None, &tiny, 150 + seed), NOW)
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            fx.store
+                .init(&heavy, &request(None, &tiny, 153), NOW)
+                .unwrap(),
+            Err(BlobReject::Quota)
+        );
     }
 
     #[tokio::test]

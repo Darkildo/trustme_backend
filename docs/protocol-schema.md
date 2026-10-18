@@ -217,7 +217,7 @@ X25519-пару устройства, и сессию дальше держит 
 ## Хранилище файлов и роль сессии
 
 Кадры `BlobUploadInit` … `BlobStatResult` (ветки `Frame.payload` 23–34) и
-поля `ServerConfig.supports_blobs` … `blob_get_window` (24–29) — хранилище
+поля `ServerConfig.supports_blobs` … `blob_min_charge` (24–30) — хранилище
 файлов, server-contract.md §6.11. Нода хранит шифротекст как блоб, в
 сообщении через очередь едет только E2E-указатель: `blob_secret` (право
 на чтение; нода хранит лишь его SHA-256 — `blob_id`), адрес ноды и ключ

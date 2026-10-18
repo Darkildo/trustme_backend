@@ -151,6 +151,7 @@ fn every_payload_variant_roundtrips() {
                 blob_chunk_max: 1024 * 1024,
                 blob_quota_per_owner: 2 * 1024 * 1024 * 1024,
                 blob_get_window: 8 * 1024 * 1024,
+                blob_min_charge: 64 * 1024,
             }
             .encode_to_vec(),
             node_identity_key: vec![6u8; 32],
@@ -632,7 +633,7 @@ fn blob_store_wire_numbers_are_pinned() {
     };
     assert_eq!(release.encode_to_vec(), [0x18, 0x04]);
 
-    // ServerConfig.supports_blobs = 24 … blob_get_window = 29.
+    // ServerConfig.supports_blobs = 24 … blob_min_charge = 30.
     let config = ServerConfig {
         supports_blobs: true,
         blob_max_size: 1,
@@ -640,13 +641,14 @@ fn blob_store_wire_numbers_are_pinned() {
         blob_chunk_max: 3,
         blob_quota_per_owner: 4,
         blob_get_window: 5,
+        blob_min_charge: 6,
         ..ServerConfig::default()
     };
     assert_eq!(
         config.encode_to_vec(),
         [
             0xc0, 0x01, 0x01, 0xc8, 0x01, 0x01, 0xd0, 0x01, 0x02, 0xd8, 0x01, 0x03, 0xe0, 0x01,
-            0x04, 0xe8, 0x01, 0x05
+            0x04, 0xe8, 0x01, 0x05, 0xf0, 0x01, 0x06
         ]
     );
 
