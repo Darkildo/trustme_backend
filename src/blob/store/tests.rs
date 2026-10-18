@@ -1052,18 +1052,19 @@ async fn reconcile_repairs_a_crash_between_metadata_and_files() {
 
     fx.reopen();
     // Второй проход уже ничего не исправляет.
-    let report = fx.store.reconcile().unwrap();
+    let report = fx.store.reconcile(NOW).unwrap();
     assert_eq!(
         report,
         reconcile::ReconcileReport {
-            blobs: 3,
+            blobs: 4,
             ..Default::default()
         }
     );
 
+    // Потерянный файл — «истёк»: отправителя можно попросить перезалить.
     assert_eq!(
         fx.store.status(&SENDER, &lost.blob_id, NOW).unwrap(),
-        Err(BlobReject::NotFound)
+        Err(BlobReject::Expired)
     );
     assert_eq!(
         fx.store

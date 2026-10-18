@@ -237,7 +237,7 @@ impl BlobStore {
                 totals: Totals::default(),
             }),
         };
-        store.reconcile()?;
+        store.reconcile(unix_now_secs())?;
         Ok(store)
     }
 

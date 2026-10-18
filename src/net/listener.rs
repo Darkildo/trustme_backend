@@ -43,7 +43,7 @@ pub async fn accept_loop(
     };
     // Один на процесс: rate-limiter отправки считает бюджет пользователя, а
     // не соединения — на сессию его дробить нельзя.
-    let limits = Arc::new(SessionLimits::new(cfg.limits));
+    let limits = Arc::new(SessionLimits::for_node(cfg.limits, &cfg.blobs));
     // Вход на хендшейк считается до крипты: респондер платит DH за любого,
     // кто открыл сокет, поэтому ограничение живёт здесь, а не внутри
     // `handle_conn`.

@@ -258,6 +258,7 @@ fn main() -> Result<()> {
         supports_delivery_ack: true,
         config_ttl: std::time::Duration::from_secs(86_400),
         advertised_address: Some("node.example:5000".to_string()),
+        blobs: None,
     };
     let signed_frame = encode_signed_server_config(&snapshot, &node, 1_700_000_000);
     // Тот же снапшот целым кадром — вариант oneof `SignedServerConfig` для

@@ -12,6 +12,11 @@ set -euo pipefail
 #     чинит;
 #   * каталог secrets — креды FCM/APNs.
 #
+# Файлов хранилища блобов (data/blobs) здесь тоже нет: они временные,
+# живут до срока или до релиза читателями и могут занимать гигабайты.
+# После восстановления нода сама превратит записи о них в надгробия
+# EXPIRED, и клиенты попросят отправителей перезалить.
+#
 # Данных JetStream здесь намеренно нет. Поток — транспорт с
 # ретеншном 14 суток, а не источник истины; восстанавливать недоставленное
 # из бэкапа означало бы передоставить то, что клиенты уже подтвердили.
@@ -44,7 +49,7 @@ mkdir -p "$BACKUP_DIR"
 
 # Свободное место проверяется до архивации: бэкап, доевший последние
 # проценты диска, — это авария, а не страховка от неё.
-need_kb=$(du -sk "$DEPLOY_DIR/data" | cut -f1)
+need_kb=$(du -sk --exclude=blobs "$DEPLOY_DIR/data" | cut -f1)
 free_kb=$(df -Pk "$BACKUP_DIR" | awk 'NR==2 {print $4}')
 if [ "$free_kb" -lt "$((need_kb * 2))" ]; then
   echo "backup aborted: need ~$((need_kb / 1024)) MiB, free $((free_kb / 1024)) MiB" >&2
@@ -52,6 +57,7 @@ if [ "$free_kb" -lt "$((need_kb * 2))" ]; then
 fi
 
 tar czf "$target" \
+  --exclude=data/blobs \
   -C "$DEPLOY_DIR" data \
   -C "$DEPLOY_DIR" .env \
   -C "$(dirname "$SECRETS_DIR")" "$(basename "$SECRETS_DIR")"
