@@ -21,32 +21,10 @@
 
 ## Как это работает
 
-```mermaid
-flowchart TB
-    op(["Оператор ноды"])
-    subgraph clients["Клиенты: iOS, Android"]
-        A["Устройство A"]
-        B["Устройство B"]
-    end
-    subgraph host["Хост ноды"]
-        N["Нода<br/>trust_message_tcp"]
-        S[("sled на диске")]
-        J[("NATS JetStream<br/>опционально")]
-    end
-    subgraph wake["Пробуждение офлайн-устройств"]
-        GW["Push-шлюз<br/>опционально"]
-        FCM["FCM HTTP v1"]
-        APNS["APNs VoIP"]
-    end
+![Контекст: клиенты, нода и опциональная периферия](docs/diagrams/context.webp)
 
-    op -. "ключ ноды вне полосы" .-> clients
-    clients <-->|"Noise IK/XX поверх TCP,<br/>protobuf-кадры"| N
-    N --- S
-    N <-->|"конверты, ack"| J
-    N -->|"wake и ring:<br/>напрямую или через шлюз"| wake
-    GW --> FCM
-    GW --> APNS
-```
+Нода — посредник между клиентами. JetStream и push-шлюз опциональны, ключ
+ноды клиенты получают от оператора вне полосы.
 
 Путь сообщения от A к B:
 
@@ -86,9 +64,9 @@ sequenceDiagram
    подтверждения оно приходит снова.
 
 Подробные схемы — [docs/architecture.md](docs/architecture.md):
-- компоненты ноды;
+- компоненты ноды и слои протокола;
 - жизненный цикл соединения и хендшейк IK/XX;
-- доставка на `sled` и на JetStream;
+- доставка на `sled` и на JetStream, ящики JetStream;
 - конвейер пушей;
 - развёртывание;
 - кто что видит.
