@@ -4,4 +4,5 @@ pub mod device_cert;
 pub mod framing;
 pub mod listener;
 pub mod noise;
+pub mod probe;
 pub mod rate_limit;

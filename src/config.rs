@@ -936,8 +936,17 @@ const DEFAULT_DELETED_RETENTION_DAYS: u64 = 7;
 
 pub fn load() -> anyhow::Result<Config> {
     let env_file = Path::new(".env");
-    let raw = read_raw(env_file.exists().then_some(env_file), None)?;
+    resolve(read_raw(env_file.exists().then_some(env_file), None)?)
+}
 
+/// Конфиг из готового набора переменных — без `.env` и окружения процесса.
+/// Так `tmnode` разбирает окружение контейнера ноды тем же кодом и с теми
+/// же значениями по умолчанию, что и сама нода, и не расходится с ней.
+pub fn from_env_vars(vars: impl IntoIterator<Item = (String, String)>) -> anyhow::Result<Config> {
+    resolve(read_raw(None, Some(vars.into_iter().collect()))?)
+}
+
+fn resolve(raw: RawConfig) -> anyhow::Result<Config> {
     let RawConfig {
         bind_addr,
         bind_host,
@@ -1761,9 +1770,10 @@ fn check_tcp_keepalive(limits: &LimitsConfig) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlobConfig, BlobRawConfig, DEFAULT_DELETED_RETENTION_DAYS, LimitsConfig, PushRawConfig,
-        RetentionPolicy, SledAckConfig, check_tcp_keepalive, parse_retention_policy, read_raw,
-        resolve_blobs, resolve_delivery, resolve_push, resolve_sled_ack,
+        BlobConfig, BlobRawConfig, DEFAULT_DELETED_RETENTION_DAYS, DeliveryBackendKind,
+        LimitsConfig, PushRawConfig, RetentionPolicy, SledAckConfig, check_tcp_keepalive,
+        from_env_vars, parse_retention_policy, read_raw, resolve_blobs, resolve_delivery,
+        resolve_push, resolve_sled_ack,
     };
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -2180,6 +2190,34 @@ mod tests {
         assert_eq!(raw.nats_url.as_deref(), Some("nats://from-file:4222"));
         assert_eq!(raw.bind_port, Some(19001));
         assert_eq!(raw.push_enabled, Some(true));
+    }
+
+    /// Окружение контейнера разбирается тем же кодом, что и окружение
+    /// процесса: значения по умолчанию и производные (каталог блобов от
+    /// `STORAGE_PATH`) совпадают с тем, что видит нода.
+    #[test]
+    fn explicit_vars_resolve_like_the_node() {
+        let cfg = from_env_vars(
+            [
+                ("STORAGE_PATH", "/srv/trust-message/data"),
+                ("DELIVERY_BACKEND", "jetstream"),
+                ("BLOB_DISK_RESERVE_BYTES", "1048576"),
+                ("PATH", "/usr/bin"),
+            ]
+            .map(|(k, v)| (k.to_owned(), v.to_owned())),
+        )
+        .unwrap();
+
+        assert_eq!(cfg.storage_path, "/srv/trust-message/data");
+        assert_eq!(cfg.delivery.backend, DeliveryBackendKind::JetStream);
+        assert!(cfg.blobs.enabled);
+        assert_eq!(cfg.blobs.dir, "/srv/trust-message/data/blobs");
+        assert_eq!(cfg.blobs.disk_reserve, 1_048_576);
+        assert!(cfg.node_identity_key.is_none());
+
+        let err = from_env_vars([("DELIVERY_BACKEND".to_owned(), "kafka".to_owned())])
+            .expect_err("unknown backend must not resolve");
+        assert!(format!("{err:#}").contains("DELIVERY_BACKEND"));
     }
 
     #[test]
