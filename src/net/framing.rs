@@ -92,6 +92,12 @@ pub fn encode_signed_server_config(
         issued_at: now_secs,
         expires_at: now_secs.saturating_add(config.config_ttl.as_secs()),
         advertised_address: config.advertised_address.clone().unwrap_or_default(),
+        supports_blobs: false,
+        blob_max_size: 0,
+        blob_max_ttl_secs: 0,
+        blob_chunk_max: 0,
+        blob_quota_per_owner: 0,
+        blob_get_window: 0,
     };
 
     // Подписываются именно эти байты, и они же уезжают клиенту: protobuf

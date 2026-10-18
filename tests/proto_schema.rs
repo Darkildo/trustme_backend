@@ -8,11 +8,14 @@
 use prost::Message;
 use prost::encoding::{WireType, encode_key, encode_varint};
 use trust_message_tcp::wire::{
-    AllocateQueue, AuthError, AuthOk, ClientSend, DeliveryAck, Frame, GetServerConfig,
-    IncomingMessage, ListQueues, MessagePriority, Ping, Pong, PushPlatform, PushTokenAck, QueueAck,
-    QueueList, QueueRecord, QueueRejectReason, RegisterPushToken, RetentionConfig, RetentionMode,
-    RevokeDeviceCerts, RevokeQueue, SendAck, SendRejectReason, ServerConfig, SetAccountRecord,
-    SetQueueOnly, SignedServerConfig, UnregisterPushToken, WakeHint, frame,
+    AllocateQueue, AuthError, AuthOk, BlobAck, BlobData, BlobDelete, BlobExtend, BlobGet,
+    BlobRejectReason, BlobRelease, BlobStat, BlobStatEntry, BlobStatQuery, BlobStatResult,
+    BlobState, BlobUploadChunk, BlobUploadCommit, BlobUploadInit, BlobUploadStatus, ClientSend,
+    DeliveryAck, Frame, GetServerConfig, IncomingMessage, ListQueues, MessagePriority, Ping, Pong,
+    PushPlatform, PushTokenAck, QueueAck, QueueList, QueueRecord, QueueRejectReason,
+    RegisterPushToken, RetentionConfig, RetentionMode, RevokeDeviceCerts, RevokeQueue, SendAck,
+    SendRejectReason, ServerConfig, SessionRole, SetAccountRecord, SetQueueOnly,
+    SignedServerConfig, UnregisterPushToken, WakeHint, frame,
 };
 
 const PROTO_VERSION: u32 = 1;
@@ -30,7 +33,7 @@ fn roundtrip(frame: &Frame) -> Frame {
 }
 
 /// Число вариантов `Frame.payload`. Обновляется вместе с `variant_index`.
-const PAYLOAD_VARIANTS: usize = 21;
+const PAYLOAD_VARIANTS: usize = 33;
 
 /// Порядковый номер варианта. `match` без `_`: новый вариант oneof в схеме
 /// ломает компиляцию теста, а не проходит мимо него.
@@ -58,6 +61,18 @@ fn variant_index(payload: &frame::Payload) -> usize {
         P::SetQueueOnly(_) => 18,
         P::SetAccountRecord(_) => 19,
         P::RevokeDeviceCerts(_) => 20,
+        P::BlobUploadInit(_) => 21,
+        P::BlobUploadChunk(_) => 22,
+        P::BlobUploadCommit(_) => 23,
+        P::BlobUploadStatus(_) => 24,
+        P::BlobGet(_) => 25,
+        P::BlobRelease(_) => 26,
+        P::BlobDelete(_) => 27,
+        P::BlobExtend(_) => 28,
+        P::BlobStat(_) => 29,
+        P::BlobAck(_) => 30,
+        P::BlobData(_) => 31,
+        P::BlobStatResult(_) => 32,
     }
 }
 
@@ -130,6 +145,12 @@ fn every_payload_variant_roundtrips() {
                 issued_at: 1_700_000_000,
                 expires_at: 1_700_086_400,
                 advertised_address: "node.example:5000".to_string(),
+                supports_blobs: true,
+                blob_max_size: 2 * 1024 * 1024 * 1024,
+                blob_max_ttl_secs: 2_592_000,
+                blob_chunk_max: 1024 * 1024,
+                blob_quota_per_owner: 2 * 1024 * 1024 * 1024,
+                blob_get_window: 8 * 1024 * 1024,
             }
             .encode_to_vec(),
             node_identity_key: vec![6u8; 32],
@@ -190,6 +211,95 @@ fn every_payload_variant_roundtrips() {
             device_id: 7,
             issued_before: 1_700_000_000,
             all: true,
+        }),
+        frame::Payload::BlobUploadInit(BlobUploadInit {
+            queue_id: vec![15u8; 32],
+            size: 40_000_000,
+            sha256: vec![16u8; 32],
+            ttl_seconds: 86_400,
+            max_releases: 2,
+            blob_id: vec![17u8; 32],
+            delete_token_hash: vec![18u8; 32],
+            request_id: 1,
+        }),
+        frame::Payload::BlobUploadChunk(BlobUploadChunk {
+            blob_id: vec![17u8; 32],
+            offset: 1_048_576,
+            data: vec![19u8; 64],
+        }),
+        frame::Payload::BlobUploadCommit(BlobUploadCommit {
+            blob_id: vec![17u8; 32],
+            request_id: 2,
+        }),
+        frame::Payload::BlobUploadStatus(BlobUploadStatus {
+            blob_id: vec![17u8; 32],
+            request_id: 3,
+        }),
+        frame::Payload::BlobGet(BlobGet {
+            blob_secret: vec![20u8; 32],
+            offset: 0,
+            length: 8_388_608,
+            request_id: 4,
+        }),
+        frame::Payload::BlobRelease(BlobRelease {
+            blob_secret: vec![20u8; 32],
+            request_id: 5,
+        }),
+        frame::Payload::BlobDelete(BlobDelete {
+            blob_id: vec![17u8; 32],
+            delete_token: vec![21u8; 32],
+            request_id: 6,
+        }),
+        frame::Payload::BlobExtend(BlobExtend {
+            blob_id: vec![17u8; 32],
+            delete_token: vec![21u8; 32],
+            ttl_seconds: 3_600,
+            request_id: 7,
+        }),
+        frame::Payload::BlobStat(BlobStat {
+            items: vec![
+                BlobStatQuery {
+                    blob_secret: vec![20u8; 32],
+                    ..BlobStatQuery::default()
+                },
+                BlobStatQuery {
+                    blob_secret: Vec::new(),
+                    blob_id: vec![17u8; 32],
+                    delete_token: vec![21u8; 32],
+                },
+            ],
+            request_id: 8,
+        }),
+        frame::Payload::BlobAck(BlobAck {
+            request_id: 9,
+            ok: false,
+            reason: BlobRejectReason::Conflict as i32,
+            blob_id: vec![17u8; 32],
+            committed_offset: 4_194_304,
+            expires_at: 1_700_086_400,
+        }),
+        frame::Payload::BlobData(BlobData {
+            request_id: 4,
+            offset: 1_048_576,
+            data: vec![22u8; 64],
+            eof: true,
+        }),
+        frame::Payload::BlobStatResult(BlobStatResult {
+            request_id: 8,
+            entries: vec![
+                BlobStatEntry {
+                    state: BlobState::Ready as i32,
+                    expires_at: 1_700_086_400,
+                    releases_done: 0,
+                    max_releases: 0,
+                },
+                BlobStatEntry {
+                    state: BlobState::Deleted as i32,
+                    expires_at: 0,
+                    releases_done: 1,
+                    max_releases: 2,
+                },
+            ],
         }),
     ];
 
@@ -296,6 +406,9 @@ fn zero_values_are_unspecified() {
     assert_eq!(SendRejectReason::Unspecified as i32, 0);
     assert_eq!(PushPlatform::Unspecified as i32, 0);
     assert_eq!(QueueRejectReason::Unspecified as i32, 0);
+    assert_eq!(SessionRole::Unspecified as i32, 0);
+    assert_eq!(BlobState::Unspecified as i32, 0);
+    assert_eq!(BlobRejectReason::Unspecified as i32, 0);
 }
 
 /// Номера полей N-2′ (выделение по тегу, надгробия, срок).
@@ -444,4 +557,103 @@ fn queue_only_wire_numbers_are_pinned() {
     };
     // ServerConfig.supports_queue_only = 19: ключ (19 << 3) | 0 = 152.
     assert_eq!(config.encode_to_vec(), [0x98, 0x01, 0x01]);
+}
+
+/// Номера хранилища файлов: ветки `Frame.payload`, поля `ServerConfig`,
+/// роль сессии и коды отказов. Клиент держит копию схемы, и перенумерация
+/// здесь молча ломала бы его.
+#[test]
+fn blob_store_wire_numbers_are_pinned() {
+    assert_eq!(SessionRole::Blob as i32, 1);
+    assert_eq!(BlobState::Ready as i32, 1);
+    assert_eq!(BlobState::Uploading as i32, 2);
+    assert_eq!(BlobState::Expired as i32, 3);
+    assert_eq!(BlobState::Deleted as i32, 4);
+    assert_eq!(BlobState::NotFound as i32, 5);
+    assert_eq!(BlobState::Forbidden as i32, 6);
+    for (reason, number) in [
+        (BlobRejectReason::NotFound, 1),
+        (BlobRejectReason::Expired, 2),
+        (BlobRejectReason::Forbidden, 3),
+        (BlobRejectReason::TooLarge, 4),
+        (BlobRejectReason::Quota, 5),
+        (BlobRejectReason::RateLimited, 6),
+        (BlobRejectReason::Invalid, 7),
+        (BlobRejectReason::NotReady, 8),
+        (BlobRejectReason::Unsupported, 9),
+        (BlobRejectReason::Internal, 10),
+        (BlobRejectReason::Deleted, 11),
+        (BlobRejectReason::Conflict, 12),
+    ] {
+        assert_eq!(reason as i32, number, "{reason:?}");
+    }
+
+    // Frame.payload = 23..34: ключ (n << 3) | 2, два байта varint.
+    let keys: Vec<[u8; 2]> = [
+        frame::Payload::BlobUploadInit(BlobUploadInit::default()),
+        frame::Payload::BlobUploadChunk(BlobUploadChunk::default()),
+        frame::Payload::BlobUploadCommit(BlobUploadCommit::default()),
+        frame::Payload::BlobUploadStatus(BlobUploadStatus::default()),
+        frame::Payload::BlobGet(BlobGet::default()),
+        frame::Payload::BlobRelease(BlobRelease::default()),
+        frame::Payload::BlobDelete(BlobDelete::default()),
+        frame::Payload::BlobExtend(BlobExtend::default()),
+        frame::Payload::BlobStat(BlobStat::default()),
+        frame::Payload::BlobAck(BlobAck::default()),
+        frame::Payload::BlobData(BlobData::default()),
+        frame::Payload::BlobStatResult(BlobStatResult::default()),
+    ]
+    .into_iter()
+    .map(|payload| {
+        let encoded = wrap(payload).encode_to_vec();
+        // proto_version = 1 (2 байта), затем ключ ветки.
+        [encoded[2], encoded[3]]
+    })
+    .collect();
+    let expected: Vec<[u8; 2]> = (23u32..=34)
+        .map(|number| {
+            let key = (number << 3) | 2;
+            [(key as u8 & 0x7f) | 0x80, (key >> 7) as u8]
+        })
+        .collect();
+    assert_eq!(keys, expected);
+
+    // Поля с «дырой» в нумерации: BlobGet.offset = 3, BlobRelease.request_id = 3.
+    let get = BlobGet {
+        offset: 1,
+        length: 2,
+        request_id: 3,
+        ..BlobGet::default()
+    };
+    assert_eq!(get.encode_to_vec(), [0x18, 0x01, 0x20, 0x02, 0x28, 0x03]);
+    let release = BlobRelease {
+        request_id: 4,
+        ..BlobRelease::default()
+    };
+    assert_eq!(release.encode_to_vec(), [0x18, 0x04]);
+
+    // ServerConfig.supports_blobs = 24 … blob_get_window = 29.
+    let config = ServerConfig {
+        supports_blobs: true,
+        blob_max_size: 1,
+        blob_max_ttl_secs: 2,
+        blob_chunk_max: 3,
+        blob_quota_per_owner: 4,
+        blob_get_window: 5,
+        ..ServerConfig::default()
+    };
+    assert_eq!(
+        config.encode_to_vec(),
+        [
+            0xc0, 0x01, 0x01, 0xc8, 0x01, 0x01, 0xd0, 0x01, 0x02, 0xd8, 0x01, 0x03, 0xe0, 0x01,
+            0x04, 0xe8, 0x01, 0x05
+        ]
+    );
+
+    // NoiseClientHello.role = 4.
+    let hello = trust_message_tcp::wire::NoiseClientHello {
+        role: SessionRole::Blob as i32,
+        ..Default::default()
+    };
+    assert_eq!(hello.encode_to_vec(), [0x20, 0x01]);
 }
