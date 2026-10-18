@@ -10,11 +10,12 @@ use anyhow::{Result, bail};
 use common::{
     Conn, FRAME_MAX, NodeOptions, connect_as, connect_blob, connect_delegated_blob, decode,
     device_key, encode_client_send, expect_auth_ok, expect_signed_config, issue_device_cert,
-    next_frame, next_incoming_within, random_identity, send_and_read_ack, spawn_node_with,
-    spawn_server, spawn_server_with_push, unix_now_secs, user_id_of,
+    next_frame, next_incoming_within, random_identity, send_and_read_ack, spawn_jetstream_server,
+    spawn_node_with, spawn_server, spawn_server_with_push, unix_now_secs, user_id_of,
 };
 use ed25519_dalek::SigningKey;
 use prost::Message;
+use sha2::Digest;
 use trust_message_tcp::config::LimitsConfig;
 use trust_message_tcp::domain::reject::SendRejectReason;
 use trust_message_tcp::push::PushKind;
@@ -390,5 +391,94 @@ async fn disabled_store_refuses_everything() -> Result<()> {
     let config = expect_signed_config(&next_frame(&mut messages).await?, &server.node_public)?;
     assert!(!config.supports_blobs);
     assert_eq!(config.blob_max_size, 0);
+    Ok(())
+}
+
+fn nats_url() -> String {
+    std::env::var("TRUST_MESSAGE_TEST_NATS_URL").unwrap_or_else(|_| "nats://127.0.0.1:4222".into())
+}
+
+/// Брокерный бэкенд: сессия `BLOB` не поднимает пул доставки и конвертов
+/// из потока не забирает — их получает сессия сообщений. Хранилище от
+/// бэкенда не зависит.
+#[tokio::test]
+#[ignore = "требует живого NATS с JetStream"]
+async fn jetstream_blob_session_is_not_a_delivery_target() -> Result<()> {
+    let server = spawn_jetstream_server(
+        "blob_role_jetstream",
+        LimitsConfig::default(),
+        &nats_url(),
+        Duration::from_secs(30),
+    )
+    .await?;
+    let alice = random_identity();
+    let bob = random_identity();
+    let mut alice_blob = blob_session(&server, &alice, 1).await?;
+    let mut bob_conn = messages_session(&server, &bob, 1).await?;
+    let ack = send_and_read_ack(&mut bob_conn, &user_id_of(&alice), b"via stream", 0).await?;
+    assert!(ack.ok && ack.queued, "{ack:?}");
+    assert!(
+        next_incoming_within(&mut alice_blob, Duration::from_millis(500))
+            .await?
+            .is_none(),
+        "сессия BLOB не получает конвертов из потока"
+    );
+
+    // Хранилище на брокерном бэкенде работает так же.
+    let data = b"jetstream blob".to_vec();
+    let secret = [0x42u8; 32];
+    let blob_id = sha2::Sha256::digest(secret).to_vec();
+    alice_blob
+        .send_frame(&wrap(frame::Payload::BlobUploadInit(
+            wire::BlobUploadInit {
+                size: data.len() as u64,
+                sha256: sha2::Sha256::digest(&data).to_vec(),
+                blob_id: blob_id.clone(),
+                delete_token_hash: vec![1u8; 32],
+                request_id: 1,
+                ..wire::BlobUploadInit::default()
+            },
+        )))
+        .await?;
+    assert!(expect_blob_ack(&mut alice_blob).await?.ok);
+    alice_blob
+        .send_frame(&wrap(frame::Payload::BlobUploadChunk(
+            wire::BlobUploadChunk {
+                blob_id: blob_id.clone(),
+                offset: 0,
+                data: data.clone(),
+            },
+        )))
+        .await?;
+    assert_eq!(
+        expect_blob_ack(&mut alice_blob).await?.committed_offset,
+        data.len() as u64
+    );
+    alice_blob
+        .send_frame(&wrap(frame::Payload::BlobUploadCommit(
+            wire::BlobUploadCommit {
+                blob_id,
+                request_id: 2,
+            },
+        )))
+        .await?;
+    assert!(expect_blob_ack(&mut alice_blob).await?.ok);
+    alice_blob
+        .send_frame(&wrap(frame::Payload::BlobGet(wire::BlobGet {
+            blob_secret: secret.to_vec(),
+            request_id: 3,
+            ..wire::BlobGet::default()
+        })))
+        .await?;
+    match decode(&next_frame(&mut alice_blob).await?)? {
+        frame::Payload::BlobData(chunk) => assert_eq!((chunk.data, chunk.eof), (data, true)),
+        other => bail!("expected BlobData, got {other:?}"),
+    }
+
+    let mut alice_messages = messages_session(&server, &alice, 1).await?;
+    let incoming = next_incoming_within(&mut alice_messages, Duration::from_secs(5))
+        .await?
+        .expect("сессия сообщений получает конверт из потока");
+    assert_eq!(incoming.body, b"via stream");
     Ok(())
 }
