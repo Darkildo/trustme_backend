@@ -45,11 +45,12 @@ jobs:
         run: cargo fmt --all --check
 
       # Базовая линия clippy — ноль предупреждений, без списка исключений.
+      # --workspace: без него проверяется только нода, а tmnode — нет.
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: Tests
-        run: cargo test --all-targets
+        run: cargo test --workspace --all-targets
 
   jetstream:
     name: delivery over JetStream
@@ -184,7 +185,7 @@ jobs:
           TRUST_MESSAGE_TEST_NATS_URL: nats://127.0.0.1:4222
           TRUST_MESSAGE_TEST_NATS_BIN: nats-server
         run: |
-          cargo llvm-cov --all-targets --json --output-path coverage.json \
+          cargo llvm-cov --workspace --all-targets --json --output-path coverage.json \
             -- --include-ignored --test-threads=1
 
       - name: Gate changed files

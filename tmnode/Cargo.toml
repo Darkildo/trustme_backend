@@ -1,0 +1,22 @@
+[package]
+name = "tmnode"
+version = "0.1.0"
+edition = "2024"
+license-file = "../LICENSE"
+repository = "https://github.com/Darkildo/trustme_backend"
+publish = false
+description = "Обслуживание ноды TrustMe: проверка, а дальше развёртывание и обновление"
+
+[dependencies]
+# Протокол и конфиг — из самой ноды: проверка не должна расходиться с тем,
+# как нода разбирает окружение и как клиент проверяет подпись.
+trust_message_tcp = { path = ".." }
+tokio = { version = "1.49.0", features = ["rt", "time", "net", "macros"] }
+anyhow = "1.0.101"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# node.toml. Та же версия уже в дереве через config.
+toml = "1"
+hex = "0.4"
+fs2 = "0.4"                                                # свободное место на диске
+zeroize = "1"                                              # окружение контейнера и ключ ноды

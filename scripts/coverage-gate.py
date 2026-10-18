@@ -9,7 +9,7 @@
 код, приехавший без тестов.
 
 Использование:
-    cargo llvm-cov --all-targets --json --output-path coverage.json
+    cargo llvm-cov --workspace --all-targets --json --output-path coverage.json
     python3 scripts/coverage-gate.py coverage.json <base-ref> [--min 70]
 """
 
@@ -21,7 +21,9 @@ import sys
 from pathlib import Path
 
 DEFAULT_MIN = 70.0
-# Точка входа и сборочный скрипт исполняются, но не тестируются.
+# Исходники под гейтом: нода и tmnode. Тесты, примеры и фаззинг — нет.
+GATED = ("src", "tmnode/src")
+# Точки входа и сборочный скрипт исполняются, но не тестируются.
 EXEMPT_SUFFIXES = ("src/main.rs", "build.rs")
 
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
@@ -65,10 +67,10 @@ def added_lines(root: Path, base_ref: str) -> dict[str, set[int]]:
     """Номера добавленных строк по файлам, из унифицированного диффа.
 
     Пути в диффе git всегда даёт от корня репозитория; `cwd=root` нужен
-    ради pathspec `src`, который иначе считался бы от текущего каталога.
+    ради pathspec, который иначе считался бы от текущего каталога.
     """
     diff = subprocess.run(
-        ["git", "diff", "-U0", "--diff-filter=d", f"{base_ref}...HEAD", "--", "src"],
+        ["git", "diff", "-U0", "--diff-filter=d", f"{base_ref}...HEAD", "--", *GATED],
         capture_output=True,
         text=True,
         check=True,
@@ -163,7 +165,7 @@ def main() -> int:
 
     added = added_lines(root, args.base_ref)
     if not added:
-        print("под src/ ничего не добавлено — гейт покрытия пропущен")
+        print("в исходниках ничего не добавлено — гейт покрытия пропущен")
         return 0
 
     coverage = covered_and_executable(args.report, root)

@@ -6,6 +6,11 @@ license-file = "LICENSE"
 repository = "https://github.com/Darkildo/trustme_backend"
 publish = false
 
+# Нода и tmnode — один workspace: tmnode переиспользует протокол и разбор
+# конфига ноды. Образ ноды собирает только корневой пакет.
+[workspace]
+members = [".", "tmnode"]
+
 [dependencies]
 tokio = { version = "1.49.0", features = ["full"] }        # async runtime, TcpListener/TcpStream
 socket2 = { version = "0.6", features = ["all"] }          # TCP keepalive принятых сокетов; TCP_KEEPCNT — только с "all"
