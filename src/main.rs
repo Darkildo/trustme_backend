@@ -17,6 +17,10 @@ use trust_message_tcp::state::{
     push_tokens::PushTokenStore, registry::ConnRegistry, storage::Storage,
 };
 use trust_message_tcp::{config, observability};
+/// Период чистки хранилища файлов: истёкшие блобы, брошенные загрузки,
+/// надгробия.
+const BLOB_CLEANUP_INTERVAL: Duration = Duration::from_secs(300);
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     observability::init_logging();
@@ -46,6 +50,22 @@ async fn main() -> Result<()> {
         cfg.offline_messages_retention,
     )?;
     storage.start_periodic_cleanup(Duration::from_secs_f64(3600.0 * 24.0));
+    // Хранилище файлов открывается один раз на процесс: при открытии идёт
+    // сверка с каталогом, а замки скачиваний и загрузок общие для всех
+    // сессий. Чистка у него своя и чаще суточной: сроки файлов и
+    // протухание загрузок меряются часами, а освобождённое место нужно
+    // новым загрузкам.
+    let blobs = if cfg.blobs.enabled {
+        let store = storage
+            .blob_store(&cfg.blobs)
+            .context("failed to open the blob store")?;
+        store.start_periodic_cleanup(BLOB_CLEANUP_INTERVAL);
+        info!(dir = %cfg.blobs.dir, "blob store enabled");
+        Some(store)
+    } else {
+        info!("blob store disabled (BLOB_ENABLED=false)");
+        None
+    };
     let push_tokens: PushTokenStore = storage.push_token_store()?;
     // Persist push throttling state so a restart does not flood every recipient
     // with a fresh push burst.
@@ -82,6 +102,7 @@ async fn main() -> Result<()> {
         push_scheduler,
         node,
         cfg,
+        blobs,
     ));
 
     let outcome = run_until_shutdown(server, shutdown_signal()).await;

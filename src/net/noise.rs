@@ -351,6 +351,44 @@ impl NodeIdentity {
     }
 }
 
+/// Роль сессии (`NoiseClientHello.role`, server-contract.md §6.11).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SessionRole {
+    /// Сообщения: доставка, отправка, очереди, push-токены.
+    #[default]
+    Messages,
+    /// Передача файлов: только кадры хранилища, `Ping`, `GetServerConfig`.
+    /// Для доставки не регистрируется.
+    Blob,
+}
+
+impl SessionRole {
+    /// Незнакомая роль — отказ хендшейка: обслужить её нода не может, а
+    /// молча принять за сессию сообщений значило бы отдать мегабайтному
+    /// потоку канал, по которому идут сообщения.
+    pub fn from_wire(raw: i32) -> Result<Self> {
+        match crate::wire::SessionRole::try_from(raw) {
+            Ok(crate::wire::SessionRole::Unspecified) => Ok(Self::Messages),
+            Ok(crate::wire::SessionRole::Blob) => Ok(Self::Blob),
+            Err(_) => bail!("unknown session role {raw}"),
+        }
+    }
+
+    pub fn to_wire(self) -> i32 {
+        (match self {
+            Self::Messages => crate::wire::SessionRole::Unspecified,
+            Self::Blob => crate::wire::SessionRole::Blob,
+        }) as i32
+    }
+
+    pub fn as_metric_label(self) -> &'static str {
+        match self {
+            Self::Messages => "messages",
+            Self::Blob => "blob",
+        }
+    }
+}
+
 /// Что нода узнала о клиенте из хендшейка. `user_id` уже сверен с
 /// аутентифицированным статиком — это не заявка, а доказанная identity.
 #[derive(Clone, Copy, Debug)]
@@ -372,6 +410,8 @@ pub struct NoiseSessionIdentity {
     /// Когда выписан сертификат сессии (unix-секунды). По нему
     /// `handle_conn` сверяет сессию с отзывами (`RevokeDeviceCerts`).
     pub cert_not_before: Option<u64>,
+    /// Роль сессии из hello.
+    pub role: SessionRole,
 }
 
 /// Кадровый транспорт поверх установленной Noise-сессии: «прочитать кадр /
@@ -606,16 +646,38 @@ where
     /// Клиентская сторона (IK, ключ аккаунта). Эталонный инициатор для
     /// тестов и `examples/`.
     pub async fn connect(
-        mut stream: S,
+        stream: S,
         node_public: &[u8; 32],
         identity: &SigningKey,
         device_id: Option<DeviceId>,
         handshake_timeout: Duration,
         max_frame_len: usize,
     ) -> Result<Self> {
+        Self::connect_with_role(
+            stream,
+            node_public,
+            identity,
+            device_id,
+            SessionRole::Messages,
+            handshake_timeout,
+            max_frame_len,
+        )
+        .await
+    }
+
+    /// То же с явной ролью сессии (server-contract.md §6.11).
+    pub async fn connect_with_role(
+        mut stream: S,
+        node_public: &[u8; 32],
+        identity: &SigningKey,
+        device_id: Option<DeviceId>,
+        role: SessionRole,
+        handshake_timeout: Duration,
+        max_frame_len: usize,
+    ) -> Result<Self> {
         let transport = timeout(
             handshake_timeout,
-            Self::connect_inner(&mut stream, node_public, identity, device_id),
+            Self::connect_inner(&mut stream, node_public, identity, device_id, role),
         )
         .await
         .map_err(|_| anyhow::anyhow!("noise handshake timed out"))??;
@@ -637,12 +699,39 @@ where
     /// разблокированного клиента. Респондер сертификат в XX не запрещает.
     #[allow(clippy::too_many_arguments)]
     pub async fn connect_delegated(
+        stream: S,
+        node_public: &[u8; 32],
+        device_static_secret: &[u8; 32],
+        identity_key: &[u8; 32],
+        device_id: DeviceId,
+        device_cert: crate::wire::DeviceCertificate,
+        handshake_timeout: Duration,
+        max_frame_len: usize,
+    ) -> Result<Self> {
+        Self::connect_delegated_with_role(
+            stream,
+            node_public,
+            device_static_secret,
+            identity_key,
+            device_id,
+            device_cert,
+            SessionRole::Messages,
+            handshake_timeout,
+            max_frame_len,
+        )
+        .await
+    }
+
+    /// Делегированный вход с явной ролью сессии.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn connect_delegated_with_role(
         mut stream: S,
         node_public: &[u8; 32],
         device_static_secret: &[u8; 32],
         identity_key: &[u8; 32],
         device_id: DeviceId,
         device_cert: crate::wire::DeviceCertificate,
+        role: SessionRole,
         handshake_timeout: Duration,
         max_frame_len: usize,
     ) -> Result<Self> {
@@ -655,6 +744,7 @@ where
                 identity_key,
                 Some(device_id),
                 Some(device_cert),
+                role,
             ),
         )
         .await
@@ -711,6 +801,7 @@ where
         node_public: &[u8; 32],
         identity: &SigningKey,
         device_id: Option<DeviceId>,
+        role: SessionRole,
     ) -> Result<TransportState> {
         Self::connect_ik(
             stream,
@@ -719,6 +810,7 @@ where
             &identity.verifying_key().to_bytes(),
             device_id,
             None,
+            role,
         )
         .await
     }
@@ -732,6 +824,7 @@ where
         identity_key: &[u8; 32],
         device_id: Option<DeviceId>,
         device_cert: Option<crate::wire::DeviceCertificate>,
+        role: SessionRole,
     ) -> Result<TransportState> {
         // Пин малого порядка — не ключ ноды: DH с такой точкой не зависит
         // от секрета, и хендшейк с клиентом прошёл бы кто угодно. snow
@@ -754,7 +847,7 @@ where
             .build_initiator()
             .map_err(|err| anyhow::anyhow!("failed to build noise initiator: {err}"))?;
 
-        let hello = encode_client_hello(identity_key, device_id, device_cert)?;
+        let hello = encode_client_hello(identity_key, device_id, device_cert, role)?;
         let mut message = vec![0u8; NOISE_MAX_MESSAGE_LEN];
         let len = handshake
             .write_message(&hello, &mut message)
@@ -821,7 +914,12 @@ where
             bail!("node key {} was not accepted", fingerprint(&node_public));
         }
 
-        let hello = encode_client_hello(&identity.verifying_key().to_bytes(), device_id, None)?;
+        let hello = encode_client_hello(
+            &identity.verifying_key().to_bytes(),
+            device_id,
+            None,
+            SessionRole::Messages,
+        )?;
         let len = handshake
             .write_message(&hello, &mut message)
             .map_err(|err| anyhow::anyhow!("failed to build noise handshake message 3: {err}"))?;
@@ -1050,6 +1148,7 @@ fn verify_client_identity(
         scope,
         cert_not_after,
         cert_not_before,
+        role: hello.role,
     })
 }
 
@@ -1063,18 +1162,20 @@ pub struct ClientHello {
     /// Сертификат устройства как приехал: длины полей и подпись проверяет
     /// `device_cert::verify`, а не разбор.
     pub device_cert: Option<crate::wire::DeviceCertificate>,
+    pub role: SessionRole,
 }
 
 fn encode_client_hello(
     identity_key: &[u8; 32],
     device_id: Option<DeviceId>,
     device_cert: Option<crate::wire::DeviceCertificate>,
+    role: SessionRole,
 ) -> Result<Vec<u8>> {
     Ok(NoiseClientHello {
         identity_key: identity_key.to_vec(),
         device_id: crate::net::framing::encode_device_id(device_id),
         device_cert,
-        role: crate::wire::SessionRole::Unspecified as i32,
+        role: role.to_wire(),
     }
     .encode_to_vec())
 }
@@ -1083,10 +1184,12 @@ pub fn decode_client_hello(bytes: &[u8]) -> Result<ClientHello> {
     let hello = NoiseClientHello::decode(bytes).context("failed to decode noise client hello")?;
     let identity_key = to_fixed_32(&hello.identity_key, "client identity key")?;
     let device_id = crate::net::framing::decode_device_id(hello.device_id)?;
+    let role = SessionRole::from_wire(hello.role)?;
     Ok(ClientHello {
         identity_key,
         device_id,
         device_cert: hello.device_cert,
+        role,
     })
 }
 
@@ -1263,6 +1366,54 @@ mod tests {
         );
     }
 
+    /// Роль из hello доезжает до доказанной identity; по умолчанию —
+    /// сессия сообщений.
+    #[tokio::test]
+    async fn session_role_reaches_the_identity() {
+        for role in [SessionRole::Messages, SessionRole::Blob] {
+            let node = node();
+            let node_public = node.public();
+            let client = client_key(41);
+            let (server_stream, client_stream) = loopback().await;
+            let server = tokio::spawn(async move {
+                NoiseFramed::accept(server_stream, &node, test_policy()).await
+            });
+            NoiseFramed::connect_with_role(
+                client_stream,
+                &node_public,
+                &client,
+                Some(3),
+                role,
+                TEST_TIMEOUT,
+                TEST_FRAME_MAX,
+            )
+            .await
+            .unwrap();
+            let (_conn, identity) = server.await.unwrap().unwrap();
+            assert_eq!(identity.role, role);
+        }
+    }
+
+    /// Незнакомая роль — отказ разбора hello, а не тихая сессия сообщений.
+    #[test]
+    fn unknown_session_role_is_refused() {
+        let mut hello = NoiseClientHello {
+            identity_key: vec![1u8; 32],
+            device_id: None,
+            device_cert: None,
+            role: 7,
+        };
+        let err = decode_client_hello(&hello.encode_to_vec()).unwrap_err();
+        assert!(err.to_string().contains("unknown session role"), "{err}");
+        hello.role = SessionRole::Blob.to_wire();
+        assert_eq!(
+            decode_client_hello(&hello.encode_to_vec()).unwrap().role,
+            SessionRole::Blob
+        );
+        assert_eq!(SessionRole::Blob.as_metric_label(), "blob");
+        assert_eq!(SessionRole::Messages.as_metric_label(), "messages");
+    }
+
     /// Первый контакт: клиент не знает ключа ноды, узнаёт его в ходе
     /// хендшейка и получает рабочую сессию.
     #[tokio::test]
@@ -1406,7 +1557,13 @@ mod tests {
             .unwrap()
             .build_initiator()
             .unwrap();
-        let hello = encode_client_hello(&client.verifying_key().to_bytes(), None, None).unwrap();
+        let hello = encode_client_hello(
+            &client.verifying_key().to_bytes(),
+            None,
+            None,
+            SessionRole::Messages,
+        )
+        .unwrap();
         let mut message = vec![0u8; NOISE_MAX_MESSAGE_LEN];
         let len = handshake.write_message(&hello, &mut message).unwrap();
         write_handshake_message(&mut client_stream, &message[..len])
@@ -1658,7 +1815,13 @@ mod tests {
             .unwrap()
             .build_initiator()
             .unwrap();
-        let hello = encode_client_hello(&client.verifying_key().to_bytes(), None, None).unwrap();
+        let hello = encode_client_hello(
+            &client.verifying_key().to_bytes(),
+            None,
+            None,
+            SessionRole::Messages,
+        )
+        .unwrap();
         let mut message = vec![0u8; NOISE_MAX_MESSAGE_LEN];
         let len = handshake.write_message(&hello, &mut message).unwrap();
         write_handshake_message(&mut client_stream, &message[..len])
@@ -1711,7 +1874,13 @@ mod tests {
             .unwrap()
             .build_initiator()
             .unwrap();
-        let hello = encode_client_hello(&client.verifying_key().to_bytes(), None, None).unwrap();
+        let hello = encode_client_hello(
+            &client.verifying_key().to_bytes(),
+            None,
+            None,
+            SessionRole::Messages,
+        )
+        .unwrap();
         let mut buffer = vec![0u8; NOISE_MAX_MESSAGE_LEN];
         let len = handshake.write_message(&hello, &mut buffer).unwrap();
         let recorded_msg1 = buffer[..len].to_vec();
@@ -1954,7 +2123,8 @@ mod tests {
         .unwrap()
         .build_initiator()
         .unwrap();
-        let hello = encode_client_hello(&identity_element, None, None).unwrap();
+        let hello =
+            encode_client_hello(&identity_element, None, None, SessionRole::Messages).unwrap();
         let mut message = vec![0u8; NOISE_MAX_MESSAGE_LEN];
         let len = handshake.write_message(&hello, &mut message).unwrap();
         write_handshake_message(&mut client_stream, &message[..len])
@@ -1996,6 +2166,7 @@ mod tests {
             &victim_id,
             None,
             None,
+            SessionRole::Messages,
         )
         .await
         .expect("handshake itself completes on the client side");
@@ -2041,7 +2212,7 @@ mod tests {
         let response = read_handshake_message(&mut client_stream).await.unwrap();
         handshake.read_message(&response, &mut payload).unwrap();
 
-        let hello = encode_client_hello(&victim_id, None, None).unwrap();
+        let hello = encode_client_hello(&victim_id, None, None, SessionRole::Messages).unwrap();
         let len = handshake.write_message(&hello, &mut message).unwrap();
         write_handshake_message(&mut client_stream, &message[..len])
             .await
@@ -2106,6 +2277,7 @@ mod tests {
             &account_id,
             Some(DEVICE),
             Some(cert),
+            SessionRole::Messages,
         )
         .await
         .expect("handshake itself completes on the client side");

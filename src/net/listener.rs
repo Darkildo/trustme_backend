@@ -3,6 +3,7 @@ use std::io;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::blob::BlobStore;
 use crate::config::{Config, LimitsConfig};
 use crate::delivery::DeliveryBackend;
 use crate::net::conn::handle_conn;
@@ -33,6 +34,7 @@ pub async fn accept_loop(
     push_scheduler: PushScheduler,
     node: Arc<NodeIdentity>,
     cfg: Config,
+    blobs: Option<BlobStore>,
 ) {
     let server_config = cfg.server_config_snapshot();
     let handshake_policy = HandshakePolicy {
@@ -117,6 +119,7 @@ pub async fn accept_loop(
         let server_config = server_config.clone();
         let limits = limits.clone();
         let node = node.clone();
+        let blobs = blobs.clone();
         // Адрес клиента — метаданные: в info-логе построчно по каждому
         // соединению ему не место.
         debug!(peer = %addr, "incoming tcp connection accepted");
@@ -136,6 +139,7 @@ pub async fn accept_loop(
                 server_config,
                 limits,
                 admission_guard,
+                blobs,
             )
             .await
             {

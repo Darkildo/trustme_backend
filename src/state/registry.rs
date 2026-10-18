@@ -82,12 +82,34 @@ pub struct Registration {
     pub resync: Arc<Notify>,
 }
 
+/// Сессия роли `BLOB` (передача файлов). Маршрутизации у неё нет: реестр
+/// держит её только ради потолка на пользователя и отзыва сертификата.
+#[derive(Clone)]
+struct BlobSession {
+    id: ConnectionId,
+    device_id: Option<DeviceId>,
+    cert_not_before: Option<u64>,
+    revocation: Arc<SessionRevocation>,
+}
+
+/// Регистрация сессии роли `BLOB`.
+#[derive(Debug, Clone)]
+pub struct BlobRegistration {
+    pub connection_id: ConnectionId,
+    pub revocation: Arc<SessionRevocation>,
+}
+
 /// Реестр живых сессий ноды: пользователь → его соединения (с `device_id`,
 /// если сессия привязана к устройству). Только в памяти; по нему идёт
 /// онлайн-маршрутизация и проверка «получатель в сети».
+///
+/// Сессии роли `BLOB` лежат отдельно: они не получают конвертов и не
+/// делают пользователя «в сети» для пушей, но отзыв сертификата и потолок
+/// сессий касаются и их.
 #[derive(Clone)]
 pub struct ConnRegistry {
     inner: Arc<DashMap<UserId, Vec<RoutedConnection>>>,
+    blob_sessions: Arc<DashMap<UserId, Vec<BlobSession>>>,
     next_connection_id: Arc<AtomicU64>,
 }
 
@@ -95,6 +117,7 @@ impl Default for ConnRegistry {
     fn default() -> Self {
         Self {
             inner: Arc::new(DashMap::new()),
+            blob_sessions: Arc::new(DashMap::new()),
             next_connection_id: Arc::new(AtomicU64::new(1)),
         }
     }
@@ -149,21 +172,33 @@ impl ConnRegistry {
     /// Отзыв сертификатов: делегированные сессии устройства `device_id`
     /// пользователя с `not_before < issued_before` выписываются из реестра
     /// (новые конверты им больше не маршрутизируются) и получают сигнал
-    /// закрыться. Сессии, вошедшие ключом аккаунта, не трогаются. Возвращает
-    /// число закрытых сессий.
+    /// закрыться. Сессии, вошедшие ключом аккаунта, не трогаются. Касается
+    /// сессий обеих ролей. Возвращает число закрытых сессий.
     pub fn revoke_delegated(
         &self,
         user: &UserId,
         device_id: DeviceId,
         issued_before: u64,
     ) -> usize {
+        let hit = |entry_device: Option<DeviceId>, cert_not_before: Option<u64>| {
+            entry_device == Some(device_id)
+                && cert_not_before.is_some_and(|not_before| not_before < issued_before)
+        };
         let mut revoked = 0usize;
         self.inner.remove_if_mut(user, |_, sessions| {
             sessions.retain(|entry| {
-                let hit = entry.device_id == Some(device_id)
-                    && entry
-                        .cert_not_before
-                        .is_some_and(|not_before| not_before < issued_before);
+                let hit = hit(entry.device_id, entry.cert_not_before);
+                if hit {
+                    entry.revocation.revoke();
+                    revoked += 1;
+                }
+                !hit
+            });
+            sessions.is_empty()
+        });
+        self.blob_sessions.remove_if_mut(user, |_, sessions| {
+            sessions.retain(|entry| {
+                let hit = hit(entry.device_id, entry.cert_not_before);
                 if hit {
                     entry.revocation.revoke();
                     revoked += 1;
@@ -173,6 +208,46 @@ impl ConnRegistry {
             sessions.is_empty()
         });
         revoked
+    }
+
+    /// Зарегистрировать сессию роли `BLOB`. Маршрутизации она не получает.
+    pub fn insert_blob_session(
+        &self,
+        user: UserId,
+        device_id: Option<DeviceId>,
+        cert_not_before: Option<u64>,
+    ) -> BlobRegistration {
+        let revocation = Arc::new(SessionRevocation::default());
+        let connection_id = self.next_connection_id.fetch_add(1, Ordering::Relaxed);
+        self.blob_sessions
+            .entry(user)
+            .or_default()
+            .push(BlobSession {
+                id: connection_id,
+                device_id,
+                cert_not_before,
+                revocation: revocation.clone(),
+            });
+        BlobRegistration {
+            connection_id,
+            revocation,
+        }
+    }
+
+    pub fn remove_blob_session(&self, user: &UserId, connection_id: ConnectionId) {
+        self.blob_sessions.remove_if_mut(user, |_, sessions| {
+            sessions.retain(|entry| entry.id != connection_id);
+            sessions.is_empty()
+        });
+    }
+
+    /// Сколько сессий роли `BLOB` у пользователя. Best-effort, как и
+    /// [`Self::session_count`].
+    pub fn blob_session_count(&self, user: &UserId) -> usize {
+        self.blob_sessions
+            .get(user)
+            .map(|sessions| sessions.len())
+            .unwrap_or(0)
     }
 
     pub fn remove(&self, user: &UserId, connection_id: ConnectionId) {
@@ -312,6 +387,29 @@ mod tests {
         assert_eq!(ids, vec![new_cert.connection_id, full.connection_id]);
         // Повтор ничего не находит.
         assert_eq!(registry.revoke_delegated(&user(1), 7, 200), 0);
+    }
+
+    /// Сессия `BLOB` не маршрутизируется и не делает пользователя «в сети»,
+    /// но считается своим потолком и закрывается отзывом сертификата.
+    #[test]
+    fn blob_sessions_are_counted_and_revoked_but_not_routed() {
+        let registry = ConnRegistry::default();
+        let delegated = registry.insert_blob_session(user(1), Some(7), Some(100));
+        let full = registry.insert_blob_session(user(1), Some(7), None);
+        assert_ne!(delegated.connection_id, full.connection_id);
+        assert_eq!(registry.blob_session_count(&user(1)), 2);
+        assert_eq!(registry.session_count(&user(1)), 0);
+        assert!(!registry.has_user(&user(1)));
+        assert!(!registry.has_device(&user(1), 7));
+        assert!(registry.route_targets(&user(1), None).is_empty());
+
+        assert_eq!(registry.revoke_delegated(&user(1), 7, 200), 1);
+        assert!(delegated.revocation.is_revoked());
+        assert!(!full.revocation.is_revoked());
+        assert_eq!(registry.blob_session_count(&user(1)), 1);
+
+        registry.remove_blob_session(&user(1), full.connection_id);
+        assert_eq!(registry.blob_session_count(&user(1)), 0);
     }
 
     #[tokio::test]
