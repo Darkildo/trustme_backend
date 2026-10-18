@@ -1540,10 +1540,11 @@ fn decode_u64(raw: &[u8]) -> u64 {
     raw.try_into().map_or(0, u64::from_be_bytes)
 }
 
+/// Вычесть без ухода ниже нуля. Итоги меняются только под замком
+/// метаданных, поэтому чтение и запись не обязаны быть одной операцией.
 fn saturating_sub(counter: &AtomicU64, value: u64) {
-    let _ = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_sub(value))
-    });
+    let current = counter.load(Ordering::Relaxed);
+    counter.store(current.saturating_sub(value), Ordering::Relaxed);
 }
 
 /// SHA-256 первых `size` байт файла; `None` — файл короче.
