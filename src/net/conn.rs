@@ -15,8 +15,9 @@ use crate::domain::reject::SendRejectReason;
 use crate::domain::wake::WakeHint;
 use crate::net::framing::{
     PROTO_VERSION, QueueListing, as_fixed_32, decode_device_id, decode_frame, encode_auth_error,
-    encode_auth_ok, encode_incoming_via_queue, encode_pong, encode_push_token_ack, encode_queue_ack,
-    encode_queue_list, encode_send_ack, encode_signed_server_config, max_send_body_len,
+    encode_auth_ok, encode_incoming_via_queue, encode_pong, encode_push_token_ack,
+    encode_queue_ack, encode_queue_list, encode_send_ack, encode_signed_server_config,
+    max_send_body_len,
 };
 use crate::net::noise::{HandshakePolicy, NodeIdentity, NoiseFramed};
 use crate::net::rate_limit::{AdmissionGuard, PingGate, SessionLimits, unix_now_secs};
@@ -1876,8 +1877,9 @@ fn queue_quota_reason(
     let scan = storage.scan_queue_quota(recipient, recipient_device_id, sender, ceilings)?;
     let queue_full = (ceilings.messages > 0 && scan.messages >= ceilings.messages)
         || (ceilings.bytes > 0 && scan.bytes >= ceilings.bytes);
-    let pair_full = !queue_full && pair_ceiling > 0
-        && storage.scan_sender_pair_quota(recipient,sender,pair_ceiling)? >= pair_ceiling;
+    let pair_full = !queue_full
+        && pair_ceiling > 0
+        && storage.scan_sender_pair_quota(recipient, sender, pair_ceiling)? >= pair_ceiling;
     let reason = if queue_full || pair_full {
         limits.queue_full.remember(
             recipient,
