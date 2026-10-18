@@ -826,6 +826,7 @@ mod broker_guarantees {
             scheduler,
             identity,
             cfg,
+            None,
         ));
 
         Ok(Node {

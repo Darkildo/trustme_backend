@@ -6,6 +6,7 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::{net::TcpStream, select, sync::mpsc};
 use tracing::{debug, error, info, warn};
 
+use crate::blob::BlobStore;
 use crate::config::ServerConfigSnapshot;
 use crate::delivery::DeliveryBackend;
 use crate::delivery::sled_ack::{Offer, SledSession, WriteDecision};
@@ -13,13 +14,14 @@ use crate::domain::priority::MessagePriority;
 use crate::domain::push::PushPlatform;
 use crate::domain::reject::SendRejectReason;
 use crate::domain::wake::WakeHint;
+use crate::net::blob_session::{self, BlobContext, BlobPeer, is_blob_request};
 use crate::net::framing::{
     PROTO_VERSION, QueueListing, as_fixed_32, decode_device_id, decode_frame, encode_auth_error,
     encode_auth_ok, encode_incoming_via_queue, encode_pong, encode_push_token_ack,
     encode_queue_ack, encode_queue_list, encode_send_ack, encode_signed_server_config,
     max_send_body_len,
 };
-use crate::net::noise::{HandshakePolicy, NodeIdentity, NoiseFramed};
+use crate::net::noise::{HandshakePolicy, NodeIdentity, NoiseFramed, SessionRole};
 use crate::net::rate_limit::{AdmissionGuard, PingGate, SessionLimits, unix_now_secs};
 use crate::observability::{self, ConnectionMetricsGuard};
 use crate::push::PushScheduler;
@@ -65,6 +67,7 @@ pub async fn handle_conn(
     server_config: ServerConfigSnapshot,
     limits: Arc<SessionLimits>,
     admission_guard: AdmissionGuard,
+    blobs: Option<BlobStore>,
 ) -> Result<()> {
     let _connection_metrics = ConnectionMetricsGuard::open();
 
@@ -127,8 +130,36 @@ pub async fn handle_conn(
         protocol_version,
         pattern = identity.pattern.as_metric_label(),
         delegated = scope.is_delegated(),
+        role = identity.role.as_metric_label(),
         "noise session established"
     );
+
+    let blob_ctx = BlobContext {
+        chunk_max: server_config
+            .blobs
+            .map_or(1, |announced| announced.chunk_max as usize),
+        max_sessions_per_user: blobs
+            .as_ref()
+            .map_or(0, |store| store.config().max_sessions_per_user),
+        store: blobs,
+        limits: limits.clone(),
+    };
+    // Сессия передачи файлов живёт своим циклом: ни регистрации для
+    // доставки, ни очередей, ни пушей (server-contract.md §6.11).
+    if identity.role == SessionRole::Blob {
+        return blob_session::serve(
+            framed,
+            identity,
+            registry,
+            cert_revocations,
+            blob_ctx,
+            server_config,
+            node,
+            Duration::from_secs(limits.cfg.session_confirm_timeout_secs),
+            admission_guard,
+        )
+        .await;
+    }
 
     // Лимит одновременных сессий на ключ. Проверяется до AuthOk; отказ
     // приходит по уже установленному каналу.
@@ -478,6 +509,9 @@ pub async fn handle_conn(
                       issued_before: u64,
                       all: bool,
                   },
+                  /// Кадр хранилища файлов: в сессии сообщений принимается
+                  /// только `BlobStat` (server-contract.md §6.11).
+                  Blob(frame::Payload),
                   Ignore,
               }
 
@@ -539,6 +573,7 @@ pub async fn handle_conn(
                       issued_before: cmd.issued_before,
                       all: cmd.all,
                   },
+                  Some(payload) if is_blob_request(&payload) => ClientFrame::Blob(payload),
                   _ => ClientFrame::Ignore,
               };
 
@@ -1517,6 +1552,22 @@ pub async fn handle_conn(
                       };
                       framed.send_frame(&ack).await?;
                   }
+                  ClientFrame::Blob(payload) => {
+                      let peer = BlobPeer {
+                          user_id,
+                          device_id,
+                          scope,
+                          connection_id: registration.connection_id,
+                      };
+                      blob_session::handle_blob_frame(
+                          &mut framed,
+                          &blob_ctx,
+                          &peer,
+                          SessionRole::Messages,
+                          payload,
+                      )
+                      .await?;
+                  }
                   ClientFrame::Ignore => {
                       debug!(user = %hex::encode(user_id), "ignoring unsupported frame");
                   }
@@ -2049,7 +2100,7 @@ async fn refuse_over_session_limit(
 /// Неподтверждённая сессия — отказ, а не сбой ноды (именно так кончается
 /// повтор записанного msg1), поэтому наверх уходит `Ok`, как и при отказе
 /// на хендшейке.
-async fn await_session_confirmation(
+pub(crate) async fn await_session_confirmation(
     framed: &mut NoiseFramed<TcpStream>,
     user_id: &UserId,
     device_id: Option<DeviceId>,
@@ -2098,7 +2149,7 @@ async fn await_session_confirmation(
 ///
 /// Cancel-safe, как и `NoiseFramed::next_frame`: отложенный кадр забирается
 /// только при первом опросе, который сразу же и завершается.
-async fn next_client_frame(
+pub(crate) async fn next_client_frame(
     framed: &mut NoiseFramed<TcpStream>,
     confirming_frame: &mut Option<BytesMut>,
 ) -> std::io::Result<Option<BytesMut>> {
@@ -2111,7 +2162,7 @@ async fn next_client_frame(
 /// Момент `unix_secs` на монотонных часах рантайма. Прошедший момент —
 /// «сейчас»; недостижимо далёкий ограничивается сверху, чтобы не
 /// переполнить `Instant`.
-fn instant_at_unix_secs(unix_secs: u64) -> tokio::time::Instant {
+pub(crate) fn instant_at_unix_secs(unix_secs: u64) -> tokio::time::Instant {
     const FAR: Duration = Duration::from_secs(100 * 365 * 24 * 3600);
     let remaining = match UNIX_EPOCH.checked_add(Duration::from_secs(unix_secs)) {
         Some(at) => at
@@ -2131,7 +2182,7 @@ fn instant_at_unix_secs(unix_secs: u64) -> tokio::time::Instant {
 ///
 /// Цикл сессии при этом не запускается: пропустить реплей и работать
 /// дальше значило бы молча не отдать уже принятые сообщения.
-async fn refuse_storage_unavailable(
+pub(crate) async fn refuse_storage_unavailable(
     framed: &mut NoiseFramed<TcpStream>,
     user_id: UserId,
     device_id: Option<DeviceId>,
@@ -2153,7 +2204,7 @@ async fn refuse_storage_unavailable(
 /// Отозван ли сертификат делегированной сессии: есть отзыв устройства с
 /// `issued_before` позже `not_before` сертификата. Сессия ключом аккаунта
 /// (`cert_not_before = None`) хранилище не читает.
-fn is_cert_revoked(
+pub(crate) fn is_cert_revoked(
     revocations: &CertRevocationStore,
     user_id: &UserId,
     device_id: Option<DeviceId>,
@@ -2170,7 +2221,7 @@ fn is_cert_revoked(
 /// Сертификат сессии отозван: `AuthError(403)` и закрытие. Код говорит
 /// клиенту, что повтор с этим сертификатом бессмыслен, — в отличие от
 /// разрыва, после которого он переподключался бы по кругу.
-async fn refuse_revoked_cert(
+pub(crate) async fn refuse_revoked_cert(
     framed: &mut NoiseFramed<TcpStream>,
     user_id: &UserId,
     device_id: Option<DeviceId>,
@@ -2197,7 +2248,10 @@ const FINAL_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Записать последний кадр сессии с таймаутом; не успели — закрываемся
 /// без него.
-async fn send_final_frame(framed: &mut NoiseFramed<TcpStream>, bytes: &[u8]) -> Result<()> {
+pub(crate) async fn send_final_frame(
+    framed: &mut NoiseFramed<TcpStream>,
+    bytes: &[u8],
+) -> Result<()> {
     match tokio::time::timeout(FINAL_FRAME_TIMEOUT, framed.send_frame(bytes)).await {
         Ok(written) => Ok(written?),
         Err(_) => {
@@ -2521,12 +2575,14 @@ fn classify_handshake_error(message: &str) -> &'static str {
         "unknown_pattern"
     } else if message.contains("identity key does not match") {
         "identity_mismatch"
+    } else if message.contains("unknown session role") {
+        "unknown_role"
     } else {
         "rejected"
     }
 }
 
-fn is_connection_reset(err: &std::io::Error) -> bool {
+pub(crate) fn is_connection_reset(err: &std::io::Error) -> bool {
     matches!(
         err.kind(),
         std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted

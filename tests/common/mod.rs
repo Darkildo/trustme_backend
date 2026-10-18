@@ -25,7 +25,7 @@ use trust_message_tcp::domain::reject::SendRejectReason;
 use trust_message_tcp::net::device_cert::signed_bytes;
 use trust_message_tcp::net::framing::verify_signed_server_config;
 use trust_message_tcp::net::listener::accept_loop;
-use trust_message_tcp::net::noise::{NOISE_PARAMS_IK, NodeIdentity, NoiseFramed};
+use trust_message_tcp::net::noise::{NOISE_PARAMS_IK, NodeIdentity, NoiseFramed, SessionRole};
 use trust_message_tcp::push::{
     InMemoryTokenStore, MockTransport, NoopStatePersistence, PushScheduler,
 };
@@ -200,6 +200,8 @@ pub async fn spawn_server(label: &str, limits: LimitsConfig) -> Result<ServerHan
 pub struct NodeInternals {
     pub storage: Storage,
     pub registry: ConnRegistry,
+    /// Хранилище файлов ноды (`None` — выключено).
+    pub blobs: Option<trust_message_tcp::blob::BlobStore>,
     /// Accept-цикл ноды. `abort` вместе с закрытием всех соединений
     /// останавливает ноду и отпускает её хранилище — так тест делает
     /// рестарт на том же каталоге (см. [`NodeOptions::storage_path`]).
@@ -325,7 +327,13 @@ pub struct NodeOptions {
     pub sled_ack: Option<SledAckConfig>,
     /// `Some` — политика офлайн-хранения вместо 30 суток.
     pub offline_retention: Option<RetentionPolicy>,
+    /// `Some` — правка конфига хранилища файлов поверх
+    /// [`test_blob_config`].
+    pub blob_config: Option<BlobTuning>,
 }
+
+/// Правка конфига хранилища файлов тестовой ноды.
+pub type BlobTuning = Box<dyn FnOnce(&mut trust_message_tcp::config::BlobConfig) + Send>;
 
 /// Нода с произвольным набором опций и её внутренности.
 pub async fn spawn_node_with(
@@ -394,6 +402,7 @@ async fn spawn_node_with_internals(
         device_cert_max_ttl,
         sled_ack,
         offline_retention,
+        blob_config,
     } = options;
     let owns_storage = external_storage.is_none();
     let storage_path = external_storage.unwrap_or_else(|| temp_storage_path(label));
@@ -453,6 +462,14 @@ async fn spawn_node_with_internals(
         ))
     };
 
+    if let Some(tune) = blob_config {
+        tune(&mut cfg.blobs);
+    }
+    let blobs = if cfg.blobs.enabled {
+        Some(storage.blob_store(&cfg.blobs)?)
+    } else {
+        None
+    };
     let listener = TcpListener::bind(&cfg.bind_addr).await?;
     let addr = listener.local_addr()?;
     let accept_task = tokio::spawn(accept_loop(
@@ -464,11 +481,13 @@ async fn spawn_node_with_internals(
         push_scheduler,
         node,
         cfg,
+        blobs.clone(),
     ))
     .abort_handle();
     let internals = NodeInternals {
         storage,
         registry,
+        blobs,
         accept_task,
     };
 
@@ -536,6 +555,51 @@ pub async fn connect_as(
     max_frame_len: usize,
 ) -> Result<Conn> {
     confirm(handshake(server, identity, device_id, max_frame_len).await?).await
+}
+
+/// Сессия роли `BLOB` (передача файлов), подтверждённая так же, как
+/// сессия сообщений.
+pub async fn connect_blob(
+    server: &ServerHandle,
+    identity: &SigningKey,
+    device_id: Option<u16>,
+) -> Result<Conn> {
+    let stream = TcpStream::connect(server.addr).await?;
+    let inner = NoiseFramed::connect_with_role(
+        stream,
+        &server.node_public,
+        identity,
+        device_id,
+        SessionRole::Blob,
+        HANDSHAKE_TIMEOUT,
+        FRAME_MAX,
+    )
+    .await?;
+    confirm(inner).await
+}
+
+/// Делегированный вход в сессию роли `BLOB`.
+pub async fn connect_delegated_blob(
+    server: &ServerHandle,
+    account_id: &[u8; 32],
+    device: &DeviceKey,
+    device_id: u16,
+    cert: wire::DeviceCertificate,
+) -> Result<Conn> {
+    let stream = TcpStream::connect(server.addr).await?;
+    let inner = NoiseFramed::connect_delegated_with_role(
+        stream,
+        &server.node_public,
+        &device.secret,
+        account_id,
+        device_id,
+        cert,
+        SessionRole::Blob,
+        HANDSHAKE_TIMEOUT,
+        FRAME_MAX,
+    )
+    .await?;
+    confirm(inner).await
 }
 
 /// Подключиться, но сессию не подтверждать: после хендшейка ни одного кадра

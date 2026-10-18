@@ -231,6 +231,26 @@ pub fn encode_queue_ack(
     }))
 }
 
+/// Ответ хранилища файлов (`BlobAck`).
+pub fn encode_blob_ack(ack: wire::BlobAck) -> Vec<u8> {
+    encode_frame(frame::Payload::BlobAck(ack))
+}
+
+/// Кусок ответа на `BlobGet`.
+pub fn encode_blob_data(request_id: u64, offset: u64, data: Vec<u8>, eof: bool) -> Vec<u8> {
+    encode_frame(frame::Payload::BlobData(wire::BlobData {
+        request_id,
+        offset,
+        data,
+        eof,
+    }))
+}
+
+/// Ответ на `BlobStat`.
+pub fn encode_blob_stat_result(result: wire::BlobStatResult) -> Vec<u8> {
+    encode_frame(frame::Payload::BlobStatResult(result))
+}
+
 /// Состояние аккаунта для `ListQueues`.
 pub struct QueueListing<'a> {
     /// Живые очереди и надгробия.
