@@ -26,6 +26,10 @@
 //!     fingerprint, verify the signed config against it
 //!   - quota_flood           blast ClientSend until a quota answers with a reason;
 //!     with --metrics <url> also checks reject_total{reason} grew
+//!   - blob_roundtrip        file storage: B allocates a queue, A uploads a file into
+//!     B's mailbox over a BLOB session, B downloads it window by window, checks
+//!     SHA-256, sees it in BlobStat and releases it; A uploads and deletes its own
+//!     file and B sees DELETED
 //!
 //! Generates fresh Ed25519 keypairs each run, so userIds are unique per invocation.
 
@@ -37,11 +41,12 @@ use anyhow::{Context, Result, anyhow, bail};
 use bytes::BytesMut;
 use ed25519_dalek::SigningKey;
 use prost::Message;
+use sha2::{Digest, Sha256};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
 use trust_message_tcp::domain::reject::SendRejectReason;
 use trust_message_tcp::net::framing::verify_signed_server_config;
-use trust_message_tcp::net::noise::{NoiseFramed, fingerprint};
+use trust_message_tcp::net::noise::{NoiseFramed, SessionRole, fingerprint};
 use trust_message_tcp::wire::{self, Frame, frame};
 
 /// Версия wire-протокола, которую заявляет этот клиент. Нода с другой
@@ -64,6 +69,7 @@ enum Scenario {
     ProbeTofu,
     QuotaFlood,
     QueueLifecycle,
+    BlobRoundtrip,
 }
 
 impl Scenario {
@@ -79,6 +85,7 @@ impl Scenario {
             "probe_config" => Ok(Self::ProbeConfig),
             "probe_tofu" => Ok(Self::ProbeTofu),
             "quota_flood" => Ok(Self::QuotaFlood),
+            "blob_roundtrip" => Ok(Self::BlobRoundtrip),
             other => bail!("unknown scenario `{other}`"),
         }
     }
@@ -214,16 +221,27 @@ fn decode_payload(bytes: &[u8]) -> Result<frame::Payload> {
 /// подтверждение сессии. Токена нет — identity доказана статиком,
 /// выведенным из ключа клиента.
 async fn login(args: &Args, identity: &SigningKey, device_id: Option<u16>) -> Result<Session> {
+    login_as(args, identity, device_id, SessionRole::Messages).await
+}
+
+/// То же с ролью сессии: `Blob` — сессия передачи файлов (контракт §6.11).
+async fn login_as(
+    args: &Args,
+    identity: &SigningKey,
+    device_id: Option<u16>,
+    role: SessionRole,
+) -> Result<Session> {
     let stream = TcpStream::connect(&args.message_addr)
         .await
         .with_context(|| format!("connect to message server at {}", args.message_addr))?;
     stream.set_nodelay(true).ok();
 
-    let conn = NoiseFramed::connect(
+    let conn = NoiseFramed::connect_with_role(
         stream,
         &args.node_key()?,
         identity,
         device_id,
+        role,
         HANDSHAKE_TIMEOUT,
         FRAME_MAX,
     )
@@ -1244,6 +1262,256 @@ async fn run(args: Args) -> Result<()> {
         Scenario::ProbeConfig => run_probe_config(&args).await,
         Scenario::ProbeTofu => run_probe_tofu(&args).await,
         Scenario::QuotaFlood => run_quota_flood(&args).await,
+        Scenario::BlobRoundtrip => run_blob_roundtrip(&args).await,
+    }
+}
+
+/// Хранилище файлов целиком через живую ноду (контракт §6.11).
+async fn run_blob_roundtrip(args: &Args) -> Result<()> {
+    let sender = fresh_keypair()?;
+    let recipient = fresh_keypair()?;
+
+    println!("==> recipient: ServerConfig must announce the file storage");
+    let mut recipient_messages = login(args, &recipient, Some(1)).await?;
+    recipient_messages
+        .send_frame(&encode_get_server_config()?)
+        .await?;
+    let bytes = read_frame(&mut recipient_messages, "SignedServerConfig").await?;
+    let config = match decode_payload(bytes.as_ref())? {
+        frame::Payload::SignedServerConfig(signed) => {
+            verify_signed_server_config(&signed, &args.node_key()?, unix_now_secs())?
+        }
+        other => bail!("expected SignedServerConfig, got {other:?}"),
+    };
+    if !config.supports_blobs {
+        bail!("the node does not announce supportsBlobs");
+    }
+    let chunk = usize::try_from(config.blob_chunk_max)?;
+    let window = config.blob_get_window;
+    println!(
+        "    <- blobMaxSize={} blobMaxTtlSecs={} blobChunkMax={} blobGetWindow={}",
+        config.blob_max_size, config.blob_max_ttl_secs, chunk, window
+    );
+
+    println!("==> recipient: AllocateQueue for the sender");
+    recipient_messages
+        .send_frame(&wrap(frame::Payload::AllocateQueue(
+            wire::AllocateQueue::default(),
+        )))
+        .await?;
+    let ack = expect_queue_ack(&mut recipient_messages).await?;
+    if !ack.ok {
+        bail!("allocation failed: reason={}", ack.reason);
+    }
+    let queue_id = ack.queue_id;
+
+    // Больше окна скачивания и не кратно куску: ответы на Get идут окнами,
+    // последний кусок — короче.
+    let size = usize::try_from(window)?.saturating_add(chunk / 2 + 17);
+    let mut data = vec![0u8; size];
+    for (index, byte) in data.iter_mut().enumerate() {
+        *byte = (index as u8).wrapping_mul(29) ^ 0x5a;
+    }
+    let secret: [u8; 32] = random_bytes()?;
+    let token: [u8; 32] = random_bytes()?;
+    let blob_id = Sha256::digest(secret).to_vec();
+
+    println!("==> sender: BLOB session, upload {size} bytes into the recipient's mailbox");
+    let mut sender_blob = login_as(args, &sender, Some(1), SessionRole::Blob).await?;
+    upload_blob(
+        &mut sender_blob,
+        &queue_id,
+        &data,
+        &blob_id,
+        &token,
+        1,
+        chunk,
+    )
+    .await?;
+
+    println!("==> recipient: BLOB session, download window by window");
+    let mut recipient_blob = login_as(args, &recipient, Some(1), SessionRole::Blob).await?;
+    let mut received = Vec::with_capacity(size);
+    let mut request_id = 10;
+    while received.len() < size {
+        request_id += 1;
+        recipient_blob
+            .send_frame(&wrap(frame::Payload::BlobGet(wire::BlobGet {
+                blob_secret: secret.to_vec(),
+                offset: received.len() as u64,
+                length: 0,
+                request_id,
+            })))
+            .await?;
+        loop {
+            let bytes = read_frame(&mut recipient_blob, "BlobData").await?;
+            match decode_payload(bytes.as_ref())? {
+                frame::Payload::BlobData(part) => {
+                    if part.offset != received.len() as u64 {
+                        bail!("BlobData out of order: offset {}", part.offset);
+                    }
+                    received.extend_from_slice(&part.data);
+                    if part.eof {
+                        break;
+                    }
+                }
+                frame::Payload::BlobAck(ack) => bail!("BlobGet refused: reason={}", ack.reason),
+                other => bail!("expected BlobData, got {other:?}"),
+            }
+        }
+        println!("    <- {} of {size} bytes", received.len());
+    }
+    if Sha256::digest(&received) != Sha256::digest(&data) {
+        bail!("downloaded file does not match the upload");
+    }
+
+    println!("==> recipient: BlobStat from the messages session");
+    let states = blob_stat(&mut recipient_messages, &secret).await?;
+    if states != [wire::BlobState::Ready as i32] {
+        bail!("expected READY, got {states:?}");
+    }
+
+    println!("==> recipient: BlobRelease (max_releases = 1) removes the file");
+    recipient_blob
+        .send_frame(&wrap(frame::Payload::BlobRelease(wire::BlobRelease {
+            blob_secret: secret.to_vec(),
+            request_id: 30,
+        })))
+        .await?;
+    let ack = expect_blob_ack(&mut recipient_blob).await?;
+    if !ack.ok {
+        bail!("release refused: reason={}", ack.reason);
+    }
+    if blob_stat(&mut recipient_messages, &secret).await? != [wire::BlobState::NotFound as i32] {
+        bail!("released file is still there");
+    }
+
+    println!("==> sender: own file, then BlobDelete; the recipient sees DELETED");
+    let own_secret: [u8; 32] = random_bytes()?;
+    let own_id = Sha256::digest(own_secret).to_vec();
+    upload_blob(
+        &mut sender_blob,
+        &[],
+        &data[..chunk],
+        &own_id,
+        &token,
+        0,
+        chunk,
+    )
+    .await?;
+    sender_blob
+        .send_frame(&wrap(frame::Payload::BlobDelete(wire::BlobDelete {
+            blob_id: own_id,
+            delete_token: token.to_vec(),
+            request_id: 40,
+        })))
+        .await?;
+    let ack = expect_blob_ack(&mut sender_blob).await?;
+    if !ack.ok {
+        bail!("delete refused: reason={}", ack.reason);
+    }
+    if blob_stat(&mut recipient_messages, &own_secret).await? != [wire::BlobState::Deleted as i32] {
+        bail!("deleted file is not reported as DELETED");
+    }
+
+    println!("==> OK");
+    Ok(())
+}
+
+/// Init → куски → подтверждение `committedOffset = size` → Commit.
+async fn upload_blob(
+    conn: &mut Session,
+    queue_id: &[u8],
+    data: &[u8],
+    blob_id: &[u8],
+    token: &[u8; 32],
+    max_releases: u32,
+    chunk: usize,
+) -> Result<()> {
+    conn.send_frame(&wrap(frame::Payload::BlobUploadInit(
+        wire::BlobUploadInit {
+            queue_id: queue_id.to_vec(),
+            size: data.len() as u64,
+            sha256: Sha256::digest(data).to_vec(),
+            ttl_seconds: 3_600,
+            max_releases,
+            blob_id: blob_id.to_vec(),
+            delete_token_hash: Sha256::digest(token).to_vec(),
+            request_id: 1,
+        },
+    )))
+    .await?;
+    let ack = expect_blob_ack(conn).await?;
+    if !ack.ok {
+        bail!("BlobUploadInit refused: reason={}", ack.reason);
+    }
+    for (index, part) in data.chunks(chunk.max(1)).enumerate() {
+        conn.send_frame(&wrap(frame::Payload::BlobUploadChunk(
+            wire::BlobUploadChunk {
+                blob_id: blob_id.to_vec(),
+                offset: (index * chunk) as u64,
+                data: part.to_vec(),
+            },
+        )))
+        .await?;
+    }
+    loop {
+        let ack = expect_blob_ack(conn).await?;
+        if !ack.ok {
+            bail!(
+                "chunk refused: reason={} committed={}",
+                ack.reason,
+                ack.committed_offset
+            );
+        }
+        println!(
+            "    <- committed {} of {}",
+            ack.committed_offset,
+            data.len()
+        );
+        if ack.committed_offset == data.len() as u64 {
+            break;
+        }
+    }
+    conn.send_frame(&wrap(frame::Payload::BlobUploadCommit(
+        wire::BlobUploadCommit {
+            blob_id: blob_id.to_vec(),
+            request_id: 2,
+        },
+    )))
+    .await?;
+    let ack = expect_blob_ack(conn).await?;
+    if !ack.ok {
+        bail!("BlobUploadCommit refused: reason={}", ack.reason);
+    }
+    println!("    <- committed, expiresAt={}", ack.expires_at);
+    Ok(())
+}
+
+async fn expect_blob_ack(conn: &mut Session) -> Result<wire::BlobAck> {
+    let bytes = read_frame(conn, "BlobAck").await?;
+    match decode_payload(bytes.as_ref())? {
+        frame::Payload::BlobAck(ack) => Ok(ack),
+        other => bail!("expected BlobAck, got {other:?}"),
+    }
+}
+
+async fn blob_stat(conn: &mut Session, secret: &[u8; 32]) -> Result<Vec<i32>> {
+    conn.send_frame(&wrap(frame::Payload::BlobStat(wire::BlobStat {
+        items: vec![wire::BlobStatQuery {
+            blob_secret: secret.to_vec(),
+            ..wire::BlobStatQuery::default()
+        }],
+        request_id: 50,
+    })))
+    .await?;
+    let bytes = read_frame(conn, "BlobStatResult").await?;
+    match decode_payload(bytes.as_ref())? {
+        frame::Payload::BlobStatResult(result) => {
+            Ok(result.entries.iter().map(|entry| entry.state).collect())
+        }
+        frame::Payload::BlobAck(ack) => bail!("BlobStat refused: reason={}", ack.reason),
+        other => bail!("expected BlobStatResult, got {other:?}"),
     }
 }
 
