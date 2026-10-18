@@ -98,6 +98,7 @@ pub fn encode_signed_server_config(
         blob_chunk_max: config.blobs.map_or(0, |blobs| blobs.chunk_max),
         blob_quota_per_owner: config.blobs.map_or(0, |blobs| blobs.quota_per_owner),
         blob_get_window: config.blobs.map_or(0, |blobs| blobs.get_window),
+        blob_min_charge: config.blobs.map_or(0, |blobs| blobs.min_charge),
     };
 
     // Подписываются именно эти байты, и они же уезжают клиенту: protobuf
@@ -604,6 +605,7 @@ mod tests {
             chunk_max: 3,
             quota_per_owner: 4,
             get_window: 5,
+            min_charge: 6,
         };
         let encoded = encode_signed_server_config(
             &ServerConfigSnapshot {
@@ -621,9 +623,10 @@ mod tests {
                 config.blob_max_ttl_secs,
                 config.blob_chunk_max,
                 config.blob_quota_per_owner,
-                config.blob_get_window
+                config.blob_get_window,
+                config.blob_min_charge
             ),
-            (1, 2, 3, 4, 5)
+            (1, 2, 3, 4, 5, 6)
         );
     }
 

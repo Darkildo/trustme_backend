@@ -126,6 +126,11 @@ pub struct BlobConfig {
     /// Запросов `BlobStat` в секунду на пользователя (`BLOB_STAT_PER_SEC`).
     /// Default: 20, `0` = без ограничения.
     pub stat_per_sec: u32,
+    /// Минимальный учётный размер блоба в квотах владельца, пары и суточной,
+    /// байт (`BLOB_MIN_CHARGE_BYTES`): без него байтовые квоты не
+    /// ограничивали бы число записей. Default: 64 KiB — мелочь до этого
+    /// размера клиент кладёт прямо в сообщение. `0` — по размеру.
+    pub min_charge: u64,
 }
 
 impl Default for BlobConfig {
@@ -148,6 +153,7 @@ impl Default for BlobConfig {
             sync_every: 4 * 1024 * 1024,
             ops_per_sec: 50,
             stat_per_sec: 20,
+            min_charge: 64 * 1024,
         }
     }
 }
@@ -358,6 +364,8 @@ pub struct BlobAnnouncement {
     pub quota_per_owner: u64,
     /// `BLOB_GET_WINDOW_BYTES`.
     pub get_window: u64,
+    /// `BLOB_MIN_CHARGE_BYTES`.
+    pub min_charge: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -686,6 +694,7 @@ impl Config {
                 chunk_max: self.blobs.chunk_max_for(self.max_frame_len) as u64,
                 quota_per_owner: self.blobs.quota_per_owner,
                 get_window: self.blobs.get_window,
+                min_charge: self.blobs.min_charge,
             }),
         }
     }
@@ -917,6 +926,8 @@ struct RawConfig {
     blob_ops_per_sec: Option<u32>,
     #[serde(default)]
     blob_stat_per_sec: Option<u32>,
+    #[serde(default)]
+    blob_min_charge_bytes: Option<u64>,
 }
 
 /// Срок архива удалённых записей по умолчанию, сутки. Короче срока очередей:
@@ -1017,6 +1028,7 @@ pub fn load() -> anyhow::Result<Config> {
         blob_sync_every_bytes,
         blob_ops_per_sec,
         blob_stat_per_sec,
+        blob_min_charge_bytes,
     } = raw;
 
     let bind_addr = resolve_bind_addr(bind_addr, bind_host, bind_port)?;
@@ -1150,6 +1162,7 @@ pub fn load() -> anyhow::Result<Config> {
             sync_every_bytes: blob_sync_every_bytes,
             ops_per_sec: blob_ops_per_sec,
             stat_per_sec: blob_stat_per_sec,
+            min_charge_bytes: blob_min_charge_bytes,
         },
         &storage_path,
         max_frame_len,
@@ -1654,6 +1667,7 @@ struct BlobRawConfig {
     sync_every_bytes: Option<u64>,
     ops_per_sec: Option<u32>,
     stat_per_sec: Option<u32>,
+    min_charge_bytes: Option<u64>,
 }
 
 /// Собрать `BlobConfig` из env: умолчания, каталог под `STORAGE_PATH`,
@@ -1722,6 +1736,7 @@ fn resolve_blobs(
         )?,
         ops_per_sec: raw.ops_per_sec.unwrap_or(defaults.ops_per_sec),
         stat_per_sec: raw.stat_per_sec.unwrap_or(defaults.stat_per_sec),
+        min_charge: raw.min_charge_bytes.unwrap_or(defaults.min_charge),
     })
 }
 
@@ -2054,6 +2069,7 @@ mod tests {
         assert_eq!(cfg.tombstone_secs, cfg.max_ttl_secs);
         assert_eq!(cfg.max_sessions_per_user, 4);
         assert_eq!(cfg.stat_per_sec, 20);
+        assert_eq!(cfg.min_charge, 64 * 1024);
 
         let tuned = resolve_blobs(
             BlobRawConfig {
@@ -2061,6 +2077,7 @@ mod tests {
                 dir: Some(" /mnt/blobs ".into()),
                 max_ttl_secs: Some(600),
                 chunk_max_bytes: Some(4096),
+                min_charge_bytes: Some(0),
                 ..BlobRawConfig::default()
             },
             "/srv/data",
@@ -2071,6 +2088,7 @@ mod tests {
         assert_eq!(tuned.dir, "/mnt/blobs");
         assert_eq!(tuned.tombstone_secs, 600);
         assert_eq!(tuned.chunk_max, 4096);
+        assert_eq!(tuned.min_charge, 0);
     }
 
     #[test]
