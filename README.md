@@ -366,6 +366,30 @@ docker run --rm \
 потолком ящика `NATS_MAX_MSGS_PER_SUBJECT` и объёмом потока
 `NATS_STREAM_MAX_BYTES`.
 
+Хранилище файлов (server-contract.md §6.11; `0` у квот и лимитов — без
+ограничения). Квоты резервируются по объявленному размеру при
+`BlobUploadInit`; квоты очередей и `RATE_LIMIT_SEND_BYTES_PER_DAY` на
+файлы не распространяются:
+
+| Переменная | По умолчанию | Смысл |
+|---|---|---|
+| `BLOB_ENABLED` | `true` | Выключатель хранилища (`ServerConfig.supports_blobs`) |
+| `BLOB_DIR` | `<STORAGE_PATH>/blobs` | Каталог файлов |
+| `BLOB_MAX_SIZE_BYTES` | `2147483648` (2 GiB) | Потолок одного файла; больше — `TOO_LARGE` |
+| `BLOB_MAX_TTL_SECS` | `2592000` (30 сут) | Потолок срока; запрошенный срок зажимается им. `0` недопустим |
+| `BLOB_QUOTA_PER_OWNER_BYTES` | `2147483648` (2 GiB) | Всего хранится на ящик (личные файлы) или аккаунт (свои) |
+| `BLOB_QUOTA_PER_PAIR_BYTES` | `1073741824` (1 GiB) | Один загрузивший в ящике одного владельца |
+| `BLOB_UPLOAD_BYTES_PER_DAY` | `4294967296` (4 GiB) | Загрузок одного пользователя за UTC-сутки |
+| `BLOB_DISK_RESERVE_BYTES` | `5368709120` (5 GiB) | Свободное место, ниже которого новые загрузки — `QUOTA` |
+| `BLOB_UPLOAD_STALE_SECS` | `86400` | Сколько живёт незавершённая загрузка после последнего сброса на диск |
+| `BLOB_TOMBSTONE_SECS` | `BLOB_MAX_TTL_SECS` | Сколько помнить истёкшие и удалённые (надгробия) |
+| `MAX_BLOB_SESSIONS_PER_USER` | `4` | Сессий роли `BLOB` на пользователя; не входят в `LIMIT_MAX_SESSIONS_PER_USER` |
+| `BLOB_CHUNK_MAX_BYTES` | `1048576` (1 MiB) | Данных в одном куске загрузки и скачивания; вместе со 128 байтами обвязки обязан влезать в `MAX_FRAME_LEN` |
+| `BLOB_GET_WINDOW_BYTES` | `8388608` (8 MiB) | Сколько отдаётся в ответ на один `BlobGet` |
+| `BLOB_SYNC_EVERY_BYTES` | `4194304` (4 MiB) | Через сколько байт загрузки — `fsync` и подтверждение прогресса |
+| `BLOB_OPS_PER_SEC` | `50` | Операций хранилища (`Init`, `Commit`, `Status`, `Get`, `Release`, `Delete`, `Extend`) в секунду на пользователя; сверх — `RATE_LIMITED` |
+| `BLOB_STAT_PER_SEC` | `20` | Запросов `BlobStat` в секунду на пользователя |
+
 Push:
 
 | Переменная | По умолчанию | Смысл |

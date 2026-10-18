@@ -3,7 +3,10 @@
 //! После падения посреди коммита или удаления запись и файл могут
 //! разойтись. Правила:
 //!
-//! - готовому блобу нужен файл `<id>`, иначе запись стирается;
+//! - готовому блобу нужен файл `<id>`, иначе он становится надгробием
+//!   `EXPIRED`: файл потерян (падение посреди удаления, восстановление из
+//!   бэкапа, в который блобы не входят), и клиенту честнее попросить
+//!   отправителя перезалить, чем считать, что файла не было;
 //! - загрузке нужен `<id>.part`; нет его — загрузка начинается с нуля,
 //!   файл короче сброшенного смещения — смещение опускается до длины;
 //! - файл без записи в подходящем состоянии стирается — в том числе
@@ -24,7 +27,9 @@ use tracing::{info, warn};
 use crate::observability;
 
 use super::super::BlobId;
-use super::super::record::{BlobRecord, expiry_key, owner_usage_key, pair_usage_key};
+use super::super::record::{
+    BlobRecord, TombCause, Tombstone, expiry_key, owner_usage_key, pair_usage_key,
+};
 use super::BlobStore;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -44,7 +49,7 @@ pub(super) struct ReconcileReport {
 }
 
 impl BlobStore {
-    pub(super) fn reconcile(&self) -> Result<ReconcileReport> {
+    pub(super) fn reconcile(&self, now: u64) -> Result<ReconcileReport> {
         let mut report = ReconcileReport::default();
         let mut files = self.scan_files()?;
 
@@ -67,7 +72,13 @@ impl BlobStore {
                 if files.contains_key(&(id, FileKind::Final)) {
                     keep.insert((id, FileKind::Final));
                 } else {
-                    self.inner.blobs.remove(id)?;
+                    let tomb = BlobRecord::Tomb(Tombstone {
+                        cause: TombCause::Expired,
+                        at: now,
+                        until: now.saturating_add(self.inner.cfg.tombstone_secs),
+                        delete_token_hash: live.delete_token_hash,
+                    });
+                    self.inner.blobs.insert(id, tomb.encode())?;
                     report.missing_files += 1;
                 }
                 continue;

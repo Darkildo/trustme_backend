@@ -5,7 +5,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
-use crate::config::LimitsConfig;
+use crate::config::{BlobConfig, LimitsConfig};
 use crate::state::registry::{DeviceId, UserId};
 
 /// Счётчики одного пользователя: фиксированное секундное окно для msg/s и
@@ -18,8 +18,9 @@ struct UserCounters {
     day_bytes: u64,
 }
 
-/// In-memory rate-limiter отправки на пользователя: `msg/s` (фиксированное
-/// окно 1 с) и `байт/сутки` (окно = UTC-день).
+/// In-memory rate-limiter на пользователя: `msg/s` (фиксированное окно
+/// 1 с) и `байт/сутки` (окно = UTC-день). Им же считаются операции и
+/// суточный объём загрузок хранилища файлов — отдельными экземплярами.
 ///
 /// Состояние сознательно не персистится: лимиты существуют против активного
 /// флуда в моменте, а не как аудит; перезапуск ноды сбрасывает счётчики.
@@ -301,20 +302,33 @@ impl HandshakeAdmission {
     }
 }
 
-/// Всё, что нужно соединению для применения лимитов: конфиг и общий на
-/// процесс rate-limiter отправки.
+/// Всё, что нужно соединению для применения лимитов: конфиг и общие на
+/// процесс rate-limiter'ы — отправки и операций хранилища файлов.
 pub struct SessionLimits {
     pub cfg: LimitsConfig,
     pub send: SendRateLimiter,
     /// Недавние ответы «очередь полна» (см. [`QueueFullCache`]).
     pub queue_full: QueueFullCache,
+    /// Операции хранилища файлов в секунду на пользователя
+    /// (`BLOB_OPS_PER_SEC`). Свой бюджет, а не `send`: файл не должен
+    /// выедать лимит сообщений, и наоборот.
+    pub blob_ops: SendRateLimiter,
+    /// `BlobStat` в секунду на пользователя (`BLOB_STAT_PER_SEC`).
+    pub blob_stat: SendRateLimiter,
 }
 
 impl SessionLimits {
+    /// Лимиты с умолчаниями хранилища файлов.
     pub fn new(cfg: LimitsConfig) -> Self {
+        Self::for_node(cfg, &BlobConfig::default())
+    }
+
+    pub fn for_node(cfg: LimitsConfig, blobs: &BlobConfig) -> Self {
         Self {
             send: SendRateLimiter::new(cfg.send_msgs_per_sec, cfg.send_bytes_per_day),
             queue_full: QueueFullCache::default(),
+            blob_ops: SendRateLimiter::new(blobs.ops_per_sec, 0),
+            blob_stat: SendRateLimiter::new(blobs.stat_per_sec, 0),
             cfg,
         }
     }

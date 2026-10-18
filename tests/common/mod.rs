@@ -141,6 +141,7 @@ pub fn snapshot() -> ServerConfigSnapshot {
         supports_delivery_ack: true,
         config_ttl: Duration::from_secs(3600),
         advertised_address: None,
+        blobs: None,
     }
 }
 

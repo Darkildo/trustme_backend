@@ -92,12 +92,12 @@ pub fn encode_signed_server_config(
         issued_at: now_secs,
         expires_at: now_secs.saturating_add(config.config_ttl.as_secs()),
         advertised_address: config.advertised_address.clone().unwrap_or_default(),
-        supports_blobs: false,
-        blob_max_size: 0,
-        blob_max_ttl_secs: 0,
-        blob_chunk_max: 0,
-        blob_quota_per_owner: 0,
-        blob_get_window: 0,
+        supports_blobs: config.blobs.is_some(),
+        blob_max_size: config.blobs.map_or(0, |blobs| blobs.max_size),
+        blob_max_ttl_secs: config.blobs.map_or(0, |blobs| blobs.max_ttl_secs),
+        blob_chunk_max: config.blobs.map_or(0, |blobs| blobs.chunk_max),
+        blob_quota_per_owner: config.blobs.map_or(0, |blobs| blobs.quota_per_owner),
+        blob_get_window: config.blobs.map_or(0, |blobs| blobs.get_window),
     };
 
     // Подписываются именно эти байты, и они же уезжают клиенту: protobuf
@@ -358,6 +358,7 @@ mod tests {
             device_cert_max_ttl: Duration::from_secs(30 * 24 * 3600),
             config_ttl: Duration::from_secs(3600),
             advertised_address: Some("node.example:5000".to_string()),
+            blobs: None,
         }
     }
 
@@ -568,6 +569,42 @@ mod tests {
 
         assert_eq!(config.advertised_address, "");
         assert!(!config.supports_delivery_ack);
+        // Хранилище выключено: флаг снят, потолки нулевые.
+        assert!(!config.supports_blobs);
+        assert_eq!(config.blob_max_size, 0);
+    }
+
+    /// Потолки хранилища файлов приезжают под подписью.
+    #[test]
+    fn signed_config_announces_blob_ceilings() {
+        let node = node(17);
+        let blobs = crate::config::BlobAnnouncement {
+            max_size: 1,
+            max_ttl_secs: 2,
+            chunk_max: 3,
+            quota_per_owner: 4,
+            get_window: 5,
+        };
+        let encoded = encode_signed_server_config(
+            &ServerConfigSnapshot {
+                blobs: Some(blobs),
+                ..snapshot()
+            },
+            &node,
+            NOW,
+        );
+        let config = verify_signed_server_config(&signed(&encoded), &node.public(), NOW).unwrap();
+        assert!(config.supports_blobs);
+        assert_eq!(
+            (
+                config.blob_max_size,
+                config.blob_max_ttl_secs,
+                config.blob_chunk_max,
+                config.blob_quota_per_owner,
+                config.blob_get_window
+            ),
+            (1, 2, 3, 4, 5)
+        );
     }
 
     /// SendAck.reason ходит по проводу и читается обратно во всех вариантах.

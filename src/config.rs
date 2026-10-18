@@ -338,6 +338,26 @@ pub struct ServerConfigSnapshot {
     /// общем случае не знает, а подписать неверный адрес хуже, чем не
     /// подписать никакого.
     pub advertised_address: Option<String>,
+    /// Хранилище файлов в подписанном снапшоте; `None` — выключено
+    /// (`BLOB_ENABLED=false`).
+    pub blobs: Option<BlobAnnouncement>,
+}
+
+/// Потолки хранилища файлов, которые нода объявляет клиенту
+/// (`ServerConfig.blob_*`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BlobAnnouncement {
+    /// `BLOB_MAX_SIZE_BYTES`.
+    pub max_size: u64,
+    /// `BLOB_MAX_TTL_SECS`.
+    pub max_ttl_secs: u64,
+    /// Данных в одном куске, байт: `BLOB_CHUNK_MAX_BYTES`, зажатый так,
+    /// чтобы кадр с куском влез в `max_frame_len`.
+    pub chunk_max: u64,
+    /// `BLOB_QUOTA_PER_OWNER_BYTES`.
+    pub quota_per_owner: u64,
+    /// `BLOB_GET_WINDOW_BYTES`.
+    pub get_window: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -660,7 +680,24 @@ impl Config {
             device_cert_max_ttl: self.device_cert_max_ttl,
             config_ttl: self.server_config_ttl,
             advertised_address: self.advertised_address.clone(),
+            blobs: self.blobs.enabled.then(|| BlobAnnouncement {
+                max_size: self.blobs.max_size,
+                max_ttl_secs: self.blobs.max_ttl_secs,
+                chunk_max: self.blobs.chunk_max_for(self.max_frame_len) as u64,
+                quota_per_owner: self.blobs.quota_per_owner,
+                get_window: self.blobs.get_window,
+            }),
         }
+    }
+}
+
+impl BlobConfig {
+    /// Данных в одном куске при потолке кадра `max_frame_len`: кадр с
+    /// куском обязан влезть в потолок вместе со служебными полями.
+    pub fn chunk_max_for(&self, max_frame_len: usize) -> usize {
+        self.chunk_max
+            .min(max_frame_len.saturating_sub(crate::blob::BLOB_FRAME_RESERVE))
+            .max(1)
     }
 }
 
@@ -848,6 +885,38 @@ struct RawConfig {
     tcp_keepalive_retries: Option<u32>,
     #[serde(default)]
     tcp_user_timeout_secs: Option<u64>,
+    #[serde(default)]
+    blob_enabled: Option<bool>,
+    #[serde(default)]
+    blob_dir: Option<String>,
+    #[serde(default)]
+    blob_max_size_bytes: Option<u64>,
+    #[serde(default)]
+    blob_max_ttl_secs: Option<u64>,
+    #[serde(default)]
+    blob_quota_per_owner_bytes: Option<u64>,
+    #[serde(default)]
+    blob_quota_per_pair_bytes: Option<u64>,
+    #[serde(default)]
+    blob_upload_bytes_per_day: Option<u64>,
+    #[serde(default)]
+    blob_disk_reserve_bytes: Option<u64>,
+    #[serde(default)]
+    blob_upload_stale_secs: Option<u64>,
+    #[serde(default)]
+    blob_tombstone_secs: Option<u64>,
+    #[serde(default)]
+    max_blob_sessions_per_user: Option<usize>,
+    #[serde(default)]
+    blob_chunk_max_bytes: Option<usize>,
+    #[serde(default)]
+    blob_get_window_bytes: Option<u64>,
+    #[serde(default)]
+    blob_sync_every_bytes: Option<u64>,
+    #[serde(default)]
+    blob_ops_per_sec: Option<u32>,
+    #[serde(default)]
+    blob_stat_per_sec: Option<u32>,
 }
 
 /// Срок архива удалённых записей по умолчанию, сутки. Короче срока очередей:
@@ -932,6 +1001,22 @@ pub fn load() -> anyhow::Result<Config> {
         tcp_keepalive_interval_secs,
         tcp_keepalive_retries,
         tcp_user_timeout_secs,
+        blob_enabled,
+        blob_dir,
+        blob_max_size_bytes,
+        blob_max_ttl_secs,
+        blob_quota_per_owner_bytes,
+        blob_quota_per_pair_bytes,
+        blob_upload_bytes_per_day,
+        blob_disk_reserve_bytes,
+        blob_upload_stale_secs,
+        blob_tombstone_secs,
+        max_blob_sessions_per_user,
+        blob_chunk_max_bytes,
+        blob_get_window_bytes,
+        blob_sync_every_bytes,
+        blob_ops_per_sec,
+        blob_stat_per_sec,
     } = raw;
 
     let bind_addr = resolve_bind_addr(bind_addr, bind_host, bind_port)?;
@@ -1047,13 +1132,28 @@ pub fn load() -> anyhow::Result<Config> {
     };
     check_tcp_keepalive(&limits)?;
 
-    let blobs = BlobConfig {
-        dir: Path::new(&storage_path)
-            .join("blobs")
-            .to_string_lossy()
-            .into_owned(),
-        ..BlobConfig::default()
-    };
+    let blobs = resolve_blobs(
+        BlobRawConfig {
+            enabled: blob_enabled,
+            dir: blob_dir,
+            max_size_bytes: blob_max_size_bytes,
+            max_ttl_secs: blob_max_ttl_secs,
+            quota_per_owner_bytes: blob_quota_per_owner_bytes,
+            quota_per_pair_bytes: blob_quota_per_pair_bytes,
+            upload_bytes_per_day: blob_upload_bytes_per_day,
+            disk_reserve_bytes: blob_disk_reserve_bytes,
+            upload_stale_secs: blob_upload_stale_secs,
+            tombstone_secs: blob_tombstone_secs,
+            max_sessions_per_user: max_blob_sessions_per_user,
+            chunk_max_bytes: blob_chunk_max_bytes,
+            get_window_bytes: blob_get_window_bytes,
+            sync_every_bytes: blob_sync_every_bytes,
+            ops_per_sec: blob_ops_per_sec,
+            stat_per_sec: blob_stat_per_sec,
+        },
+        &storage_path,
+        max_frame_len,
+    )?;
 
     Ok(Config {
         blobs,
@@ -1535,6 +1635,96 @@ fn retention_days(days: u64, field_name: &str) -> anyhow::Result<RetentionPolicy
 /// `TCP_KEEPINTVL` до 32 767 с, `TCP_KEEPCNT` до 127). Значение вне них
 /// ядро отвергает на каждом принятом сокете, и нода работала бы без
 /// keepalive, сообщая об этом только предупреждениями в логе.
+/// Сырые `BLOB_*` из окружения.
+#[derive(Debug, Default)]
+struct BlobRawConfig {
+    enabled: Option<bool>,
+    dir: Option<String>,
+    max_size_bytes: Option<u64>,
+    max_ttl_secs: Option<u64>,
+    quota_per_owner_bytes: Option<u64>,
+    quota_per_pair_bytes: Option<u64>,
+    upload_bytes_per_day: Option<u64>,
+    disk_reserve_bytes: Option<u64>,
+    upload_stale_secs: Option<u64>,
+    tombstone_secs: Option<u64>,
+    max_sessions_per_user: Option<usize>,
+    chunk_max_bytes: Option<usize>,
+    get_window_bytes: Option<u64>,
+    sync_every_bytes: Option<u64>,
+    ops_per_sec: Option<u32>,
+    stat_per_sec: Option<u32>,
+}
+
+/// Собрать `BlobConfig` из env: умолчания, каталог под `STORAGE_PATH`,
+/// проверка значений, без которых хранилище работать не может.
+fn resolve_blobs(
+    raw: BlobRawConfig,
+    storage_path: &str,
+    max_frame_len: usize,
+) -> anyhow::Result<BlobConfig> {
+    let defaults = BlobConfig::default();
+    let positive = |value: Option<u64>, default: u64, name: &str| match value {
+        Some(0) => bail!("{name} must be greater than zero"),
+        Some(value) => Ok(value),
+        None => Ok(default),
+    };
+    let max_ttl_secs = positive(raw.max_ttl_secs, defaults.max_ttl_secs, "BLOB_MAX_TTL_SECS")?;
+    let chunk_max = raw.chunk_max_bytes.unwrap_or(defaults.chunk_max);
+    if chunk_max == 0 {
+        bail!("BLOB_CHUNK_MAX_BYTES must be greater than zero");
+    }
+    let reserve = crate::blob::BLOB_FRAME_RESERVE;
+    if chunk_max.saturating_add(reserve) > max_frame_len {
+        bail!(
+            "BLOB_CHUNK_MAX_BYTES ({chunk_max}) plus {reserve} bytes of frame overhead must fit \
+             MAX_FRAME_LEN ({max_frame_len})"
+        );
+    }
+    let dir = normalize_optional_text(raw.dir).unwrap_or_else(|| {
+        Path::new(storage_path)
+            .join("blobs")
+            .to_string_lossy()
+            .into_owned()
+    });
+    Ok(BlobConfig {
+        enabled: raw.enabled.unwrap_or(defaults.enabled),
+        dir,
+        max_size: raw.max_size_bytes.unwrap_or(defaults.max_size),
+        max_ttl_secs,
+        quota_per_owner: raw
+            .quota_per_owner_bytes
+            .unwrap_or(defaults.quota_per_owner),
+        quota_per_pair: raw.quota_per_pair_bytes.unwrap_or(defaults.quota_per_pair),
+        upload_bytes_per_day: raw
+            .upload_bytes_per_day
+            .unwrap_or(defaults.upload_bytes_per_day),
+        disk_reserve: raw.disk_reserve_bytes.unwrap_or(defaults.disk_reserve),
+        upload_stale_secs: positive(
+            raw.upload_stale_secs,
+            defaults.upload_stale_secs,
+            "BLOB_UPLOAD_STALE_SECS",
+        )?,
+        tombstone_secs: raw.tombstone_secs.unwrap_or(max_ttl_secs),
+        max_sessions_per_user: raw
+            .max_sessions_per_user
+            .unwrap_or(defaults.max_sessions_per_user),
+        chunk_max,
+        get_window: positive(
+            raw.get_window_bytes,
+            defaults.get_window,
+            "BLOB_GET_WINDOW_BYTES",
+        )?,
+        sync_every: positive(
+            raw.sync_every_bytes,
+            defaults.sync_every,
+            "BLOB_SYNC_EVERY_BYTES",
+        )?,
+        ops_per_sec: raw.ops_per_sec.unwrap_or(defaults.ops_per_sec),
+        stat_per_sec: raw.stat_per_sec.unwrap_or(defaults.stat_per_sec),
+    })
+}
+
 fn check_tcp_keepalive(limits: &LimitsConfig) -> anyhow::Result<()> {
     const MAX_SECS: u64 = 32_767;
     const MAX_RETRIES: u32 = 127;
@@ -1556,9 +1746,9 @@ fn check_tcp_keepalive(limits: &LimitsConfig) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_DELETED_RETENTION_DAYS, LimitsConfig, PushRawConfig, RetentionPolicy,
-        SledAckConfig, check_tcp_keepalive, parse_retention_policy, read_raw, resolve_delivery,
-        resolve_push, resolve_sled_ack,
+        BlobConfig, BlobRawConfig, DEFAULT_DELETED_RETENTION_DAYS, LimitsConfig, PushRawConfig,
+        RetentionPolicy, SledAckConfig, check_tcp_keepalive, parse_retention_policy, read_raw,
+        resolve_blobs, resolve_delivery, resolve_push, resolve_sled_ack,
     };
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -1850,6 +2040,100 @@ mod tests {
                 "expected {field} complaint, got: {err}"
             );
         }
+    }
+
+    /// Хранилище файлов по умолчанию: включено, каталог под
+    /// `STORAGE_PATH`, надгробия помнятся потолок срока.
+    #[test]
+    fn blob_defaults_follow_the_storage_path_and_ttl_ceiling() {
+        let cfg = resolve_blobs(BlobRawConfig::default(), "/srv/data", 8 * 1024 * 1024).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.dir, "/srv/data/blobs");
+        assert_eq!(cfg.max_size, 2 * 1024 * 1024 * 1024);
+        assert_eq!(cfg.max_ttl_secs, 30 * 86_400);
+        assert_eq!(cfg.tombstone_secs, cfg.max_ttl_secs);
+        assert_eq!(cfg.max_sessions_per_user, 4);
+        assert_eq!(cfg.stat_per_sec, 20);
+
+        let tuned = resolve_blobs(
+            BlobRawConfig {
+                enabled: Some(false),
+                dir: Some(" /mnt/blobs ".into()),
+                max_ttl_secs: Some(600),
+                chunk_max_bytes: Some(4096),
+                ..BlobRawConfig::default()
+            },
+            "/srv/data",
+            8 * 1024 * 1024,
+        )
+        .unwrap();
+        assert!(!tuned.enabled);
+        assert_eq!(tuned.dir, "/mnt/blobs");
+        assert_eq!(tuned.tombstone_secs, 600);
+        assert_eq!(tuned.chunk_max, 4096);
+    }
+
+    #[test]
+    fn blob_settings_that_cannot_work_are_refused() {
+        let frame = 1024 * 1024;
+        for (raw, field) in [
+            (
+                BlobRawConfig {
+                    max_ttl_secs: Some(0),
+                    ..BlobRawConfig::default()
+                },
+                "BLOB_MAX_TTL_SECS",
+            ),
+            (
+                BlobRawConfig {
+                    chunk_max_bytes: Some(0),
+                    ..BlobRawConfig::default()
+                },
+                "BLOB_CHUNK_MAX_BYTES",
+            ),
+            // Кусок по умолчанию (1 MiB) не влезает в кадр в 1 MiB.
+            (BlobRawConfig::default(), "MAX_FRAME_LEN"),
+            (
+                BlobRawConfig {
+                    chunk_max_bytes: Some(4096),
+                    upload_stale_secs: Some(0),
+                    ..BlobRawConfig::default()
+                },
+                "BLOB_UPLOAD_STALE_SECS",
+            ),
+            (
+                BlobRawConfig {
+                    chunk_max_bytes: Some(4096),
+                    get_window_bytes: Some(0),
+                    ..BlobRawConfig::default()
+                },
+                "BLOB_GET_WINDOW_BYTES",
+            ),
+            (
+                BlobRawConfig {
+                    chunk_max_bytes: Some(4096),
+                    sync_every_bytes: Some(0),
+                    ..BlobRawConfig::default()
+                },
+                "BLOB_SYNC_EVERY_BYTES",
+            ),
+        ] {
+            let err = resolve_blobs(raw, "data", frame).unwrap_err().to_string();
+            assert!(
+                err.contains(field),
+                "expected {field} complaint, got: {err}"
+            );
+        }
+    }
+
+    /// Кусок в снапшоте зажат потолком кадра: конфиг, собранный в обход
+    /// `load()`, не объявит кусок, который не влезет в кадр.
+    #[test]
+    fn announced_chunk_fits_the_frame() {
+        let blobs = BlobConfig::default();
+        assert_eq!(blobs.chunk_max_for(8 * 1024 * 1024), 1024 * 1024);
+        assert_eq!(blobs.chunk_max_for(64 * 1024), 64 * 1024 - 128);
+        assert_eq!(blobs.chunk_max_for(16), 1);
     }
 
     /// Ключи `.env` в верхнем регистре доходят до полей, окружение
