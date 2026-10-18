@@ -323,6 +323,14 @@ impl Storage {
         crate::state::cert_revocations::CertRevocationStore::open(&self.db)
     }
 
+    /// Хранилище файлов: метаданные в деревьях общей базы, байты — в
+    /// каталоге `cfg.dir`. Открывать один раз на процесс: при открытии
+    /// идёт сверка с каталогом, а в памяти живут замки скачиваний и
+    /// загрузок, общие для всех сессий.
+    pub fn blob_store(&self, cfg: &crate::config::BlobConfig) -> Result<crate::blob::BlobStore> {
+        crate::blob::BlobStore::open(&self.db, cfg)
+    }
+
     /// Same as `push_token_store`, for the `push_state` tree that persists
     /// push throttling counters across restarts.
     pub fn push_state_store(&self) -> Result<crate::state::push_state::PushStateStore> {

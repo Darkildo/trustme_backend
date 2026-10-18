@@ -3259,6 +3259,7 @@ dependencies = [
  "curve25519-dalek 5.0.0",
  "dashmap",
  "ed25519-dalek 3.0.0",
+ "fs2",
  "futures-util",
  "getrandom 0.4.3",
  "hex",
@@ -3277,6 +3278,7 @@ dependencies = [
  "sled",
  "snow",
  "socket2",
+ "subtle",
  "tokio",
  "tokio-util",
  "tonic",
@@ -3284,6 +3286,7 @@ dependencies = [
  "tonic-prost-build",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

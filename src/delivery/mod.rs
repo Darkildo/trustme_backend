@@ -1699,6 +1699,7 @@ mod tests {
     async fn jetstream_backend_refuses_to_start_without_a_broker() {
         let (storage, path) = temp_storage("jetstream_down");
         let cfg = Config {
+            blobs: crate::config::BlobConfig::default(),
             queue_addressing_enabled: false,
             device_cert_max_ttl: Duration::from_secs(30 * 24 * 3600),
             bind_addr: "127.0.0.1:0".to_string(),

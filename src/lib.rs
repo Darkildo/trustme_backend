@@ -1,3 +1,4 @@
+pub mod blob;
 pub mod config;
 pub mod delivery;
 pub mod domain;
