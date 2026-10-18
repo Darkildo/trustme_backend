@@ -27,6 +27,7 @@ FAST_SCENARIOS=(
   "device_routing"
   "probe_config"
   "probe_tofu"
+  "blob_roundtrip"
 )
 SLOW_SCENARIOS=(
   "no_dup_after_ack"
