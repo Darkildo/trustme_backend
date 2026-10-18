@@ -376,6 +376,18 @@ docker exec prometheus wget -qO- http://127.0.0.1:9090/api/v1/rules \
 
 ## Проверка живого развёртывания
 
+Первым делом — `tmnode doctor` на хосте ноды. Он проверяет только на
+чтение контейнер, окружение, каталог данных, ключ, диск, резерв под файлы,
+память, часы, а затем подключается к ноде как клиент
+([tmnode.md](tmnode.md)):
+
+```bash
+cargo build --release -p tmnode
+sudo target/release/tmnode doctor
+```
+
+Сценарии ниже проверяют поведение протокола.
+
 ```bash
 # все сценарии против ноды
 bash examples/run_all.sh --message <host:port> --node-key <hex>

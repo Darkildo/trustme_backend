@@ -22,10 +22,14 @@ WORKDIR /app
 # то есть самим cargo. Всё, что нужно сборке, приезжает с зависимостями.
 
 # Pre-cache dependencies.
+# Манифест tmnode нужен cargo, чтобы прочитать workspace; в образ tmnode
+# не собирается.
 COPY Cargo.toml Cargo.lock build.rs ./
+COPY tmnode/Cargo.toml ./tmnode/
 COPY schemas ./schemas
-RUN mkdir src \
+RUN mkdir -p src tmnode/src \
     && echo 'fn main() {}' > src/main.rs \
+    && echo 'fn main() {}' > tmnode/src/main.rs \
     && cargo fetch --locked
 
 # Build the real binary.

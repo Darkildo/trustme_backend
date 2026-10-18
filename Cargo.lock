@@ -2948,6 +2948,21 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
+name = "tmnode"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "fs2",
+ "hex",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "trust_message_tcp",
+ "zeroize",
+]
+
+[[package]]
 name = "tokio"
 version = "1.53.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
