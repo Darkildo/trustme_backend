@@ -14,7 +14,7 @@ members = [".", "tmnode"]
 # Одна версия на релиз: тег vX.Y.Z — и нода, и tmnode X.Y.Z. По ней агент
 # находит свой бинарь в GitHub Releases (docs/agent-protocol.md).
 [workspace.package]
-version = "0.6.0"
+version = "0.7.0"
 
 [dependencies]
 tokio = { version = "1.49.0", features = ["full"] }        # async runtime, TcpListener/TcpStream
