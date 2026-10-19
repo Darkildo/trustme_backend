@@ -60,6 +60,12 @@ curl -fsSL https://raw.githubusercontent.com/Darkildo/trustme_backend/stable/dep
 
 Токен подключения одноразовый: повтор получает `401`.
 
+`node_id` — строка из a-z, 0-9 и `-`, до 64 символов: так его пишет
+`node.toml`. `tmnode` приводит его к нижнему регистру (ULID к регистру
+нечувствителен). Если id и после этого не подходит, `tmnode enroll`
+завершается ошибкой до установки ноды: агент с таким `node.toml` не
+работал бы.
+
 Что делает `tmnode enroll`:
 
 1. Сохраняет `agent_token` в `/etc/tmnode/agent.toml` (права 0600).

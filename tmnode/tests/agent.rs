@@ -12,7 +12,7 @@ use std::time::Duration;
 use anyhow::{Result, bail};
 use tmnode::agent::{self, AdminApi, AgentConfig, HttpAdmin};
 use tmnode::install::{Layout, Runner};
-use tmnode::node_config::Backend;
+use tmnode::node_config::{Backend, NodeConfig};
 use tmnode::ops::{self, EnrollArgs};
 use tmnode::protocol::{
     EnrollRequest, EnrollResponse, Heartbeat, HeartbeatResponse, InstallSpec, RuntimeDoc,
@@ -62,6 +62,8 @@ struct FakeAdmin {
     enrolled: RefCell<Vec<EnrollRequest>>,
     beats: RefCell<Vec<Heartbeat>>,
     runtime: RefCell<Option<RuntimeDoc>>,
+    /// Какой `node_id` выдаёт enroll.
+    node_id: RefCell<String>,
 }
 
 impl FakeAdmin {
@@ -70,6 +72,7 @@ impl FakeAdmin {
             enrolled: RefCell::new(Vec::new()),
             beats: RefCell::new(Vec::new()),
             runtime: RefCell::new(None),
+            node_id: RefCell::new("01node".into()),
         }
     }
 }
@@ -83,7 +86,7 @@ impl AdminApi for FakeAdmin {
         Ok(EnrollResponse {
             agent_id: "agent-1".into(),
             agent_token: "tma_secret".into(),
-            node_id: "01NODE".into(),
+            node_id: self.node_id.borrow().clone(),
             node_name: "Офис".into(),
             install: InstallSpec {
                 image: "ghcr.io/darkildo/trustme_backend:v0.6.0".into(),
@@ -159,7 +162,7 @@ async fn enroll_installs_and_remembers_the_agent() {
     let files = runner.files.borrow().clone();
     assert_eq!(files[&AgentConfig::path(&layout)].1, 0o600);
     let node_toml = &files[&layout.etc_dir.join("node.toml")].0;
-    assert!(node_toml.contains("mode = \"managed\"") && node_toml.contains("01NODE"));
+    assert!(node_toml.contains("mode = \"managed\"") && node_toml.contains("01node"));
     assert!(
         files[&layout.data_dir.join("runtime.toml")]
             .0
@@ -194,6 +197,64 @@ async fn enroll_installs_and_remembers_the_agent() {
             .is_none()
     );
     assert!(AgentConfig::load(&MemRunner::default(), &layout).is_err());
+}
+
+fn enroll_args() -> EnrollArgs {
+    EnrollArgs {
+        url: "https://admin.example.org".into(),
+        token: "tme_good".into(),
+        no_install: false,
+    }
+}
+
+#[tokio::test]
+async fn uppercase_ulid_from_the_panel_becomes_a_valid_node_id() {
+    let layout = temp_layout("enroll_ulid");
+    let runner = MemRunner::default();
+    let admin = FakeAdmin::new();
+    *admin.node_id.borrow_mut() = "01M59VPQM9K99KVS9ZJ3F70YMG".into();
+    ops::enroll_and_install(&admin, &runner, &layout, &enroll_args(), "srv-1", "t")
+        .await
+        .unwrap()
+        .unwrap();
+
+    // Тот же файл, что потом читают агент и doctor, — с диска.
+    let path = layout.etc_dir.join("node.toml");
+    std::fs::write(&path, &runner.files.borrow()[&path].0).unwrap();
+    let config = NodeConfig::load(&path).unwrap();
+    assert_eq!(
+        config.node.id.as_deref(),
+        Some("01m59vpqm9k99kvs9zj3f70ymg")
+    );
+}
+
+#[tokio::test]
+async fn enroll_refuses_a_node_id_that_node_toml_would_reject() {
+    for bad in ["node_01".to_owned(), "a".repeat(65)] {
+        let layout = temp_layout("enroll_bad_id");
+        let runner = MemRunner::default();
+        let admin = FakeAdmin::new();
+        *admin.node_id.borrow_mut() = bad.clone();
+        let err = ops::enroll_and_install(&admin, &runner, &layout, &enroll_args(), "srv-1", "t")
+            .await
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("node.id"), "{bad}: {err:#}");
+
+        // Ни конфига, ни ноды, ни службы агента.
+        assert!(
+            !runner
+                .files
+                .borrow()
+                .contains_key(&layout.etc_dir.join("node.toml"))
+        );
+        let commands = runner.commands.borrow();
+        assert!(
+            !commands
+                .iter()
+                .any(|c| c.starts_with("docker") || c.starts_with("systemctl")),
+            "{commands:?}"
+        );
+    }
 }
 
 #[tokio::test]
