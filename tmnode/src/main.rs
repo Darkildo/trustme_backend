@@ -38,7 +38,7 @@ async fn run_ops(args: &[String]) -> i32 {
     use tmnode::ops;
 
     let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
-    let layout = Layout::default();
+    let layout = Layout::from_env(|key| std::env::var(key).ok());
     let runner = HostRunner;
     let usage = |msg: String| {
         eprintln!("tmnode: {msg}\n\nСправка: tmnode help");
