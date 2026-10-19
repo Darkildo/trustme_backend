@@ -71,6 +71,13 @@ pub trait Runner {
     fn write_file(&self, path: &Path, contents: &[u8], mode: u32, uid: Option<u32>) -> Result<()>;
     fn create_dir(&self, path: &Path, uid: Option<u32>) -> Result<()>;
     fn read_file(&self, path: &Path) -> Result<Option<String>>;
+    /// Переименовать файл. В пределах одного каталога — атомарно: так
+    /// подменяется бинарь `tmnode`.
+    fn rename(&self, from: &Path, to: &Path) -> Result<()>;
+    /// Скопировать файл с правами; копия появляется целиком или никак.
+    fn copy_file(&self, from: &Path, to: &Path) -> Result<()>;
+    /// Удалить файл; файла нет — не ошибка.
+    fn remove_file(&self, path: &Path) -> Result<()>;
     fn sleep(&self, duration: Duration);
 }
 
@@ -143,6 +150,29 @@ impl Runner for HostRunner {
             Ok(text) => Ok(Some(text)),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(err) => Err(err).with_context(|| format!("чтение {}", path.display())),
+        }
+    }
+
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        std::fs::rename(from, to)
+            .with_context(|| format!("переименование {} в {}", from.display(), to.display()))
+    }
+
+    fn copy_file(&self, from: &Path, to: &Path) -> Result<()> {
+        let mut tmp = to.as_os_str().to_owned();
+        tmp.push(".tmnode-copy");
+        let tmp = PathBuf::from(tmp);
+        std::fs::copy(from, &tmp)
+            .with_context(|| format!("копирование {} в {}", from.display(), tmp.display()))?;
+        std::fs::rename(&tmp, to).with_context(|| format!("запись {}", to.display()))
+    }
+
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        match std::fs::remove_file(path) {
+            Err(err) if err.kind() != std::io::ErrorKind::NotFound => {
+                Err(err).with_context(|| format!("удаление {}", path.display()))
+            }
+            _ => Ok(()),
         }
     }
 
@@ -554,6 +584,33 @@ mod tests {
             Ok(self.files.borrow().get(path).map(|f| f.0.clone()))
         }
 
+        fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+            let file = self.files.borrow_mut().remove(from);
+            match file {
+                Some(file) => {
+                    self.files.borrow_mut().insert(to.to_owned(), file);
+                    Ok(())
+                }
+                None => bail!("нет {}", from.display()),
+            }
+        }
+
+        fn copy_file(&self, from: &Path, to: &Path) -> Result<()> {
+            let file = self.files.borrow().get(from).cloned();
+            match file {
+                Some(file) => {
+                    self.files.borrow_mut().insert(to.to_owned(), file);
+                    Ok(())
+                }
+                None => bail!("нет {}", from.display()),
+            }
+        }
+
+        fn remove_file(&self, path: &Path) -> Result<()> {
+            self.files.borrow_mut().remove(path);
+            Ok(())
+        }
+
         fn sleep(&self, _duration: Duration) {}
     }
 
@@ -790,6 +847,22 @@ mod tests {
         let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
         assert!(host.read_file(&dir.join("nope")).unwrap().is_none());
+        host.copy_file(&file, &dir.join("copy")).unwrap();
+        let mode = std::fs::metadata(dir.join("copy"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        host.rename(&dir.join("copy"), &dir.join("moved")).unwrap();
+        assert_eq!(
+            host.read_file(&dir.join("moved")).unwrap().as_deref(),
+            Some("hello")
+        );
+        host.remove_file(&dir.join("moved")).unwrap();
+        host.remove_file(&dir.join("moved")).unwrap();
+        assert!(host.read_file(&dir.join("moved")).unwrap().is_none());
+        assert!(host.rename(&dir.join("nope"), &dir.join("x")).is_err());
         assert_eq!(host.run("echo", &["hi".into()]).unwrap().trim(), "hi");
         assert!(host.run("false", &[]).is_err());
         assert!(host.run("/nonexistent/program", &[]).is_err());
@@ -817,6 +890,9 @@ mod tests {
             .0
             .clone();
         assert!(unit.contains("ExecStart=/usr/local/bin/tmnode agent"));
+        // Самообновление: агент завершается после замены бинаря, служба
+        // поднимается уже новым — при любом коде выхода.
+        assert!(unit.contains("Restart=always\n"));
         assert_eq!(
             runner.commands.borrow().last().unwrap(),
             "systemctl enable --now tmnode-agent.service"
