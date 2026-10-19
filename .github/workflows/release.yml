@@ -38,11 +38,20 @@ jobs:
       - name: Build
         run: cargo build --release --locked -p tmnode
 
+      # Версия tmnode — версия релиза: по ней агент находит бинарь
+      # (`<релизы>/v<tmnode.version>/`) и сверяет `tmnode version`.
       - name: Package
+        env:
+          TAG: ${{ github.ref_name }}
         run: |
           mkdir -p dist
           cp target/release/tmnode "dist/tmnode-${{ matrix.arch }}-linux"
-          "dist/tmnode-${{ matrix.arch }}-linux" version
+          printed="$("dist/tmnode-${{ matrix.arch }}-linux" version)"
+          echo "$printed"
+          if [ "$printed" != "tmnode ${TAG#v}" ]; then
+            echo "tmnode печатает «$printed», а тег — $TAG: поднимите [workspace.package] version"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:

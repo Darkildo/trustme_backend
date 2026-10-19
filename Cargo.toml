@@ -1,6 +1,6 @@
 [package]
 name = "trust_message_tcp"
-version = "0.6.0"
+version.workspace = true
 edition = "2024"
 license-file = "LICENSE"
 repository = "https://github.com/Darkildo/trustme_backend"
@@ -10,6 +10,11 @@ publish = false
 # конфига ноды. Образ ноды собирает только корневой пакет.
 [workspace]
 members = [".", "tmnode"]
+
+# Одна версия на релиз: тег vX.Y.Z — и нода, и tmnode X.Y.Z. По ней агент
+# находит свой бинарь в GitHub Releases (docs/agent-protocol.md).
+[workspace.package]
+version = "0.6.0"
 
 [dependencies]
 tokio = { version = "1.49.0", features = ["full"] }        # async runtime, TcpListener/TcpStream
