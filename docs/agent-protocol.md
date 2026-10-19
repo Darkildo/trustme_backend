@@ -138,9 +138,13 @@ heartbeat раз в `interval_secs`. Пределы, которые агент �
 
 ## Обновление
 
-С `tmnode` 0.3.0 админка обновляет ноду и сам `tmnode` до версий из
-релиза бэкенда. Поля в heartbeat необязательные. Агент до 0.3.0 задание
-не видит. Админка до 0.3.0 не видит статуса.
+С `tmnode` 0.7.0 админка обновляет ноду и сам `tmnode` до версий из
+релиза бэкенда. Поля в heartbeat необязательные. Агент до 0.7.0 задание
+не видит. Админка до 0.7.0 не видит статуса.
+
+**Версии.** С 0.7.0 версия `tmnode` совпадает с версией релиза бэкенда,
+в котором он вышел: в релизе `v0.8.0` и нода, и `tmnode` — 0.8.0. До
+этого у `tmnode` была своя нумерация (0.2.0 вышел в `v0.6.0`).
 
 **Задание** приходит в ответе heartbeat:
 
@@ -150,8 +154,8 @@ heartbeat раз в `interval_secs`. Пределы, которые агент �
   "runtime": { "version": "…", "content": "…" },
   "update": {
     "id": "01jb…",
-    "node_version": "0.7.0",
-    "tmnode": { "version": "0.3.0", "sha256": "…" },
+    "node_version": "0.8.0",
+    "tmnode": { "version": "0.8.0", "sha256": "…" },
     "allow_downgrade": false
   }
 }
@@ -164,8 +168,8 @@ heartbeat раз в `interval_secs`. Пределы, которые агент �
 
 ```json
 {
-  "tmnode_version": "0.3.0",
-  "node_image": "ghcr.io/darkildo/trustme_backend:v0.7.0",
+  "tmnode_version": "0.8.0",
+  "node_image": "ghcr.io/darkildo/trustme_backend:v0.8.0",
   "update": {
     "id": "01jb…",
     "state": "succeeded",
@@ -173,10 +177,10 @@ heartbeat раз в `interval_secs`. Пределы, которые агент �
     "error": null,
     "started_at": 1792443630,
     "finished_at": 1792443702,
-    "from_node_image": "ghcr.io/darkildo/trustme_backend:v0.6.0",
-    "node_image": "ghcr.io/darkildo/trustme_backend:v0.7.0",
-    "from_tmnode": "0.2.1",
-    "tmnode": "0.3.0"
+    "from_node_image": "ghcr.io/darkildo/trustme_backend:v0.7.0",
+    "node_image": "ghcr.io/darkildo/trustme_backend:v0.8.0",
+    "from_tmnode": "0.7.0",
+    "tmnode": "0.8.0"
   }
 }
 ```
@@ -196,17 +200,14 @@ heartbeat раз в `interval_secs`. Пределы, которые агент �
 - Образ ноды: `<репозиторий образов>:v<node_version>`. Репозиторий по
   умолчанию — `ghcr.io/darkildo/trustme_backend`. Переопределяется
   переменной `TMNODE_IMAGE_REPO` в юните агента.
-- `tmnode`: `<релизы>/v<релиз>/tmnode-<arch>-linux` и `SHA256SUMS` рядом.
+- `tmnode`: `<релизы>/v<tmnode.version>/tmnode-<arch>-linux` и
+  `SHA256SUMS` рядом.
   Адрес релизов по умолчанию —
   `https://github.com/Darkildo/trustme_backend/releases/download`.
   Переопределяется переменной `TMNODE_RELEASES_URL`.
-- `<релиз>` — версия бэкенда, а не `tmnode.version`: `release.yml`
-  кладёт бинарь в релиз бэкенда (`tmnode` 0.3.0 лежит в `v0.7.0`). Агент
-  берёт `node_version` из задания, а если её нет — версию, на которой нода
-  работает сейчас (тег образа `vX.Y.Z`). Задание только на `tmnode` для
-  ноды на образе без версии (`:stable`) получает `refused`: релиз не
-  известен. Админке надёжнее присылать `tmnode` вместе с `node_version`
-  того же релиза — совпадение с текущей версией ноду не трогает.
+- Версия `tmnode` совпадает с версией релиза бэкенда, в котором он
+  вышел, поэтому релиз — это `tmnode.version`. Задание только на
+  `tmnode` от образа ноды не зависит: подходит и для ноды на `:stable`.
 - Хэш бинаря должен совпасть дважды: со строкой в `SHA256SUMS` и с
   `tmnode.sha256` из задания.
 
@@ -292,7 +293,7 @@ heartbeat, пока админка присылает задание; первы
 Служба агента и `tmnode update` не работают одновременно — их разводит
 блокировка `/etc/tmnode/update.lock`.
 
-**Агенты до 0.3.0** задание не видят. Обновить их можно только на
+**Агенты до 0.7.0** задание не видят. Обновить их можно только на
 сервере:
 
     curl -fsSL https://raw.githubusercontent.com/Darkildo/trustme_backend/stable/deploy/install.sh \
