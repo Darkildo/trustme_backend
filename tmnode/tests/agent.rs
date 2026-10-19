@@ -104,6 +104,7 @@ impl AdminApi for FakeAdmin {
         Ok(HeartbeatResponse {
             interval_secs: 1,
             runtime: self.runtime.borrow().clone(),
+            update: None,
         })
     }
 }
@@ -370,6 +371,8 @@ async fn http_client_speaks_the_protocol() {
         node_key: None,
         report: None,
         runtime_status: None,
+        node_image: None,
+        update: None,
     };
     let reply = api.heartbeat(&beat).await.unwrap();
     assert_eq!(reply.interval_secs, 30);
