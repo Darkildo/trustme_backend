@@ -3296,6 +3296,7 @@ dependencies = [
  "subtle",
  "tokio",
  "tokio-util",
+ "toml",
  "tonic",
  "tonic-prost",
  "tonic-prost-build",

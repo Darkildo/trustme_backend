@@ -1,4 +1,5 @@
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -7,12 +8,13 @@ use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
 use tracing::{error, info, warn};
 use trust_message_tcp::delivery::DeliveryBackend;
-use trust_message_tcp::net::listener::accept_loop;
+use trust_message_tcp::net::listener::{Live, accept_loop_live};
 use trust_message_tcp::net::noise::NodeIdentity;
 use trust_message_tcp::push::{
     ApnsEnvironment, ApnsVoipClient, FcmHttpV1Client, MockTransport, PushGatewayClient,
     PushScheduler, PushStatePersistence,
 };
+use trust_message_tcp::runtime::{self, Reloader};
 use trust_message_tcp::state::{
     push_tokens::PushTokenStore, registry::ConnRegistry, storage::Storage,
 };
@@ -28,6 +30,13 @@ async fn main() -> Result<()> {
     let mut cfg = config::load()?;
     apply_cli_overrides(&mut cfg).context("failed to apply command-line overrides")?;
     observability::init_metrics(&cfg.metrics);
+
+    // Настройки без перезапуска (docs/runtime-config.md): файл ложится
+    // поверх окружения до того, как по конфигу откроются хранилища. Неверный
+    // файл не мешает старту — нода поднимается на настройках окружения.
+    let env_cfg = cfg.clone();
+    let runtime_path = PathBuf::from(&cfg.runtime_config_path);
+    let runtime_status = runtime::apply_at_startup(&mut cfg, &runtime_path);
 
     // Identity ноды — один Ed25519-ключ: из него выводится X25519-статик
     // для Noise IK, им же подписываются снапшот конфигурации и запросы к
@@ -93,7 +102,9 @@ async fn main() -> Result<()> {
     // планировщик пушей работают до выхода из `main` и отменяются вместе с
     // рантаймом. Останавливается только приём новых.
     let storage_for_shutdown = storage.clone();
-    let server = tokio::spawn(accept_loop(
+    let live = Live::new(&cfg, blobs);
+    Reloader::new(runtime_path, env_cfg, &cfg, live.clone(), &runtime_status).spawn();
+    let server = tokio::spawn(accept_loop_live(
         listener,
         registry,
         storage,
@@ -102,7 +113,7 @@ async fn main() -> Result<()> {
         push_scheduler,
         node,
         cfg,
-        blobs,
+        live,
     ));
 
     let outcome = run_until_shutdown(server, shutdown_signal()).await;

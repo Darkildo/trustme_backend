@@ -7,7 +7,7 @@ use tokio::{net::TcpStream, select, sync::mpsc};
 use tracing::{debug, error, info, warn};
 
 use crate::blob::BlobStore;
-use crate::config::ServerConfigSnapshot;
+use crate::config::SharedServerConfig;
 use crate::delivery::DeliveryBackend;
 use crate::delivery::sled_ack::{Offer, SledSession, WriteDecision};
 use crate::domain::priority::MessagePriority;
@@ -64,7 +64,7 @@ pub async fn handle_conn(
     push_scheduler: PushScheduler,
     node: Arc<NodeIdentity>,
     handshake_policy: HandshakePolicy,
-    server_config: ServerConfigSnapshot,
+    shared_config: SharedServerConfig,
     limits: Arc<SessionLimits>,
     admission_guard: AdmissionGuard,
     blobs: Option<BlobStore>,
@@ -75,8 +75,11 @@ pub async fn handle_conn(
     // после первого открытия — это клон Arc.
     let queues = storage.queue_store()?;
     let cert_revocations = storage.cert_revocation_store()?;
+    // Снимок на сессию: эти возможности меняются только перезапуском. Сам
+    // подписанный конфиг клиент получает из живого снапшота — с текущими
+    // лимитами.
+    let server_config = shared_config.current();
     let device_cert_max_ttl_secs = server_config.device_cert_max_ttl.as_secs();
-    let max_queues = limits.cfg.max_queues_per_user;
     let queue_addressing = server_config.supports_queue_addressing;
 
     // Сессия начинается с Noise-хендшейка; после него identity клиента
@@ -138,9 +141,6 @@ pub async fn handle_conn(
         chunk_max: server_config
             .blobs
             .map_or(1, |announced| announced.chunk_max as usize),
-        max_sessions_per_user: blobs
-            .as_ref()
-            .map_or(0, |store| store.config().max_sessions_per_user),
         store: blobs,
         limits: limits.clone(),
     };
@@ -153,9 +153,9 @@ pub async fn handle_conn(
             registry,
             cert_revocations,
             blob_ctx,
-            server_config,
+            shared_config,
             node,
-            Duration::from_secs(limits.cfg.session_confirm_timeout_secs),
+            Duration::from_secs(limits.cfg().session_confirm_timeout_secs),
             admission_guard,
         )
         .await;
@@ -195,7 +195,7 @@ pub async fn handle_conn(
     // Место на входе держится до подтверждения: неподтверждённое соединение
     // ещё не учтено лимитом сессий, и без входа повторы не ограничивало бы
     // ничто.
-    let confirm_timeout = Duration::from_secs(limits.cfg.session_confirm_timeout_secs);
+    let confirm_timeout = Duration::from_secs(limits.cfg().session_confirm_timeout_secs);
     let Some(confirming_frame) =
         await_session_confirmation(&mut framed, &user_id, device_id, confirm_timeout).await?
     else {
@@ -268,10 +268,10 @@ pub async fn handle_conn(
     let mut messages_rejected = 0u64;
     // Пер-соединение окно Ping: флудер перестаёт получать pong, честный
     // keepalive-клиент проверки не замечает.
-    let mut ping_gate = PingGate::new(limits.cfg.ping_per_sec);
+    let mut ping_gate = PingGate::new(limits.cfg().ping_per_sec);
     // То же окно для управляющих кадров очередей: каждый — транзакция или
     // скан хранилища.
-    let mut control_gate = PingGate::new(limits.cfg.control_per_sec);
+    let mut control_gate = PingGate::new(limits.cfg().control_per_sec);
 
     if delivery_backend.is_jetstream() {
         // Always invoke; start_scope_pump dedupes via `pumps` map and revives
@@ -646,7 +646,7 @@ pub async fn handle_conn(
                   debug!(
                       user = %hex::encode(user_id),
                       ?device_id,
-                      limit = limits.cfg.control_per_sec,
+                      limit = limits.cfg().control_per_sec,
                       "control frame rate limit exceeded"
                   );
                   framed
@@ -1184,7 +1184,7 @@ pub async fn handle_conn(
                           observability::observe_ping_dropped();
                           debug!(
                               user = %hex::encode(user_id),
-                              limit = limits.cfg.ping_per_sec,
+                              limit = limits.cfg().ping_per_sec,
                               "ping rate limit exceeded; pong suppressed"
                           );
                           continue;
@@ -1196,7 +1196,7 @@ pub async fn handle_conn(
                   }
                   ClientFrame::GetServerConfig => {
                       let response =
-                          encode_signed_server_config(&server_config, &node, unix_now_secs());
+                          encode_signed_server_config(&shared_config.current(), &node, unix_now_secs());
                       framed.send_frame(&response).await?;
                       debug!(user = %hex::encode(user_id), "sent server config to authenticated client");
                   }
@@ -1223,7 +1223,7 @@ pub async fn handle_conn(
                           (Some(current_device_id), Some(platform)) => register_push_token(
                               &push_tokens,
                               &push_scheduler,
-                              limits.cfg.max_push_devices_per_user,
+                              limits.cfg().max_push_devices_per_user,
                               &user_id,
                               current_device_id,
                               platform,
@@ -1296,7 +1296,7 @@ pub async fn handle_conn(
                                       encode_queue_ack(false, None, WireQueueRejectReason::Internal)
                                   }
                                   Ok(queue_id) => {
-                                      match queues.allocate(&user_id, queue_id, params, now, max_queues) {
+                                      match queues.allocate(&user_id, queue_id, params, now, limits.cfg().max_queues_per_user) {
                                           Ok(Ok(record)) => {
                                               debug!(
                                                   user = %hex::encode(user_id),
@@ -1874,7 +1874,9 @@ fn precheck_send(
         return Some(SendRejectReason::TooLarge);
     }
 
-    if limits.cfg.ttl_min_seconds > 0 && ttl_seconds > 0 && ttl_seconds < limits.cfg.ttl_min_seconds
+    if limits.cfg().ttl_min_seconds > 0
+        && ttl_seconds > 0
+        && ttl_seconds < limits.cfg().ttl_min_seconds
     {
         return Some(SendRejectReason::InvalidTtl);
     }
@@ -1901,7 +1903,7 @@ fn queue_quota_reason(
     sender: &UserId,
     pair_ceiling: u64,
 ) -> Result<QuotaVerdict> {
-    let cfg = &limits.cfg;
+    let cfg = limits.cfg();
     let ceilings = QueueQuotaCeilings {
         messages: cfg.max_messages_per_queue as u64,
         bytes: cfg.max_bytes_per_queue,
@@ -1960,7 +1962,7 @@ fn sender_pair_ceiling(
     recipient_online: bool,
     ack: Option<crate::config::SledAckConfig>,
 ) -> u64 {
-    let base = limits.cfg.max_messages_sender_pair as u64;
+    let base = limits.cfg().max_messages_sender_pair as u64;
     match ack {
         Some(ack) if recipient_online && base > 0 => base.saturating_add(ack.max_unacked as u64),
         _ => base,
@@ -2075,7 +2077,7 @@ async fn refuse_over_session_limit(
     limits: &SessionLimits,
     user_id: &UserId,
 ) -> Result<()> {
-    let limit = limits.cfg.max_sessions_per_user;
+    let limit = limits.cfg().max_sessions_per_user;
     if limit == 0 || registry.session_count(user_id) < limit {
         return Ok(());
     }
@@ -2944,7 +2946,7 @@ mod tests {
                 &recipient,
                 None,
                 &sender,
-                limits.cfg.max_messages_sender_pair as u64
+                limits.cfg().max_messages_sender_pair as u64
             )
             .unwrap()
             .reason,
@@ -2958,7 +2960,7 @@ mod tests {
                 &[7u8; 32],
                 None,
                 &sender,
-                limits.cfg.max_messages_sender_pair as u64
+                limits.cfg().max_messages_sender_pair as u64
             )
             .unwrap()
             .reason,
@@ -2993,7 +2995,7 @@ mod tests {
                 &recipient,
                 None,
                 &sender,
-                limits.cfg.max_messages_sender_pair as u64
+                limits.cfg().max_messages_sender_pair as u64
             )
             .unwrap()
             .reason,
@@ -3032,7 +3034,7 @@ mod tests {
                 &recipient,
                 None,
                 &loud,
-                limits.cfg.max_messages_sender_pair as u64
+                limits.cfg().max_messages_sender_pair as u64
             )
             .unwrap()
             .reason,
@@ -3046,7 +3048,7 @@ mod tests {
                 &recipient,
                 None,
                 &quiet,
-                limits.cfg.max_messages_sender_pair as u64
+                limits.cfg().max_messages_sender_pair as u64
             )
             .unwrap()
             .reason,
@@ -3130,7 +3132,7 @@ mod tests {
                 &recipient,
                 None,
                 &sender,
-                limits.cfg.max_messages_sender_pair as u64,
+                limits.cfg().max_messages_sender_pair as u64,
             )
             .unwrap()
             .reason
@@ -3169,7 +3171,7 @@ mod tests {
                 &recipient,
                 None,
                 &sender,
-                limits.cfg.max_messages_sender_pair as u64
+                limits.cfg().max_messages_sender_pair as u64
             )
             .unwrap()
             .reason,
@@ -3182,7 +3184,7 @@ mod tests {
                 &recipient,
                 Some(7),
                 &sender,
-                limits.cfg.max_messages_sender_pair as u64
+                limits.cfg().max_messages_sender_pair as u64
             )
             .unwrap()
             .reason,
@@ -3219,7 +3221,7 @@ mod tests {
                 &recipient,
                 None,
                 &sender,
-                limits.cfg.max_messages_sender_pair as u64
+                limits.cfg().max_messages_sender_pair as u64
             )
             .unwrap()
             .reason,

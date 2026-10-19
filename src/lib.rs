@@ -5,6 +5,7 @@ pub mod domain;
 pub mod net;
 pub mod observability;
 pub mod push;
+pub mod runtime;
 pub mod state;
 
 /// Код, сгенерированный из `schemas/trustmessage/**.proto`. Дерево модулей

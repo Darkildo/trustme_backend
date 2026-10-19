@@ -4,17 +4,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use crate::blob::BlobStore;
-use crate::config::{Config, LimitsConfig};
+use crate::config::{Config, LimitsConfig, SharedServerConfig};
 use crate::delivery::DeliveryBackend;
 use crate::net::conn::handle_conn;
 use crate::net::noise::{HandshakePolicy, NodeIdentity};
-use crate::net::rate_limit::{HandshakeAdmission, SessionLimits};
+use crate::net::rate_limit::{HandshakeAdmission, LiveGate, SessionLimits};
 use crate::observability;
 use crate::push::PushScheduler;
 use crate::state::{push_tokens::PushTokenStore, registry::ConnRegistry, storage::Storage};
 use socket2::{SockRef, TcpKeepalive};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Semaphore;
 use tracing::{debug, error, info, warn};
 
 /// Первая пауза после ошибки `accept`, не связанной с конкретным
@@ -23,6 +22,58 @@ const ACCEPT_BACKOFF_INITIAL: Duration = Duration::from_millis(100);
 /// Потолок паузы: при затяжной нехватке дескрипторов цикл просыпается раз в
 /// секунду — и сразу замечает, что они освободились.
 const ACCEPT_BACKOFF_MAX: Duration = Duration::from_secs(1);
+
+/// Настройки входа и сессий, которые меняются без перезапуска
+/// (`runtime.toml`, docs/runtime-config.md). Общие для всех соединений.
+pub struct Live {
+    /// Один на процесс: rate-limiter отправки считает бюджет пользователя,
+    /// а не соединения — на сессию его дробить нельзя.
+    pub limits: Arc<SessionLimits>,
+    /// Вход на хендшейк считается до крипты: респондер платит DH за любого,
+    /// кто открыл сокет, поэтому ограничение живёт здесь, а не внутри
+    /// `handle_conn`.
+    pub admission: Arc<HandshakeAdmission>,
+    /// Потолок открытых соединений. Лимит хендшейков ограничивает только
+    /// вход, а сессий на пользователя — только одного пользователя; без
+    /// общего потолка число задач и буферов растёт, пока не кончится память
+    /// или дескрипторы. Место держится всё время жизни соединения. Потолка
+    /// на IP у установленных сессий нет намеренно: за carrier-grade NAT с
+    /// одного адреса приходят сотни честных устройств.
+    pub connections: Arc<LiveGate>,
+    pub server_config: SharedServerConfig,
+    pub blobs: Option<BlobStore>,
+}
+
+impl Live {
+    pub fn new(cfg: &Config, blobs: Option<BlobStore>) -> Arc<Self> {
+        Arc::new(Self {
+            limits: Arc::new(SessionLimits::for_node(cfg.limits, &cfg.blobs)),
+            admission: Arc::new(HandshakeAdmission::new(
+                cfg.limits.handshake_max_inflight,
+                cfg.limits.handshake_max_inflight_per_ip,
+            )),
+            connections: Arc::new(LiveGate::new(cfg.limits.max_connections)),
+            server_config: SharedServerConfig::new(cfg.server_config_snapshot()),
+            blobs,
+        })
+    }
+
+    /// Применить новые лимиты ко всем живым частям. `cfg` — уже
+    /// проверенный конфиг, где значения «только после перезапуска» равны
+    /// текущим.
+    pub fn apply(&self, cfg: &Config) {
+        self.limits.apply(cfg.limits, &cfg.blobs);
+        self.admission.set_limits(
+            cfg.limits.handshake_max_inflight,
+            cfg.limits.handshake_max_inflight_per_ip,
+        );
+        self.connections.set_limit(cfg.limits.max_connections);
+        if let Some(store) = &self.blobs {
+            store.set_config(&cfg.blobs);
+        }
+        self.server_config.replace(cfg.server_config_snapshot());
+    }
+}
 
 #[allow(clippy::too_many_arguments)]
 pub async fn accept_loop(
@@ -36,36 +87,41 @@ pub async fn accept_loop(
     cfg: Config,
     blobs: Option<BlobStore>,
 ) {
-    let server_config = cfg.server_config_snapshot();
+    let live = Live::new(&cfg, blobs);
+    accept_loop_live(
+        listener,
+        registry,
+        storage,
+        delivery_backend,
+        push_tokens,
+        push_scheduler,
+        node,
+        cfg,
+        live,
+    )
+    .await
+}
+
+/// То же с живыми настройками, которые снаружи меняет перечитывание
+/// `runtime.toml`.
+#[allow(clippy::too_many_arguments)]
+pub async fn accept_loop_live(
+    listener: TcpListener,
+    registry: ConnRegistry,
+    storage: Storage,
+    delivery_backend: DeliveryBackend,
+    push_tokens: PushTokenStore,
+    push_scheduler: PushScheduler,
+    node: Arc<NodeIdentity>,
+    cfg: Config,
+    live: Arc<Live>,
+) {
     let handshake_policy = HandshakePolicy {
         timeout: cfg.handshake_timeout,
         max_frame_len: cfg.max_frame_len,
         allow_tofu: cfg.noise_allow_tofu,
         device_cert_max_ttl_secs: cfg.device_cert_max_ttl.as_secs(),
     };
-    // Один на процесс: rate-limiter отправки считает бюджет пользователя, а
-    // не соединения — на сессию его дробить нельзя.
-    let limits = Arc::new(SessionLimits::for_node(cfg.limits, &cfg.blobs));
-    // Вход на хендшейк считается до крипты: респондер платит DH за любого,
-    // кто открыл сокет, поэтому ограничение живёт здесь, а не внутри
-    // `handle_conn`.
-    let admission = Arc::new(HandshakeAdmission::new(
-        cfg.limits.handshake_max_inflight,
-        cfg.limits.handshake_max_inflight_per_ip,
-    ));
-    // Потолок открытых соединений. Лимит хендшейков ограничивает только
-    // вход, а сессий на пользователя — только одного пользователя; без
-    // общего потолка число задач и буферов растёт, пока не кончится память
-    // или дескрипторы. Разрешение держится всё время жизни соединения.
-    // Потолка на IP у установленных сессий нет намеренно: за
-    // carrier-grade NAT с одного адреса приходят сотни честных устройств.
-    let connections = Arc::new(Semaphore::new(if cfg.limits.max_connections == 0 {
-        Semaphore::MAX_PERMITS
-    } else {
-        cfg.limits.max_connections
-    }));
-    let keepalive = tcp_keepalive_params(&cfg.limits);
-    let user_timeout = tcp_user_timeout(&cfg.limits);
     let mut backoff = AcceptBackoff::new(ACCEPT_BACKOFF_INITIAL, ACCEPT_BACKOFF_MAX);
 
     info!(
@@ -84,9 +140,9 @@ pub async fn accept_loop(
         let (stream, addr) = accept_with_backoff(|| listener.accept(), &mut backoff).await;
         observability::observe_listener_accept_ok();
 
-        let connection_permit = match connections.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
+        let connection_permit = match live.connections.try_acquire() {
+            Some(permit) => permit,
+            None => {
                 observability::observe_connection_limit_rejected();
                 debug!(peer = %addr, "connection limit reached; closing connection");
                 // Закрытие до хендшейка: ожидание места — та же нагрузка,
@@ -95,7 +151,7 @@ pub async fn accept_loop(
             }
         };
 
-        let admission_guard = match admission.try_admit(addr.ip()) {
+        let admission_guard = match live.admission.try_admit(addr.ip()) {
             Ok(guard) => guard,
             Err(reason) => {
                 observability::observe_handshake_admission_rejected(reason.as_metric_label());
@@ -109,17 +165,24 @@ pub async fn accept_loop(
                 continue;
             }
         };
-        configure_accepted_socket(&stream, keepalive.as_ref(), user_timeout);
+        // Параметры TCP берутся из текущих лимитов: новые настройки
+        // действуют для новых соединений.
+        let limits_now = live.limits.cfg();
+        configure_accepted_socket(
+            &stream,
+            tcp_keepalive_params(&limits_now).as_ref(),
+            tcp_user_timeout(&limits_now),
+        );
 
         let registry = registry.clone();
         let storage = storage.clone();
         let delivery_backend = delivery_backend.clone();
         let push_tokens = push_tokens.clone();
         let push_scheduler = push_scheduler.clone();
-        let server_config = server_config.clone();
-        let limits = limits.clone();
+        let server_config = live.server_config.clone();
+        let limits = live.limits.clone();
         let node = node.clone();
-        let blobs = blobs.clone();
+        let blobs = live.blobs.clone();
         // Адрес клиента — метаданные: в info-логе построчно по каждому
         // соединению ему не место.
         debug!(peer = %addr, "incoming tcp connection accepted");

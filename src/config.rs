@@ -2,6 +2,7 @@ use anyhow::{Context, anyhow, bail};
 use config::{Config as ConfigSource, Environment, File, FileFormat};
 use serde::Deserialize;
 use std::path::Path;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 #[derive(Clone, Debug)]
@@ -64,6 +65,9 @@ pub struct Config {
     pub device_cert_max_ttl: Duration,
     /// Хранилище файлов (`BLOB_*`, server-contract.md §6.11).
     pub blobs: BlobConfig,
+    /// Файл настроек без перезапуска (`RUNTIME_CONFIG_PATH`,
+    /// docs/runtime-config.md). Default: `<STORAGE_PATH>/runtime.toml`.
+    pub runtime_config_path: String,
 }
 
 /// Хранилище файлов: каталог, потолки, квоты и лимиты (`BLOB_*`). Квоты
@@ -303,6 +307,26 @@ impl Default for LimitsConfig {
             tcp_keepalive_retries: 4,
             tcp_user_timeout_secs: 120,
         }
+    }
+}
+
+/// Снапшот возможностей, общий для всех сессий и заменяемый на лету: новые
+/// лимиты (`runtime.toml`) попадают в следующий подписанный конфиг любой
+/// сессии.
+#[derive(Clone)]
+pub struct SharedServerConfig(Arc<RwLock<ServerConfigSnapshot>>);
+
+impl SharedServerConfig {
+    pub fn new(snapshot: ServerConfigSnapshot) -> Self {
+        Self(Arc::new(RwLock::new(snapshot)))
+    }
+
+    pub fn current(&self) -> ServerConfigSnapshot {
+        self.0.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    pub fn replace(&self, snapshot: ServerConfigSnapshot) {
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = snapshot;
     }
 }
 
@@ -928,6 +952,8 @@ struct RawConfig {
     blob_stat_per_sec: Option<u32>,
     #[serde(default)]
     blob_min_charge_bytes: Option<u64>,
+    #[serde(default)]
+    runtime_config_path: Option<String>,
 }
 
 /// Срок архива удалённых записей по умолчанию, сутки. Короче срока очередей:
@@ -1038,6 +1064,7 @@ fn resolve(raw: RawConfig) -> anyhow::Result<Config> {
         blob_ops_per_sec,
         blob_stat_per_sec,
         blob_min_charge_bytes,
+        runtime_config_path,
     } = raw;
 
     let bind_addr = resolve_bind_addr(bind_addr, bind_host, bind_port)?;
@@ -1177,7 +1204,14 @@ fn resolve(raw: RawConfig) -> anyhow::Result<Config> {
         max_frame_len,
     )?;
 
+    let runtime_config_path = normalize_optional_text(runtime_config_path).unwrap_or_else(|| {
+        crate::runtime::default_path(&storage_path)
+            .to_string_lossy()
+            .into_owned()
+    });
+
     Ok(Config {
+        runtime_config_path,
         blobs,
         queue_addressing_enabled: queue_addressing_enabled.unwrap_or(false),
         device_cert_max_ttl: Duration::from_secs(
@@ -1749,7 +1783,7 @@ fn resolve_blobs(
     })
 }
 
-fn check_tcp_keepalive(limits: &LimitsConfig) -> anyhow::Result<()> {
+pub(crate) fn check_tcp_keepalive(limits: &LimitsConfig) -> anyhow::Result<()> {
     const MAX_SECS: u64 = 32_767;
     const MAX_RETRIES: u32 = 127;
     if limits.tcp_keepalive_secs == 0 {
@@ -2260,6 +2294,7 @@ mod tests {
     #[test]
     fn sled_advertises_delivery_acks_unless_retention_is_immediate() {
         let mut cfg = super::Config {
+            runtime_config_path: String::new(),
             blobs: super::BlobConfig::default(),
             queue_addressing_enabled: false,
             device_cert_max_ttl: Duration::ZERO,

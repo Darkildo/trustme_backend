@@ -322,6 +322,13 @@ pub fn observe_node_key(source: &'static str) {
     gauge!("trust_message_tcp_node_key_source", "source" => source).set(1.0);
 }
 
+/// Попытка применить `runtime.toml`: `applied` или `invalid`. Рост
+/// `invalid` значит, что нода работает не на тех настройках, которые ей
+/// прислали.
+pub fn observe_runtime_reload(result: &'static str) {
+    counter!("trust_message_tcp_runtime_reload_total", "result" => result).increment(1);
+}
+
 /// Права файла ключа: 1 — только владелец, 0 — доступен шире. Ключ,
 /// который может прочитать кто-то ещё, позволяет выдавать себя за ноду.
 pub fn observe_node_key_permissions(owner_only: bool) {

@@ -25,6 +25,8 @@ tracing-subscriber = { version = "0.3", features=["fmt","env-filter"] }
 config = "0.15"                                            # конфиг из .env и переменных окружения
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# runtime.toml — настройки без перезапуска. Та же версия уже в дереве через config.
+toml = "1"
 hex = "0.4"
 # Вывод id очереди из тега клиента (SHA-256). Та же версия уже в дереве
 # через ed25519-dalek; без фич по умолчанию — OID не нужен.
