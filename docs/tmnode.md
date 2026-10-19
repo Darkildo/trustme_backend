@@ -10,15 +10,17 @@
 - **`tmnode install`** — нода на чистом сервере одной командой, по
   желанию с TURN;
 - **`tmnode enroll` и `tmnode agent`** — подключение к админке и связь с
-  ней (протокол — [agent-protocol.md](agent-protocol.md)).
+  ней (протокол — [agent-protocol.md](agent-protocol.md));
+- **`tmnode update`** — обновление ноды и самого `tmnode` до версий
+  релиза с проверкой и откатом; с админкой то же делает агент.
 
 Два контракта, на которые опираются эти команды и admin-сервис:
 
 - [`node.toml`](#nodetoml-схема-1) — описание ноды;
 - [`tmnode.report/1`](#отчёт-tmnodereport1) — машиночитаемый отчёт проверок.
 
-Дальше по плану: `pair` (ссылка и QR для клиента), `update` /
-`rollback`, `backup` / `restore`.
+Дальше по плану: `pair` (ссылка и QR для клиента), `backup` /
+`restore`.
 
 ## Установка ноды одной командой
 
@@ -53,6 +55,77 @@ curl -fsSL https://raw.githubusercontent.com/Darkildo/trustme_backend/stable/dep
 С админкой вместо `install` используется `enroll --url … --token …` —
 команду с токеном показывает панель
 ([agent-protocol.md](agent-protocol.md)).
+
+## Обновление
+
+Нода без админки (`management.mode = "local"` в `node.toml`)
+обновляется на сервере:
+
+```bash
+sudo tmnode update --node-version 0.7.0                         # только нода
+sudo tmnode update --node-version 0.7.0 --tmnode-version 0.3.0  # и сам tmnode
+```
+
+| Флаг | Смысл |
+|---|---|
+| `--node-version X.Y.Z` | образ ноды `ghcr.io/darkildo/trustme_backend:vX.Y.Z` |
+| `--tmnode-version X.Y.Z` | новый `tmnode` из того же релиза бэкенда |
+| `--allow-downgrade` | разрешить версию ниже текущей. Данные при откате не восстанавливаются |
+| `--json` | итог в JSON — тот же `UpdateStatus`, что агент шлёт админке |
+| `--resume` | только дочитать прерванное обновление |
+
+Что происходит — тот же движок, что у агента
+([agent-protocol.md](agent-protocol.md), «Обновление»):
+
+1. Новый `tmnode` скачивается из GitHub Releases. SHA-256 сверяется с
+   `SHA256SUMS` релиза, `<новый> version` — с заданной версией. Прежний
+   бинарь остаётся как `tmnode.prev` рядом, новый встаёт на его место, и
+   обновление продолжает уже он (`tmnode update --resume`).
+2. `docker pull` образа. Прежний контейнер останавливается и
+   переименовывается в `message-service.prev`. Новый создаётся с теми
+   же портами, томами, сетью, политикой перезапуска и окружением — кроме
+   переменных, заданных самим прежним образом.
+3. До двух минут `tmnode doctor` проверяет новую ноду: контейнер
+   работает, ключ прежний, рукопожатие и подписанный конфиг проходят.
+   Не прошла — прежний контейнер возвращается, итог «откат» с причиной и
+   хвостом `docker logs`.
+
+Ход задания пишется в `/etc/tmnode/update.json`. Прерванное обновление
+(сбой питания посреди пересоздания) следующий `tmnode update` сначала
+доводит или откатывает.
+
+Код выхода: 0 — обновлено или делать нечего, 1 — отказ, ошибка или
+откат, 2 — неверный вызов.
+
+Управляемую ноду так не обновить: `tmnode update` откажет. Её обновляет
+агент по заданию из панели.
+
+**Откуда качать** задаёт сервер, не админка: переменные
+`TMNODE_IMAGE_REPO` (по умолчанию `ghcr.io/darkildo/trustme_backend`) и
+`TMNODE_RELEASES_URL` (по умолчанию
+`https://github.com/Darkildo/trustme_backend/releases/download`). У
+агента они задаются в юните службы (`Environment=`).
+
+**Агент.** Служба `tmnode-agent` с 0.3.0:
+- присылает в heartbeat образ контейнера ноды (`node_image`) и ход
+  задания на обновление (`update`);
+- выполняет задание из ответа админки. Перед долгими шагами шлёт
+  отдельный heartbeat со статусом `running`;
+- после замены своего бинаря завершается, systemd поднимает службу уже
+  новым (`Restart=always`);
+- при старте сначала дочитывает незавершённое задание.
+
+Агент до 0.3.0 обновляться не умеет. Его обновляют на сервере:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Darkildo/trustme_backend/stable/deploy/install.sh \
+  | sudo sh -s -- agent-upgrade
+```
+
+`agent-upgrade` ставит `tmnode` последнего релиза (или
+`TMNODE_VERSION=vX.Y.Z`) со сверкой SHA-256. Прежний бинарь сохраняется
+как `tmnode.prev`, служба `tmnode-agent` перезапускается. Сам `tmnode`
+при этом не запускается, нода не трогается.
 
 ## Принципы
 
@@ -165,9 +238,11 @@ channel = "stable"            # stable | pinned
 - **Секретов в файле нет.** Секрет ключа ноды остаётся в
   `STORAGE_PATH/node_identity_key` или `NODE_IDENTITY_KEY`
   ([runbook-node-key.md](runbook-node-key.md)).
-- **Пространство под admin-сервис.** `node.id`, `node.org`, метки,
-  `management.mode` и `updates` в нулевом этапе только проверяются по
-  форме. Смысл им придадут `enroll` и `update`.
+- **Пространство под admin-сервис.** `node.id`, `node.org` и метки пока
+  только проверяются по форме. `management.mode = "managed"` разрешает
+  админке обновлять ноду и запрещает `tmnode update` на сервере.
+  `updates.channel = "pinned"` держит версию ноды: задание на другую
+  версию агент и `tmnode update` отклоняют.
 
 ## Отчёт tmnode.report/1
 

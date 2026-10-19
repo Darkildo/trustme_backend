@@ -227,7 +227,7 @@ RustSec на каждом PR и раз в сутки — `audit.yml`. Сторо
 | `tests/` | Интеграционные тесты через настоящий Noise-канал на loopback |
 | `fuzz/` | Таргеты `cargo-fuzz`, словарь и сиды |
 | `examples/` | `e2e_smoke` (сценарии против живой ноды), `load_gen` (нагрузка), административные утилиты push |
-| `tmnode/` | Утилита обслуживания ноды: `tmnode doctor` — проверка ноды только на чтение ([docs/tmnode.md](docs/tmnode.md)) |
+| `tmnode/` | Утилита обслуживания ноды: `doctor` (проверка только на чтение), `install`, `enroll` / `agent` (связь с админкой), `update` (обновление с откатом) — [docs/tmnode.md](docs/tmnode.md) |
 | `deploy/` | Образы, compose-override для JetStream, правила алертов, мониторинг, скрипты бэкапа и восстановления |
 | `docs/` | Эксплуатационная документация (см. ниже) |
 
@@ -420,8 +420,9 @@ account- и device-scope), `queue_stats` (счётчики квот, перес�
   запуска, лимиты соединений, бэкапы, выкладка, обновление и откат.
 - [docs/runtime-config.md](docs/runtime-config.md) — лимиты и квоты без
   перезапуска: `runtime.toml`, каталог настроек, статус.
-- [docs/tmnode.md](docs/tmnode.md) — `tmnode doctor`: проверка ноды на хосте
-  и снаружи, схема `node.toml`, формат отчёта.
+- [docs/tmnode.md](docs/tmnode.md) — `tmnode`: проверка ноды на хосте и
+  снаружи, установка, обновление с откатом, схема `node.toml`, формат
+  отчёта.
 - [docs/runbook-node-key.md](docs/runbook-node-key.md) — ключ ноды: бэкап,
   ротация, сигналы потери.
 - [docs/runbook-metrics.md](docs/runbook-metrics.md) — метрики и алерты.
