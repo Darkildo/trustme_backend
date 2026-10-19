@@ -1,4 +1,4 @@
-//! Команды, которые меняют машину: `install`, `enroll`, `agent`
+//! Команды, которые меняют машину: `install`, `enroll`, `agent`, `update`
 //! (docs/tmnode.md). `doctor` и `config check` — только чтение, они в
 //! `cli`.
 
@@ -10,7 +10,8 @@ use anyhow::{Context, Result, bail};
 use crate::agent::{self, AdminApi, AgentConfig, HttpAdmin};
 use crate::install::{self, Installed, Layout, NodeMeta, Runner};
 use crate::node_config::Backend;
-use crate::protocol::{CoturnSpec, InstallSpec, RuntimeDoc};
+use crate::protocol::{CoturnSpec, InstallSpec, RuntimeDoc, UpdateStatus};
+use crate::update::{self, HttpFetch, Origin, Outcome, Progress, Sources, Updater, Version};
 
 /// Образ ноды по умолчанию для установки без админки.
 pub const DEFAULT_IMAGE: &str = "ghcr.io/darkildo/trustme_backend:stable";
@@ -202,6 +203,7 @@ pub fn hostname(runner: &dyn Runner) -> String {
 }
 
 /// Служба агента: токен из `agent.toml`, `node.toml` из каталога настроек.
+/// Возвращается, когда `tmnode` заменён: systemd перезапустит службу.
 pub async fn agent_service<S: crate::system::System>(
     runner: &dyn Runner,
     sys: &S,
@@ -214,10 +216,202 @@ pub async fn agent_service<S: crate::system::System>(
     if runner.read_file(&node_toml)?.is_none() {
         bail!("{} нет: нода не установлена", node_toml.display());
     }
-    agent::run_forever(&api, runner, sys, &node_toml, now, |line| {
-        eprintln!("tmnode agent: {line}")
-    })
-    .await
+    // Пока служба работает, `tmnode update` на этом сервере не запустится.
+    let _lock = lock_updates(layout)?;
+    let sources = Sources::from_env(|key| std::env::var(key).ok())?;
+    let fetch = HttpFetch::new(&sources)?;
+    let tmnode_path = tmnode_path()?;
+    let updater = Updater {
+        runner,
+        sys,
+        fetch: &fetch,
+        layout,
+        sources: &sources,
+        node_toml: &node_toml,
+        tmnode_path: &tmnode_path,
+        tmnode_version: env!("CARGO_PKG_VERSION"),
+        origin: Origin::Admin,
+        now: &now,
+    };
+    agent::run_forever(&api, &updater, |line| eprintln!("tmnode agent: {line}")).await;
+    Ok(())
+}
+
+/// Обновлением на сервере занят один процесс: служба агента или
+/// `tmnode update`. Блокировка снимается с завершением процесса.
+pub fn lock_updates(layout: &Layout) -> Result<std::fs::File> {
+    use fs2::FileExt;
+    std::fs::create_dir_all(&layout.etc_dir)
+        .with_context(|| format!("каталог {}", layout.etc_dir.display()))?;
+    let path = layout.etc_dir.join("update.lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)
+        .with_context(|| format!("блокировка {}", path.display()))?;
+    file.try_lock_exclusive().map_err(|_| {
+        anyhow::anyhow!(
+            "{} занят: работает служба tmnode-agent или другой tmnode update",
+            path.display()
+        )
+    })?;
+    Ok(file)
+}
+
+/// Путь к работающему бинарю: рядом с ним кладётся новый.
+pub fn tmnode_path() -> Result<std::path::PathBuf> {
+    let path = std::env::current_exe().context("путь к tmnode")?;
+    // Бинарь подменили, пока процесс работал: ядро дописывает пометку.
+    Ok(
+        match path.to_str().and_then(|p| p.strip_suffix(" (deleted)")) {
+            Some(stripped) => stripped.into(),
+            None => path,
+        },
+    )
+}
+
+/// Аргументы `tmnode update`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UpdateArgs {
+    pub node_version: Option<Version>,
+    pub tmnode_version: Option<Version>,
+    pub allow_downgrade: bool,
+    pub json: bool,
+    /// Только дочитать прерванное обновление.
+    pub resume: bool,
+}
+
+pub fn parse_update(args: &[&str]) -> Result<UpdateArgs, String> {
+    let mut out = UpdateArgs {
+        node_version: None,
+        tmnode_version: None,
+        allow_downgrade: false,
+        json: false,
+        resume: false,
+    };
+    let mut iter = args.iter();
+    while let Some(&flag) = iter.next() {
+        let mut version = || {
+            let raw = iter
+                .next()
+                .copied()
+                .ok_or_else(|| format!("{flag}: нужно значение"))?;
+            Version::parse(raw).ok_or_else(|| format!("{flag}: ожидается X.Y.Z, получено `{raw}`"))
+        };
+        match flag {
+            "--node-version" => out.node_version = Some(version()?),
+            "--tmnode-version" => out.tmnode_version = Some(version()?),
+            "--allow-downgrade" => out.allow_downgrade = true,
+            "--json" => out.json = true,
+            "--resume" => out.resume = true,
+            other => return Err(format!("неизвестный флаг `{other}`")),
+        }
+    }
+    let versions = out.node_version.is_some() || out.tmnode_version.is_some();
+    if out.resume && versions {
+        return Err("--resume дочитывает прерванное обновление: без версий".into());
+    }
+    if !out.resume && !versions {
+        return Err("нужна --node-version и/или --tmnode-version".into());
+    }
+    Ok(out)
+}
+
+/// Ход `tmnode update` — шаги в stderr.
+struct StepPrinter<'a, W: Write> {
+    out: std::cell::RefCell<&'a mut W>,
+}
+
+impl<W: Write> Progress for StepPrinter<'_, W> {
+    async fn running(&self, status: &UpdateStatus) {
+        if let Some(step) = status.step {
+            let _ = writeln!(self.out.borrow_mut(), "→ {}", update::step_text(step));
+        }
+    }
+}
+
+/// `tmnode update`: сначала дочитать прерванное обновление, потом
+/// выполнить новое. `None` — делать нечего.
+pub async fn update<S: crate::system::System, F: update::Fetch>(
+    up: &Updater<'_, S, F>,
+    args: &UpdateArgs,
+    log: &mut impl Write,
+) -> Result<Option<Outcome>> {
+    let config = crate::node_config::NodeConfig::load(up.node_toml)
+        .context("tmnode update работает с нодой, поставленной tmnode install")?;
+    if config.management.mode == crate::node_config::ManagementMode::Managed {
+        // До дочитывания: прерванное задание админки доводит её агент.
+        bail!(
+            "нода под управлением админки (management.mode = \"managed\"): обновляйте её из панели"
+        );
+    }
+    let progress = StepPrinter {
+        out: std::cell::RefCell::new(log),
+    };
+    if let Some(outcome) = up.resume(&progress).await {
+        if args.resume || matches!(outcome, Outcome::Restart(_)) {
+            return Ok(Some(outcome));
+        }
+        let status = outcome.status();
+        let _ = writeln!(
+            progress.out.borrow_mut(),
+            "Прерванное обновление {}: {}",
+            status.id,
+            update::state_name(status.state)
+        );
+    }
+    if args.resume {
+        return Ok(None);
+    }
+    let own = Version::parse(up.tmnode_version);
+    if args.node_version.is_none() && args.tmnode_version == own {
+        let _ = writeln!(
+            progress.out.borrow_mut(),
+            "tmnode {} уже стоит",
+            up.tmnode_version
+        );
+        return Ok(None);
+    }
+    let order = up
+        .local_order(args.node_version, args.tmnode_version, args.allow_downgrade)
+        .await?;
+    Ok(Some(up.execute(&order, &progress).await))
+}
+
+/// Итог `tmnode update`: текст или JSON (`UpdateStatus`, как в протоколе).
+pub fn print_update(out: &mut impl Write, status: &UpdateStatus, json: bool) {
+    if json {
+        let _ = writeln!(
+            out,
+            "{}",
+            serde_json::to_string_pretty(status).expect("status serializes")
+        );
+        return;
+    }
+    let state = match status.state {
+        crate::protocol::UpdateState::Succeeded => "готово",
+        crate::protocol::UpdateState::Failed => "не удалось",
+        crate::protocol::UpdateState::RolledBack => "откат: новая нода не прошла проверку",
+        crate::protocol::UpdateState::Refused => "отказ",
+        crate::protocol::UpdateState::Running => "выполняется",
+    };
+    let _ = writeln!(out, "Обновление {}: {state}", status.id);
+    let pair = |from: &Option<String>, to: &Option<String>| match (from, to) {
+        (Some(from), Some(to)) if from != to => format!("{from} → {to}"),
+        (_, Some(to)) => to.clone(),
+        (Some(from), None) => from.clone(),
+        (None, None) => "—".to_owned(),
+    };
+    let _ = writeln!(
+        out,
+        "  нода:   {}\n  tmnode: {}",
+        pair(&status.from_node_image, &status.node_image),
+        pair(&status.from_tmnode, &status.tmnode)
+    );
+    if let Some(error) = &status.error {
+        let _ = writeln!(out, "\n{error}");
+    }
 }
 
 pub fn now() -> u64 {
@@ -293,6 +487,27 @@ mod tests {
         );
         assert!(parse_enroll(&["--x"]).is_err());
         assert!(parse_enroll(&["--url"]).is_err());
+    }
+
+    #[test]
+    fn one_update_at_a_time() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("tmnode_lock_{nanos}"));
+        let layout = Layout {
+            data_dir: root.join("data"),
+            etc_dir: root.join("etc"),
+            unit_path: root.join("unit"),
+        };
+        let held = lock_updates(&layout).unwrap();
+        let err = lock_updates(&layout).unwrap_err();
+        assert!(err.to_string().contains("tmnode-agent"), "{err}");
+        drop(held);
+        assert!(lock_updates(&layout).is_ok());
+        assert!(tmnode_path().unwrap().is_absolute());
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

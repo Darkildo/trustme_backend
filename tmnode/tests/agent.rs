@@ -10,13 +10,14 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{Result, bail};
-use tmnode::agent::{self, AdminApi, AgentConfig, HttpAdmin};
+use tmnode::agent::{self, AdminApi, AgentConfig, HttpAdmin, Next};
 use tmnode::install::{Layout, Runner};
 use tmnode::node_config::{Backend, NodeConfig};
 use tmnode::ops::{self, EnrollArgs};
 use tmnode::protocol::{
     EnrollRequest, EnrollResponse, Heartbeat, HeartbeatResponse, InstallSpec, RuntimeDoc,
 };
+use tmnode::update::{Fetch, Origin, Sources, Updater};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Записанный файл: содержимое, права, владелец.
@@ -79,6 +80,44 @@ impl Runner for MemRunner {
         Ok(())
     }
     fn sleep(&self, _duration: Duration) {}
+}
+
+/// Сети в этих тестах нет: заданий на обновление админка не присылает.
+struct NoFetch;
+
+impl Fetch for NoFetch {
+    async fn get(&self, url: &str, _limit: usize) -> Result<Vec<u8>> {
+        bail!("{url}: сети в тесте нет")
+    }
+}
+
+fn now() -> u64 {
+    1_800_000_000
+}
+
+fn sources() -> Sources {
+    Sources::from_env(|_| None).unwrap()
+}
+
+fn updater<'a>(
+    runner: &'a MemRunner,
+    sys: &'a common::Fake,
+    layout: &'a Layout,
+    node_toml: &'a Path,
+    sources: &'a Sources,
+) -> Updater<'a, common::Fake, NoFetch> {
+    Updater {
+        runner,
+        sys,
+        fetch: &NoFetch,
+        layout,
+        sources,
+        node_toml,
+        tmnode_path: Path::new("/usr/local/bin/tmnode"),
+        tmnode_version: env!("CARGO_PKG_VERSION"),
+        origin: Origin::Admin,
+        now: &now,
+    }
 }
 
 /// Админка, которая запоминает запросы и отвечает заготовками.
@@ -306,12 +345,16 @@ async fn heartbeat_reports_and_applies_desired_settings() {
         .unwrap();
     let sys = common::healthy();
     let admin = FakeAdmin::new();
+    let sources = sources();
+    let up = updater(&runner, &sys, &layout, &node_toml, &sources);
 
     // Желаемых настроек нет — на диск ничего не пишется.
-    let interval = agent::tick(&admin, &runner, &sys, &node_toml, 1_800_000_000)
-        .await
-        .unwrap();
-    assert_eq!(interval, 5, "interval is clamped to the protocol minimum");
+    let next = agent::tick(&admin, &up).await.unwrap();
+    assert_eq!(
+        next,
+        Next::Wait(5),
+        "interval is clamped to the protocol minimum"
+    );
     {
         let beats = admin.beats.borrow();
         assert_eq!(beats[0].node_key, Some(hex::encode(common::node_public())));
@@ -320,6 +363,12 @@ async fn heartbeat_reports_and_applies_desired_settings() {
             "tmnode.report/1"
         );
         assert_eq!(beats[0].runtime_status.as_ref().unwrap()["version"], "v0");
+        assert_eq!(beats[0].tmnode_version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(
+            beats[0].node_image.as_deref(),
+            Some("trust-message-service:jetstream")
+        );
+        assert!(beats[0].update.is_none());
     }
     assert!(
         !runner
@@ -329,9 +378,7 @@ async fn heartbeat_reports_and_applies_desired_settings() {
     );
 
     *admin.runtime.borrow_mut() = Some(runtime_doc("v2", 7));
-    agent::tick(&admin, &runner, &sys, &node_toml, 1_800_000_000)
-        .await
-        .unwrap();
+    agent::tick(&admin, &up).await.unwrap();
     let (content, mode, uid) = runner.files.borrow()[&layout.data_dir.join("runtime.toml")].clone();
     assert!(content.contains("= 7"));
     assert_eq!((mode, uid), (0o600, Some(10001)));
@@ -357,11 +404,7 @@ async fn heartbeat_reports_and_applies_desired_settings() {
 
     // Без data_dir в node.toml агенту некуда писать.
     std::fs::write(&node_toml, "schema = 1\n").unwrap();
-    assert!(
-        agent::tick(&admin, &runner, &sys, &node_toml, 0)
-            .await
-            .is_err()
-    );
+    assert!(agent::tick(&admin, &up).await.is_err());
 }
 
 /// Однократный HTTP-ответ на локальном порту.
