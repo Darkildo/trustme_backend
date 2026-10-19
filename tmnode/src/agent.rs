@@ -3,7 +3,8 @@
 //! `tmnode enroll` меняет одноразовый токен на постоянный и задание на
 //! установку. `tmnode agent` (служба systemd) раз в полминуты присылает
 //! отчёт `doctor` и статус настроек и забирает желаемый `runtime.toml` —
-//! нода подхватывает его сама, без перезапуска.
+//! нода подхватывает его сама, без перезапуска, — и задание на обновление
+//! (`update`).
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -19,9 +20,10 @@ use crate::install::{Layout, Runner};
 use crate::node_config::NodeConfig;
 use crate::protocol::{
     API_PREFIX, DEFAULT_INTERVAL_SECS, EnrollRequest, EnrollResponse, Heartbeat, HeartbeatResponse,
-    MAX_INTERVAL_SECS, MIN_INTERVAL_SECS, RuntimeDoc,
+    MAX_INTERVAL_SECS, MIN_INTERVAL_SECS, RuntimeDoc, UpdateStatus,
 };
 use crate::system::System;
+use crate::update::{Fetch, Outcome, Progress, Updater};
 
 /// Пользователь ноды в контейнере: `runtime.toml` читает она.
 const NODE_UID: u32 = 10001;
@@ -162,56 +164,135 @@ pub async fn enroll(
     Ok(response)
 }
 
-/// Один цикл: отчёт и статус в админку, желаемые настройки — на диск.
-/// Возвращает, через сколько секунд повторить.
-pub async fn tick<S: System>(
-    api: &impl AdminApi,
-    runner: &dyn Runner,
-    sys: &S,
-    node_toml: &Path,
-    now: u64,
-) -> Result<u64> {
+/// Что делать после цикла.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Next {
+    /// Следующий heartbeat через столько секунд.
+    Wait(u64),
+    /// `tmnode` заменён: службе пора завершиться, systemd поднимет её уже
+    /// новым бинарём.
+    Restart,
+}
+
+/// Поля heartbeat без отчёта `doctor`: из них же собираются промежуточные
+/// heartbeat обновления.
+fn base_beat<S: System, F: Fetch>(
+    up: &Updater<'_, S, F>,
+    config: &NodeConfig,
+    data_dir: &Path,
+) -> Result<Heartbeat> {
+    let runtime_status = up
+        .runner
+        .read_file(&data_dir.join("runtime.status.json"))?
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let node_image = up
+        .sys
+        .container(&config.runtime.container)
+        .ok()
+        .flatten()
+        .map(|c| c.image);
+    Ok(Heartbeat {
+        tmnode_version: up.tmnode_version.to_owned(),
+        node_key: config.endpoint.as_ref().map(|e| e.node_key.clone()),
+        report: None,
+        runtime_status,
+        node_image,
+        update: up.report(),
+    })
+}
+
+fn load_config(node_toml: &Path) -> Result<(NodeConfig, PathBuf)> {
     let config = NodeConfig::load(node_toml)?;
     let data_dir = config
         .runtime
         .data_dir
         .clone()
         .ok_or_else(|| anyhow!("в node.toml нет runtime.data_dir"))?;
+    Ok((config, data_dir))
+}
 
+/// Ход обновления — отдельным heartbeat до долгого шага: обычный придёт
+/// только после шага, а `docker pull` и проверка идут минутами.
+struct BeatProgress<'a, A> {
+    api: &'a A,
+    base: Heartbeat,
+}
+
+impl<A: AdminApi> Progress for BeatProgress<'_, A> {
+    async fn running(&self, status: &UpdateStatus) {
+        let mut beat = self.base.clone();
+        beat.update = Some(status.clone());
+        // Не дошёл — итог всё равно уйдёт следующим heartbeat.
+        let _ = self.api.heartbeat(&beat).await;
+    }
+}
+
+/// Один цикл: отчёт и статус в админку, желаемые настройки — на диск,
+/// задание на обновление — к исполнению.
+pub async fn tick<S: System, F: Fetch>(
+    api: &impl AdminApi,
+    up: &Updater<'_, S, F>,
+) -> Result<Next> {
+    let (config, data_dir) = load_config(up.node_toml)?;
     let report = doctor::run(
-        sys,
+        up.sys,
         &Input {
-            config: ConfigSource::Loaded(node_toml.to_owned(), Box::new(config.clone())),
+            config: ConfigSource::Loaded(up.node_toml.to_owned(), Box::new(config.clone())),
             container: None,
             addr: None,
             node_key: None,
             remote: false,
             step_timeout: Duration::from_secs(5),
         },
-        now,
+        (up.now)(),
     )
     .await;
-    let runtime_status = runner
-        .read_file(&data_dir.join("runtime.status.json"))?
-        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-
+    let base = base_beat(up, &config, &data_dir)?;
     let response = api
         .heartbeat(&Heartbeat {
-            tmnode_version: env!("CARGO_PKG_VERSION").to_owned(),
-            node_key: config.endpoint.as_ref().map(|e| e.node_key.clone()),
             report: Some(serde_json::to_value(&report).expect("report serializes")),
-            runtime_status,
-            node_image: None,
-            update: None,
+            ..base.clone()
         })
         .await?;
 
     if let Some(desired) = &response.runtime {
-        apply_runtime(runner, &data_dir, desired)?;
+        apply_runtime(up.runner, &data_dir, desired)?;
     }
-    Ok(response
+    let interval = response
         .interval_secs
-        .clamp(MIN_INTERVAL_SECS, MAX_INTERVAL_SECS))
+        .clamp(MIN_INTERVAL_SECS, MAX_INTERVAL_SECS);
+
+    up.acknowledge(response.update.as_ref().map(|order| order.id.as_str()));
+    let Some(order) = &response.update else {
+        return Ok(Next::Wait(interval));
+    };
+    let repeat = up
+        .load()
+        .is_some_and(|saved| saved.order.id == order.id && saved.status.state.is_final());
+    if repeat {
+        // Итог уже ушёл в этом heartbeat: повтор задание не выполняет.
+        return Ok(Next::Wait(interval));
+    }
+    let progress = BeatProgress { api, base };
+    match up.execute(order, &progress).await {
+        Outcome::Restart(_) => Ok(Next::Restart),
+        // Итог — в админку поскорее.
+        Outcome::Done(_) => Ok(Next::Wait(MIN_INTERVAL_SECS)),
+    }
+}
+
+/// При старте службы: дочитать задание, прерванное перезапуском агента
+/// (самообновление) или падением.
+pub async fn resume<S: System, F: Fetch>(
+    api: &impl AdminApi,
+    up: &Updater<'_, S, F>,
+) -> Result<Option<Outcome>> {
+    if up.load().is_none_or(|saved| saved.status.state.is_final()) {
+        return Ok(None);
+    }
+    let (config, data_dir) = load_config(up.node_toml)?;
+    let base = base_beat(up, &config, &data_dir)?;
+    Ok(up.resume(&BeatProgress { api, base }).await)
 }
 
 /// Записать желаемый `runtime.toml`, если на диске другая версия. Файл
@@ -234,19 +315,36 @@ pub fn apply_runtime(runner: &dyn Runner, data_dir: &Path, desired: &RuntimeDoc)
     Ok(true)
 }
 
-/// Служба: циклы без конца, с паузой при ошибках.
-pub async fn run_forever<S: System>(
+/// Служба: циклы с паузой при ошибках. Возвращается, только когда
+/// `tmnode` заменён и службе пора перезапуститься.
+pub async fn run_forever<S: System, F: Fetch>(
     api: &impl AdminApi,
-    runner: &dyn Runner,
-    sys: &S,
-    node_toml: &Path,
-    now: impl Fn() -> u64,
+    up: &Updater<'_, S, F>,
     mut log: impl FnMut(&str),
-) -> ! {
+) {
+    match resume(api, up).await {
+        Ok(Some(Outcome::Restart(_))) => return,
+        Ok(Some(Outcome::Done(status))) => log(&format!(
+            "прерванное обновление {}: {}{}",
+            status.id,
+            crate::update::state_name(status.state),
+            status
+                .error
+                .as_deref()
+                .map(|e| format!(" — {e}"))
+                .unwrap_or_default()
+        )),
+        Ok(None) => {}
+        Err(err) => log(&format!("прерванное обновление не дочитано: {err:#}")),
+    }
     let mut failures: u32 = 0;
     loop {
-        let wait = match tick(api, runner, sys, node_toml, now()).await {
-            Ok(interval) => {
+        let wait = match tick(api, up).await {
+            Ok(Next::Restart) => {
+                log("tmnode заменён: служба перезапускается новым бинарём");
+                return;
+            }
+            Ok(Next::Wait(interval)) => {
                 failures = 0;
                 interval
             }

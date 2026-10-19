@@ -25,6 +25,12 @@ tmnode — обслуживание ноды TrustMe
   tmnode enroll --url URL --token ТОКЕН [--no-install]
                               подключить сервер к админке и поставить ноду по её заданию
   tmnode agent                служба связи с админкой (ставится enroll)
+  tmnode update [--node-version X.Y.Z] [--tmnode-version X.Y.Z]
+                [--allow-downgrade] [--json]
+                              обновить ноду и/или tmnode до версий релиза, без админки;
+                              не прошедшая проверку нода откатывается
+  tmnode update --resume [--json]
+                              дочитать прерванное обновление
   tmnode version
 
 Опции doctor:
