@@ -6,6 +6,22 @@
 
 ## Не выпущено
 
+### tmnode: установка и агент
+
+- `tmnode install` — нода на чистом сервере одной командой: Docker без
+  compose, по желанию NATS (JetStream) и coturn с секцией `[ice]` для
+  звонков. Живая нода не затирается.
+- `tmnode enroll` / `tmnode agent` — подключение к админке по
+  одноразовому токену и служба связи. Heartbeat с отчётом `doctor` и
+  статусом `runtime.toml`; желаемые настройки агент записывает на диск, а
+  нода подхватывает их без перезапуска. Протокол v1 —
+  docs/agent-protocol.md, типы — `tmnode::protocol`.
+- `deploy/install.sh` — ставит Docker, скачивает `tmnode` из GitHub
+  Releases со сверкой SHA-256 и запускает его.
+- Релиз по тегу `v*` (`release.yml`): бинари `tmnode` для x86_64 и
+  aarch64 с `SHA256SUMS` в GitHub Releases; образ коммита тега получает
+  теги `vX.Y.Z` и `stable`.
+
 ### Учётки для звонков (ICE)
 
 - Кадры `GetIceServers` → `IceServers` (ветки `Frame.payload` 35–36) и

@@ -19,6 +19,12 @@ tmnode — обслуживание ноды TrustMe
 Использование:
   tmnode doctor [опции]       проверить ноду (только чтение)
   tmnode config check [ФАЙЛ]  проверить node.toml
+  tmnode install --public-host ХОСТ [--port ПОРТ] [--backend sled|jetstream]
+                 [--with-turn] [--image ОБРАЗ]
+                              поставить ноду на этот сервер (Docker), без админки
+  tmnode enroll --url URL --token ТОКЕН [--no-install]
+                              подключить сервер к админке и поставить ноду по её заданию
+  tmnode agent                служба связи с админкой (ставится enroll)
   tmnode version
 
 Опции doctor:
