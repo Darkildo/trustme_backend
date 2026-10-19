@@ -83,11 +83,11 @@ pub struct Heartbeat {
     /// Содержимое `runtime.status.json` ноды.
     pub runtime_status: Option<Value>,
     /// Образ, на котором сейчас запущен контейнер ноды
-    /// (`ghcr.io/darkildo/trustme_backend:v0.7.0`). Нет у агентов до 0.3.0.
+    /// (`ghcr.io/darkildo/trustme_backend:v0.7.0`). Нет у агентов до 0.7.0.
     #[serde(default)]
     pub node_image: Option<String>,
     /// Ход последнего задания на обновление. Агент присылает его, пока
-    /// админка не перестанет присылать это задание. Нет у агентов до 0.3.0.
+    /// админка не перестанет присылать это задание. Нет у агентов до 0.7.0.
     #[serde(default)]
     pub update: Option<UpdateStatus>,
 }
@@ -130,6 +130,8 @@ pub struct UpdateOrder {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct TmnodeRelease {
     /// `X.Y.Z` — версия, которую печатает `tmnode version` нового бинаря.
+    /// Она же — релиз бэкенда `vX.Y.Z`, из которого агент берёт бинарь:
+    /// с 0.7.0 у `tmnode` и ноды одна версия на релиз.
     pub version: String,
     /// SHA-256 бинаря `tmnode-<arch>-linux` для архитектуры агента (hex,
     /// строчные). Должна совпасть и с файлом, и с `SHA256SUMS` релиза.
@@ -253,7 +255,7 @@ mod tests {
             id: "01jb0000000000000000000000".into(),
             node_version: Some("0.7.0".into()),
             tmnode: Some(TmnodeRelease {
-                version: "0.3.0".into(),
+                version: "0.7.0".into(),
                 sha256: "ab".repeat(32),
             }),
             allow_downgrade: false,
@@ -278,8 +280,8 @@ mod tests {
             finished_at: Some(2),
             from_node_image: Some("ghcr.io/darkildo/trustme_backend:v0.6.0".into()),
             node_image: Some("ghcr.io/darkildo/trustme_backend:v0.6.0".into()),
-            from_tmnode: Some("0.3.0".into()),
-            tmnode: Some("0.3.0".into()),
+            from_tmnode: Some("0.7.0".into()),
+            tmnode: Some("0.7.0".into()),
         };
         let json = serde_json::to_value(&status).unwrap();
         assert_eq!(json["state"], "rolled_back");

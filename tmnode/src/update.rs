@@ -319,8 +319,9 @@ struct Run {
 /// Что из задания на самом деле нужно сделать.
 #[derive(Debug, Default)]
 struct Plan {
-    /// Новый `tmnode`: версия, SHA-256, релиз, из которого он берётся.
-    tmnode: Option<(Version, String, Version)>,
+    /// Новый `tmnode`: версия (она же — релиз, из которого он берётся) и
+    /// SHA-256.
+    tmnode: Option<(Version, String)>,
     node: Option<Version>,
 }
 
@@ -435,9 +436,9 @@ impl<S: System, F: Fetch> Updater<'_, S, F> {
             Ok(plan) => plan,
             Err(why) => return self.finish(&mut run, UpdateState::Refused, Some(why)),
         };
-        if let Some((version, sha256, release)) = &plan.tmnode {
+        if let Some((version, sha256)) = &plan.tmnode {
             return match self
-                .replace_tmnode(&mut run, *version, sha256, *release, progress)
+                .replace_tmnode(&mut run, *version, sha256, progress)
                 .await
             {
                 Ok(()) => Outcome::Restart(run.saved.status),
@@ -597,14 +598,7 @@ impl<S: System, F: Fetch> Updater<'_, S, F> {
                     "tmnode {own} новее {wanted}: понижение — только с allow_downgrade"
                 ));
             } else {
-                // Бинарь лежит в релизе бэкенда, а не под своей версией
-                // (release.yml): берётся из релиза ноды по заданию, иначе —
-                // из релиза, на котором нода работает сейчас.
-                let release = node.or(current_node).ok_or(
-                    "не известно, из какого релиза брать tmnode: в задании нет node_version, \
-                     а образ ноды — не vX.Y.Z",
-                )?;
-                plan.tmnode = Some((wanted, sha256, release));
+                plan.tmnode = Some((wanted, sha256));
             }
         }
         Ok(plan)
@@ -622,20 +616,7 @@ impl<S: System, F: Fetch> Updater<'_, S, F> {
             tmnode_version.filter(|v| Version::parse(self.tmnode_version) != Some(*v));
         let tmnode = match tmnode_version {
             None => None,
-            Some(version) => {
-                let config = NodeConfig::load(self.node_toml)?;
-                let release = node_version
-                    .or_else(|| {
-                        self.current_image(&config)
-                            .as_deref()
-                            .and_then(Version::from_image)
-                    })
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "не известно, из какого релиза брать tmnode: образ ноды — не vX.Y.Z; \
-                             задайте и --node-version"
-                        )
-                    })?;
+            Some(release) => {
                 let asset = self.sources.asset();
                 let sums = self
                     .fetch
@@ -648,7 +629,7 @@ impl<S: System, F: Fetch> Updater<'_, S, F> {
                 let sha256 = parse_sums(&String::from_utf8_lossy(&sums), &asset)
                     .ok_or_else(|| anyhow!("в SHA256SUMS релиза v{release} нет {asset}"))?;
                 Some(crate::protocol::TmnodeRelease {
-                    version: version.to_string(),
+                    version: release.to_string(),
                     sha256,
                 })
             }
@@ -676,10 +657,11 @@ impl<S: System, F: Fetch> Updater<'_, S, F> {
         run: &mut Run,
         version: Version,
         sha256: &str,
-        release: Version,
         progress: &impl Progress,
     ) -> Result<()> {
         self.step(run, UpdateStep::DownloadTmnode, progress).await?;
+        // Версия tmnode — версия релиза бэкенда, в котором он вышел.
+        let release = version;
         let asset = self.sources.asset();
         let sums = self
             .fetch
