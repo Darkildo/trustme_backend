@@ -11,11 +11,20 @@
 # Что делает: ставит Docker (apt), если его нет; скачивает tmnode нужной
 # версии из GitHub Releases и сверяет SHA-256; запускает tmnode с
 # переданными аргументами. Версию можно закрепить: TMNODE_VERSION=v0.6.0.
+#
+# Обновить агент, который сам обновляться не умеет (tmnode до 0.3.0):
+#
+#   … | sudo sh -s -- agent-upgrade
+#
+# ставит tmnode так же, со сверкой SHA-256, сохраняет прежний как
+# tmnode.prev и перезапускает службу tmnode-agent. Сам tmnode при этом не
+# запускается.
 set -eu
 
 REPO="Darkildo/trustme_backend"
 VERSION="${TMNODE_VERSION:-latest}"
 BIN="/usr/local/bin/tmnode"
+UNIT="tmnode-agent.service"
 
 fail() {
     echo "install.sh: $*" >&2
@@ -23,7 +32,16 @@ fail() {
 }
 
 [ "$(id -u)" = "0" ] || fail "нужен root: запустите через sudo"
-[ "$#" -gt 0 ] || fail "передайте команду tmnode: install … или enroll …"
+[ "$#" -gt 0 ] || fail "передайте команду tmnode: install …, enroll … или agent-upgrade"
+
+MODE="run"
+if [ "$1" = "agent-upgrade" ]; then
+    [ "$#" -eq 1 ] || fail "agent-upgrade — без аргументов"
+    MODE="agent-upgrade"
+    command -v systemctl >/dev/null 2>&1 || fail "нет systemctl: агент ставится только службой systemd"
+    systemctl cat "$UNIT" >/dev/null 2>&1 \
+        || fail "служба $UNIT не установлена: сначала подключите сервер (enroll)"
+fi
 
 case "$(uname -m)" in
     x86_64 | amd64) ARCH="x86_64" ;;
@@ -31,7 +49,8 @@ case "$(uname -m)" in
     *) fail "архитектура $(uname -m) не поддерживается" ;;
 esac
 
-if ! command -v docker >/dev/null 2>&1; then
+# Агенту Docker уже не нужен: нода стоит.
+if [ "$MODE" = "run" ] && ! command -v docker >/dev/null 2>&1; then
     command -v apt-get >/dev/null 2>&1 \
         || fail "Docker не найден, а apt-get нет: поставьте Docker сами и повторите"
     echo "Ставлю Docker (docker.io)…"
@@ -53,6 +72,22 @@ curl -fsSL -o "$TMP/tmnode-$ARCH-linux" "$BASE/tmnode-$ARCH-linux"
 curl -fsSL -o "$TMP/SHA256SUMS" "$BASE/SHA256SUMS"
 (cd "$TMP" && grep " tmnode-$ARCH-linux\$" SHA256SUMS | sha256sum -c -) \
     || fail "контрольная сумма tmnode не сошлась"
-install -m 0755 "$TMP/tmnode-$ARCH-linux" "$BIN"
 
-exec "$BIN" "$@"
+if [ "$MODE" = "run" ]; then
+    install -m 0755 "$TMP/tmnode-$ARCH-linux" "$BIN"
+    exec "$BIN" "$@"
+fi
+
+# agent-upgrade: новый бинарь должен запускаться до того, как заменит
+# прежний; замена — rename в том же каталоге, работающая служба её не
+# замечает до перезапуска.
+chmod 0755 "$TMP/tmnode-$ARCH-linux"
+NEW_VERSION="$("$TMP/tmnode-$ARCH-linux" version)" \
+    || fail "скачанный tmnode не запускается на этом сервере"
+install -m 0755 "$TMP/tmnode-$ARCH-linux" "$BIN.new"
+if [ -f "$BIN" ]; then
+    cp -p "$BIN" "$BIN.prev"
+fi
+mv -f "$BIN.new" "$BIN"
+systemctl restart "$UNIT"
+echo "Поставлен $NEW_VERSION, служба $UNIT перезапущена. Прежний бинарь — $BIN.prev."
