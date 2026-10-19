@@ -99,6 +99,7 @@ pub fn encode_signed_server_config(
         blob_quota_per_owner: config.blobs.map_or(0, |blobs| blobs.quota_per_owner),
         blob_get_window: config.blobs.map_or(0, |blobs| blobs.get_window),
         blob_min_charge: config.blobs.map_or(0, |blobs| blobs.min_charge),
+        supports_ice_servers: config.supports_ice_servers,
     };
 
     // Подписываются именно эти байты, и они же уезжают клиенту: protobuf
@@ -205,6 +206,11 @@ pub fn encode_send_ack(ok: bool, queued: bool, queue_id: u64, reason: SendReject
         queue_id,
         reason: reason.to_wire(),
     }))
+}
+
+/// Ответ на `GetIceServers` (§6.12).
+pub fn encode_ice_servers(reply: wire::IceServers) -> Vec<u8> {
+    encode_frame(frame::Payload::IceServers(reply))
 }
 
 pub fn encode_pong() -> Vec<u8> {
@@ -370,6 +376,7 @@ mod tests {
 
     fn snapshot() -> ServerConfigSnapshot {
         ServerConfigSnapshot {
+            supports_ice_servers: false,
             max_frame_len: 1024,
             supports_device_addressing: true,
             deleted_messages_retention: RetentionPolicy::Disabled,
@@ -577,6 +584,7 @@ mod tests {
         let node = node(16);
         let encoded = encode_signed_server_config(
             &ServerConfigSnapshot {
+                supports_ice_servers: false,
                 advertised_address: None,
                 offline_messages_retention: RetentionPolicy::Disabled,
                 supports_delivery_ack: false,
@@ -609,6 +617,7 @@ mod tests {
         };
         let encoded = encode_signed_server_config(
             &ServerConfigSnapshot {
+                supports_ice_servers: false,
                 blobs: Some(blobs),
                 ..snapshot()
             },

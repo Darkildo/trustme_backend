@@ -490,6 +490,12 @@ message ServerConfig {
   // отправить внутри сообщения. 0 — блоб считается по размеру.
   uint64 blob_min_charge = 30;
 
+  // Нода выдаёт временные учётки STUN/TURN для звонков: `GetIceServers` →
+  // `IceServers` (server-contract.md, §6.12). `false` — оператор не
+  // настроил ни одного ICE-сервера, и запрос получит `NOT_CONFIGURED`.
+  // Меняется без перезапуска ноды.
+  bool supports_ice_servers = 31;
+
   // Номера 9–11 зарезервированы под удалённые поля версий клиента и ссылки
   // на обновление. Оператор ноды не должен влиять на дистрибуцию
   // клиентских бинарей: это забота вендорского подписанного манифеста, а
@@ -921,6 +927,40 @@ message Ping {}
 
 message Pong {}
 
+// Запрос ICE-серверов перед звонком (server-contract.md, §6.12). Только в
+// сессии сообщений.
+message GetIceServers {}
+
+// Ответ на `GetIceServers`.
+message IceServers {
+  // Серверы для `RTCPeerConnection.iceServers`. Пусто при отказе.
+  repeated IceServer servers = 1;
+  // Unix-секунды, после которых учётки TURN не действуют. Звонок, который
+  // идёт через TURN дольше, клиент продлевает ICE restart со свежими
+  // учётками.
+  uint64 expires_at = 2;
+  // `ICE_REJECT_REASON_UNSPECIFIED` — учётки выданы.
+  IceRejectReason reason = 3;
+}
+
+message IceServer {
+  // `stun:`, `stuns:`, `turn:` или `turns:` URL.
+  repeated string urls = 1;
+  // Пусто у STUN. У TURN — `<expires_at>:<псевдоним>`: псевдоним
+  // постоянен для пользователя на этой ноде и не раскрывает его ключ.
+  string username = 2;
+  // Пусто у STUN. У TURN — пароль по схеме coturn REST.
+  string credential = 3;
+}
+
+enum IceRejectReason {
+  ICE_REJECT_REASON_UNSPECIFIED = 0;
+  // Оператор не настроил ICE-серверы.
+  ICE_REJECT_REASON_NOT_CONFIGURED = 1;
+  // Слишком часто: общий лимит управляющих кадров сессии.
+  ICE_REJECT_REASON_RATE_LIMITED = 2;
+}
+
 // Универсальный конверт. Ровно один вариант `payload` на кадр. Кадр без
 // payload или с вариантом, который нода не обрабатывает, — не ошибка
 // формата: нода его игнорирует, что оставляет место для расширений.
@@ -961,5 +1001,7 @@ message Frame {
     BlobAck blob_ack = 32;
     BlobData blob_data = 33;
     BlobStatResult blob_stat_result = 34;
+    GetIceServers get_ice_servers = 35;
+    IceServers ice_servers = 36;
   }
 }

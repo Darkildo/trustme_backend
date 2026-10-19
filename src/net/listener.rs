@@ -7,6 +7,7 @@ use crate::blob::BlobStore;
 use crate::config::{Config, LimitsConfig, SharedServerConfig};
 use crate::delivery::DeliveryBackend;
 use crate::net::conn::handle_conn;
+use crate::net::ice::SharedIce;
 use crate::net::noise::{HandshakePolicy, NodeIdentity};
 use crate::net::rate_limit::{HandshakeAdmission, LiveGate, SessionLimits};
 use crate::observability;
@@ -41,6 +42,8 @@ pub struct Live {
     /// одного адреса приходят сотни честных устройств.
     pub connections: Arc<LiveGate>,
     pub server_config: SharedServerConfig,
+    /// ICE-серверы для учёток звонков (§6.12).
+    pub ice: SharedIce,
     pub blobs: Option<BlobStore>,
 }
 
@@ -54,6 +57,7 @@ impl Live {
             )),
             connections: Arc::new(LiveGate::new(cfg.limits.max_connections)),
             server_config: SharedServerConfig::new(cfg.server_config_snapshot()),
+            ice: SharedIce::new(cfg.ice.clone()),
             blobs,
         })
     }
@@ -71,6 +75,7 @@ impl Live {
         if let Some(store) = &self.blobs {
             store.set_config(&cfg.blobs);
         }
+        self.ice.replace(cfg.ice.clone());
         self.server_config.replace(cfg.server_config_snapshot());
     }
 }
@@ -180,6 +185,7 @@ pub async fn accept_loop_live(
         let push_tokens = push_tokens.clone();
         let push_scheduler = push_scheduler.clone();
         let server_config = live.server_config.clone();
+        let ice = live.ice.clone();
         let limits = live.limits.clone();
         let node = node.clone();
         let blobs = live.blobs.clone();
@@ -200,6 +206,7 @@ pub async fn accept_loop_live(
                 node,
                 handshake_policy,
                 server_config,
+                ice,
                 limits,
                 admission_guard,
                 blobs,

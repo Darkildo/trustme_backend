@@ -37,6 +37,13 @@ sha2 = { version = "0.11", default-features = false }
 fs2 = "0.4"
 subtle = "2"
 zeroize = "1"
+# Временные TURN-учётки по схеме coturn REST: пароль — base64 от
+# HMAC-SHA1 общего секрета. SHA-1 здесь задан протоколом coturn, а не
+# выбран нами. hmac и sha1 — той же линейки digest 0.11, что sha2;
+# base64 0.22 уже в дереве.
+hmac = "0.13"
+sha1 = "0.11"
+base64 = "0.22"
 
 # Напрямую не используется: объявлен ради фич по умолчанию (в т.ч.
 # prefer-post-quantum) у rustls, через который ходят reqwest и tonic.

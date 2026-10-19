@@ -247,6 +247,7 @@ fn main() -> Result<()> {
     println!("signed_server_config:");
     let node = NodeIdentity::from_seed([7u8; 32], NodeKeySource::Configured);
     let snapshot = ServerConfigSnapshot {
+        supports_ice_servers: false,
         supports_queue_addressing: false,
         device_cert_max_ttl: std::time::Duration::from_secs(30 * 24 * 3600),
         max_frame_len: 8 * 1024 * 1024,

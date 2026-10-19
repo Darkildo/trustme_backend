@@ -149,6 +149,7 @@ u32 LE длина логического кадра || тело кадра   ←
 | `BlobDelete` | `blobId(32)`, `deleteToken(32)`, `requestId` | Удалить файл (загрузивший); только в сессии `BLOB` |
 | `BlobExtend` | `blobId(32)`, `deleteToken(32)`, `ttlSeconds`, `requestId` | Продлить срок файла (загрузивший); только в сессии `BLOB` |
 | `BlobStat` | `items[]: {blobSecret(32) \| blobId(32) + deleteToken(32)}` (≤ 64), `requestId` | Проверить наличие файлов пачкой; в сессиях обеих ролей |
+| `GetIceServers` | — | Временные учётки STUN/TURN перед звонком (§6.12); только в сессии сообщений |
 
 ### Сервер → клиент
 
@@ -166,6 +167,7 @@ u32 LE длина логического кадра || тело кадра   ←
 | `BlobAck` | `requestId`, `ok: bool`, `reason: BlobRejectReason`, `blobId(32)`, `committedOffset`, `expiresAt` | Исход операции хранилища файлов; прогресс загрузки (`requestId = 0`); отказ посреди ответа на `BlobGet` (§6.11) |
 | `BlobData` | `requestId`, `offset`, `data`, `eof: bool` | Кусок ответа на `BlobGet` |
 | `BlobStatResult` | `requestId`, `entries[]: {state: BlobState, expiresAt, releasesDone, maxReleases}` | Ответ на `BlobStat`, в порядке запроса |
+| `IceServers` | `servers[]: {urls[], username, credential}`, `expiresAt`, `reason: IceRejectReason` | Ответ на `GetIceServers` (§6.12) |
 
 ### Вспомогательные типы
 
@@ -296,6 +298,7 @@ seed), поэтому пиннить нужно одну величину — X2
 | `blobQuotaPerOwner` | Сколько байт файлов может храниться на один ящик (личные файлы) или аккаунт (свои файлы) |
 | `blobGetWindow` | Сколько байт нода отдаёт в ответ на один `BlobGet` |
 | `blobMinCharge` | Минимальный учётный размер блоба в квотах, байт: файл меньше считается за столько. 0 — по размеру |
+| `supportsIceServers` | true — оператор настроил ICE-серверы, `GetIceServers` выдаёт учётки (§6.12). Меняется без перезапуска ноды |
 
 Полей о версиях клиента и ссылке на обновление в снапшоте нет (номера 9–11
 зарезервированы): снапшот подписан ключом конкретной ноды, и оператор ноды
@@ -1353,6 +1356,54 @@ min(ttlSeconds, потолок)` (`0` — потолок; можно и сокр
 Метрики — `blob_ops_total{op,result}`, `blob_bytes_total`,
 `blob_removed_total{cause}`, `blob_stored_bytes`, `blob_count`
 ([runbook-metrics.md](docs/runbook-metrics.md)).
+
+### 6.12. Учётки ICE для звонков
+
+WebRTC-звонок идёт напрямую между устройствами. Если прямой путь закрыт
+(симметричный NAT, корпоративный файрвол), медиа идёт через TURN-сервер.
+Чужой TURN бесплатно не работает: нода выдаёт своим пользователям
+временные учётки к серверам, которые настроил её оператор.
+
+**Когда спрашивать.**
+- Перед звонком — исходящим и входящим.
+- Только если в подписанном конфиге `supportsIceServers = true`.
+- Только из сессии сообщений; в сессии `BLOB` кадр игнорируется.
+- Подходит и делегированная сессия любого scope: принять звонок может и
+  устройство только на приём.
+
+**Ответ `IceServers`:**
+
+| Поле | Смысл |
+|---|---|
+| `servers[]` | Готово для `RTCPeerConnection.iceServers`. У STUN `username` и `credential` пусты |
+| `expiresAt` | Unix-секунды. После них учётки TURN не принимаются |
+| `reason` | `UNSPECIFIED` — выдано; `NOT_CONFIGURED` — серверов нет; `RATE_LIMITED` — слишком часто |
+
+**Учётки TURN** — по схеме coturn REST (`use-auth-secret`):
+
+```
+username   = "<expiresAt>:<псевдоним>"
+credential = base64(HMAC-SHA1(общий секрет TURN, username))
+```
+
+Псевдоним — первые 8 байт `SHA-256("trustmessage/ice-user/v1\0" ‖ userId)`
+в hex. Он постоянен для пользователя на ноде: оператор TURN видит, что
+сессии принадлежат одному человеку, но не видит его ключ.
+
+**Срок** — `ICE_CREDENTIAL_TTL_SECS`, по умолчанию 2 ч. TURN проверяет
+срок и при продлении выделенного канала, поэтому звонок, который идёт
+через TURN дольше срока, оборвётся. Клиент, звонок которого приближается к
+`expiresAt`, запрашивает свежие учётки и делает ICE restart.
+
+**Лимит.** `GetIceServers` расходует общий бюджет управляющих кадров
+сессии (`LIMIT_CONTROL_PER_SEC`); сверх него — `RATE_LIMITED`.
+
+**Настройка.** Серверы и секреты задаются только в `runtime.toml`,
+секция `[ice]` (docs/runtime-config.md), и меняются без перезапуска ноды:
+следующий запрос получит новые серверы, а `supportsIceServers` — новое
+значение.
+
+Метрика — `ice_requests_total{result}`.
 
 ---
 

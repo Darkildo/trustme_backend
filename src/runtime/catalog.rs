@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-use crate::config::{BlobConfig, Config, LimitsConfig};
+use crate::config::{BlobConfig, Config, IceConfig, LimitsConfig};
 
 /// Когда изменение настройки начинает действовать.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -39,6 +39,8 @@ pub enum Group {
     Blobs,
     /// Сертификаты и подписанный конфиг.
     Security,
+    /// Звонки: учётки ICE-серверов.
+    Calls,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -60,6 +62,9 @@ pub struct Tunables {
     pub blobs: BlobConfig,
     pub device_cert_max_ttl_secs: u64,
     pub server_config_ttl_secs: u64,
+    /// ICE-серверы и срок учёток. Серверы — не настройки каталога: это
+    /// список с секретами, он задаётся секцией `[ice]` файла.
+    pub ice: IceConfig,
 }
 
 impl Default for Tunables {
@@ -69,6 +74,7 @@ impl Default for Tunables {
             blobs: BlobConfig::default(),
             device_cert_max_ttl_secs: 30 * 24 * 3600,
             server_config_ttl_secs: 24 * 3600,
+            ice: IceConfig::default(),
         }
     }
 }
@@ -80,6 +86,7 @@ impl Tunables {
             blobs: cfg.blobs.clone(),
             device_cert_max_ttl_secs: cfg.device_cert_max_ttl.as_secs(),
             server_config_ttl_secs: cfg.server_config_ttl.as_secs(),
+            ice: cfg.ice.clone(),
         }
     }
 
@@ -88,6 +95,7 @@ impl Tunables {
         cfg.blobs = self.blobs.clone();
         cfg.device_cert_max_ttl = Duration::from_secs(self.device_cert_max_ttl_secs);
         cfg.server_config_ttl = Duration::from_secs(self.server_config_ttl_secs);
+        cfg.ice = self.ice.clone();
     }
 }
 
@@ -604,6 +612,19 @@ pub static CATALOG: &[Setting] = &[
         false,
         "Срок жизни подписанного конфига у клиента",
         |t| t.server_config_ttl_secs,
+        u64
+    ),
+    // Звонки.
+    setting!(
+        "ice_credential_ttl_secs",
+        Calls,
+        Seconds,
+        Hot,
+        300,
+        DAY,
+        false,
+        "Срок временной учётки TURN; звонок длиннее продлевается ICE restart",
+        |t| t.ice.credential_ttl_secs,
         u64
     ),
 ];

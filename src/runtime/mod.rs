@@ -25,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, IceServerConfig};
 use crate::net::listener::Live;
 use crate::net::rate_limit::unix_now_secs;
 use crate::observability;
@@ -46,6 +46,85 @@ pub struct RuntimeFile {
     /// Настройки каталога: имя → значение.
     #[serde(default)]
     pub settings: BTreeMap<String, u64>,
+    /// ICE-серверы для звонков (server-contract.md §6.12). Нет секции —
+    /// серверы из окружения (то есть никаких).
+    pub ice: Option<IceSection>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct IceSection {
+    #[serde(default)]
+    pub servers: Vec<IceServerSection>,
+}
+
+#[derive(Clone, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct IceServerSection {
+    pub urls: Vec<String>,
+    /// Общий секрет coturn (`static-auth-secret`). Обязателен у `turn:` и
+    /// `turns:`, запрещён у STUN.
+    pub secret: Option<String>,
+}
+
+/// Секрет TURN в отладочный вывод не попадает.
+impl std::fmt::Debug for IceServerSection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IceServerSection")
+            .field("urls", &self.urls)
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
+/// Сколько ICE-серверов и URL у одного сервера принимает нода.
+const MAX_ICE_SERVERS: usize = 8;
+const MAX_ICE_URLS: usize = 8;
+/// Короче — секрет TURN перебирается.
+const MIN_ICE_SECRET: usize = 16;
+
+impl IceServerSection {
+    fn validate(&self, index: usize) -> Result<IceServerConfig> {
+        let at = |what: String| anyhow!("ice.servers[{index}]: {what}");
+        if self.urls.is_empty() || self.urls.len() > MAX_ICE_URLS {
+            return Err(at(format!("от 1 до {MAX_ICE_URLS} urls")));
+        }
+        let mut turn = false;
+        for url in &self.urls {
+            let (scheme, rest) = url.split_once(':').unwrap_or(("", ""));
+            match scheme {
+                "turn" | "turns" => turn = true,
+                "stun" | "stuns" => {}
+                _ => {
+                    return Err(at(format!(
+                        "`{url}`: ожидается stun:, stuns:, turn: или turns:"
+                    )));
+                }
+            }
+            if rest.is_empty() || url.len() > 256 || url.chars().any(char::is_whitespace) {
+                return Err(at(format!("`{url}`: неверный адрес")));
+            }
+        }
+        let secret = self
+            .secret
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        match (turn, secret) {
+            (true, None) => {
+                return Err(at("у TURN нужен secret (static-auth-secret coturn)".into()));
+            }
+            (false, Some(_)) => return Err(at("у STUN secret не нужен".into())),
+            (true, Some(secret)) if secret.len() < MIN_ICE_SECRET => {
+                return Err(at(format!("secret короче {MIN_ICE_SECRET} символов")));
+            }
+            _ => {}
+        }
+        Ok(IceServerConfig {
+            urls: self.urls.clone(),
+            secret: secret.map(str::to_owned),
+        })
+    }
 }
 
 impl RuntimeFile {
@@ -63,6 +142,17 @@ impl RuntimeFile {
     /// значение вне пределов или вместе они несовместимы.
     pub fn overlay(&self, base: &Tunables, max_frame_len: usize) -> Result<Tunables> {
         let mut out = base.clone();
+        if let Some(ice) = &self.ice {
+            if ice.servers.len() > MAX_ICE_SERVERS {
+                bail!("ice.servers: не больше {MAX_ICE_SERVERS}");
+            }
+            out.ice.servers = ice
+                .servers
+                .iter()
+                .enumerate()
+                .map(|(i, server)| server.validate(i))
+                .collect::<Result<_>>()?;
+        }
         for (key, value) in &self.settings {
             let setting =
                 catalog::find(key).ok_or_else(|| anyhow!("неизвестная настройка `{key}`"))?;
@@ -376,6 +466,63 @@ mod tests {
             .overlay(&base, frame)
             .unwrap_err();
         assert!(format!("{err:#}").contains("MAX_FRAME_LEN"));
+    }
+
+    #[test]
+    fn ice_section_is_validated() {
+        let base = Tunables::default();
+        let frame = 8 * 1024 * 1024;
+        let ok = RuntimeFile::parse(
+            r#"
+[settings]
+ice_credential_ttl_secs = 600
+
+[[ice.servers]]
+urls = ["stun:stun.example.org:3478"]
+
+[[ice.servers]]
+urls = ["turn:turn.example.org:3478?transport=udp", "turns:turn.example.org:5349"]
+secret = "0123456789abcdef0123"
+"#,
+        )
+        .unwrap()
+        .overlay(&base, frame)
+        .unwrap();
+        assert_eq!(ok.ice.servers.len(), 2);
+        assert_eq!(ok.ice.credential_ttl_secs, 600);
+        assert!(ok.ice.servers[0].secret.is_none());
+        // Секрет не попадает в отладочный вывод.
+        assert!(!format!("{:?}", ok.ice).contains("0123456789abcdef0123"));
+
+        for (text, needle) in [
+            ("[[ice.servers]]\nurls = []\n", "urls"),
+            ("[[ice.servers]]\nurls = [\"http://x\"]\n", "stun:"),
+            ("[[ice.servers]]\nurls = [\"turn:\"]\n", "неверный адрес"),
+            (
+                "[[ice.servers]]\nurls = [\"turn:x:3478\"]\n",
+                "нужен secret",
+            ),
+            (
+                "[[ice.servers]]\nurls = [\"turn:x:3478\"]\nsecret = \"short\"\n",
+                "короче",
+            ),
+            (
+                "[[ice.servers]]\nurls = [\"stun:x:3478\"]\nsecret = \"0123456789abcdef0123\"\n",
+                "не нужен",
+            ),
+            ("[ice]\nfoo = 1\n", "неверная структура"),
+        ] {
+            let err = RuntimeFile::parse(text)
+                .and_then(|f| f.overlay(&base, frame))
+                .expect_err(text);
+            assert!(format!("{err:#}").contains(needle), "{text}: {err:#}");
+        }
+        let many = "[[ice.servers]]\nurls = [\"stun:x:1\"]\n".repeat(9);
+        let err = RuntimeFile::parse(&many)
+            .unwrap()
+            .overlay(&base, frame)
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("не больше"));
     }
 
     #[test]

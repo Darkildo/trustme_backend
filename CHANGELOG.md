@@ -6,6 +6,18 @@
 
 ## Не выпущено
 
+### Учётки для звонков (ICE)
+
+- Кадры `GetIceServers` → `IceServers` (ветки `Frame.payload` 35–36) и
+  `ServerConfig.supports_ice_servers` (31): нода выдаёт временные учётки
+  STUN/TURN перед звонком (server-contract.md §6.12).
+- Учётки TURN — по схеме coturn REST: `<срок>:<псевдоним>` и base64 от
+  HMAC-SHA1 общего секрета. Псевдоним — хэш `user_id`, ключ пользователя
+  в TURN не уходит. Срок — `ice_credential_ttl_secs`, по умолчанию 2 ч.
+- Серверы и секреты — секция `[ice]` в `runtime.toml`, меняются без
+  перезапуска. Запросы считаются в общем лимите управляющих кадров.
+  Метрика — `ice_requests_total{result}`.
+
 ### Лимиты без перезапуска
 
 - Файл `runtime.toml` (`RUNTIME_CONFIG_PATH`, по умолчанию

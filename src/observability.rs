@@ -322,6 +322,11 @@ pub fn observe_node_key(source: &'static str) {
     gauge!("trust_message_tcp_node_key_source", "source" => source).set(1.0);
 }
 
+/// Запрос учёток ICE (§6.12): `issued`, `not_configured`, `rate_limited`.
+pub fn observe_ice_request(result: &'static str) {
+    counter!("trust_message_tcp_ice_requests_total", "result" => result).increment(1);
+}
+
 /// Попытка применить `runtime.toml`: `applied` или `invalid`. Рост
 /// `invalid` значит, что нода работает не на тех настройках, которые ей
 /// прислали.

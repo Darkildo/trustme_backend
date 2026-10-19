@@ -17,10 +17,11 @@ use crate::domain::wake::WakeHint;
 use crate::net::blob_session::{self, BlobContext, BlobPeer, is_blob_request};
 use crate::net::framing::{
     PROTO_VERSION, QueueListing, as_fixed_32, decode_device_id, decode_frame, encode_auth_error,
-    encode_auth_ok, encode_incoming_via_queue, encode_pong, encode_push_token_ack,
-    encode_queue_ack, encode_queue_list, encode_send_ack, encode_signed_server_config,
-    max_send_body_len,
+    encode_auth_ok, encode_ice_servers, encode_incoming_via_queue, encode_pong,
+    encode_push_token_ack, encode_queue_ack, encode_queue_list, encode_send_ack,
+    encode_signed_server_config, max_send_body_len,
 };
+use crate::net::ice::{self, SharedIce};
 use crate::net::noise::{HandshakePolicy, NodeIdentity, NoiseFramed, SessionRole};
 use crate::net::rate_limit::{AdmissionGuard, PingGate, SessionLimits, unix_now_secs};
 use crate::observability::{self, ConnectionMetricsGuard};
@@ -32,6 +33,7 @@ use crate::state::{
     registry::{ConnRegistry, DeviceId, OutboundFrame, SessionRevocation, UserId},
     storage::{EnqueueResult, InboxScope, QueueQuotaCeilings, Storage},
 };
+use crate::wire::IceRejectReason;
 use crate::wire::QueueRejectReason as WireQueueRejectReason;
 use crate::wire::frame;
 
@@ -39,6 +41,16 @@ use crate::wire::frame;
 /// порциями цикл успевает прочитать кадры клиента — подтверждения в том
 /// числе, — а не пишет весь бэклог одним куском.
 const PULL_BATCH: usize = 64;
+
+/// Метка исхода `GetIceServers` для метрики.
+fn ice_outcome(reply: &crate::wire::IceServers) -> &'static str {
+    match IceRejectReason::try_from(reply.reason) {
+        Ok(IceRejectReason::Unspecified) => "issued",
+        Ok(IceRejectReason::NotConfigured) => "not_configured",
+        Ok(IceRejectReason::RateLimited) => "rate_limited",
+        Err(_) => "unknown",
+    }
+}
 
 struct RegistryCleanup {
     registry: ConnRegistry,
@@ -65,6 +77,7 @@ pub async fn handle_conn(
     node: Arc<NodeIdentity>,
     handshake_policy: HandshakePolicy,
     shared_config: SharedServerConfig,
+    ice: SharedIce,
     limits: Arc<SessionLimits>,
     admission_guard: AdmissionGuard,
     blobs: Option<BlobStore>,
@@ -474,6 +487,7 @@ pub async fn handle_conn(
                       message_id: u64,
                   },
                   GetServerConfig,
+                  GetIceServers,
                   Ping,
                   RegisterPushToken {
                       token: String,
@@ -546,6 +560,7 @@ pub async fn handle_conn(
                       message_id: ack.message_id,
                   },
                   Some(frame::Payload::GetServerConfig(_)) => ClientFrame::GetServerConfig,
+                  Some(frame::Payload::GetIceServers(_)) => ClientFrame::GetIceServers,
                   Some(frame::Payload::Ping(_)) => ClientFrame::Ping,
                   Some(frame::Payload::RegisterPushToken(req)) => ClientFrame::RegisterPushToken {
                       token: req.token,
@@ -1199,6 +1214,18 @@ pub async fn handle_conn(
                           encode_signed_server_config(&shared_config.current(), &node, unix_now_secs());
                       framed.send_frame(&response).await?;
                       debug!(user = %hex::encode(user_id), "sent server config to authenticated client");
+                  }
+                  ClientFrame::GetIceServers => {
+                      // Учётки дёшевы, но выдаются по общему бюджету
+                      // управляющих кадров сессии: иначе это был бы
+                      // бесплатный генератор нагрузки на HMAC.
+                      let reply = if control_gate.allow(unix_now_secs()) {
+                          ice::issue(&ice.current(), &user_id, unix_now_secs())
+                      } else {
+                          ice::reject(IceRejectReason::RateLimited)
+                      };
+                      observability::observe_ice_request(ice_outcome(&reply));
+                      framed.send_frame(&encode_ice_servers(reply)).await?;
                   }
                   ClientFrame::RegisterPushToken { token, platform } => {
                       // Платформа обязательна: по ней выбирается слот токена (FCM или VoIP).
