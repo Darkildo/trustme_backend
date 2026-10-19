@@ -98,8 +98,16 @@ jobs:
           TAG: ${{ github.ref_name }}
         run: |
           image="ghcr.io/${GITHUB_REPOSITORY,,}"
-          docker buildx imagetools inspect "$image:$GITHUB_SHA" >/dev/null \
-            || { echo "образ $image:$GITHUB_SHA не найден: тег не на коммите master?"; exit 1; }
+          # Тег ставится сразу после fast-forward master, а образ коммита
+          # docker-image.yml публикует несколько минут спустя: ждём его.
+          for attempt in $(seq 1 60); do
+            docker buildx imagetools inspect "$image:$GITHUB_SHA" >/dev/null 2>&1 && break
+            if [ "$attempt" = 60 ]; then
+              echo "образ $image:$GITHUB_SHA не появился за 30 минут: тег не на коммите master?"
+              exit 1
+            fi
+            sleep 30
+          done
           docker buildx imagetools create \
             --tag "$image:$TAG" \
             --tag "$image:stable" \
