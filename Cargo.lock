@@ -2992,7 +2992,7 @@ checksum = "fd3ca314f692efd6c868f8408f53fe444634a845f96c028b97d35f6a1f79f0ee"
 
 [[package]]
 name = "tmnode"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "fs2",
@@ -3309,7 +3309,7 @@ dependencies = [
 
 [[package]]
 name = "trust_message_tcp"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "async-nats",
