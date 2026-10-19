@@ -201,6 +201,8 @@ pub async fn tick<S: System>(
             node_key: config.endpoint.as_ref().map(|e| e.node_key.clone()),
             report: Some(serde_json::to_value(&report).expect("report serializes")),
             runtime_status,
+            node_image: None,
+            update: None,
         })
         .await?;
 
