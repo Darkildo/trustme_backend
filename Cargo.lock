@@ -2996,7 +2996,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "fs2",
+ "getrandom 0.4.3",
  "hex",
+ "reqwest",
  "serde",
  "serde_json",
  "tokio",

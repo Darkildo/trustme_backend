@@ -4,16 +4,55 @@
 администрирования поднимал свою ноду одной командой, а команды и сисадмины
 компаний разворачивали парк нод и управляли им через admin-сервис.
 
-Сейчас готов нулевой этап: **`tmnode doctor`** — проверка ноды только на
-чтение — и два контракта, на которые опираются следующие этапы и
-admin-сервис:
+Готово:
+
+- **`tmnode doctor`** — проверка ноды только на чтение;
+- **`tmnode install`** — нода на чистом сервере одной командой, по
+  желанию с TURN;
+- **`tmnode enroll` и `tmnode agent`** — подключение к админке и связь с
+  ней (протокол — [agent-protocol.md](agent-protocol.md)).
+
+Два контракта, на которые опираются эти команды и admin-сервис:
 
 - [`node.toml`](#nodetoml-схема-1) — описание ноды;
 - [`tmnode.report/1`](#отчёт-tmnodereport1) — машиночитаемый отчёт проверок.
 
-Дальше по плану: `install` (установка из готового образа), `pair` (ссылка и
-QR для клиента), `update` / `rollback`, `backup` / `restore`, `enroll`
-(подключение к admin-сервису).
+Дальше по плану: `pair` (ссылка и QR для клиента), `update` /
+`rollback`, `backup` / `restore`.
+
+## Установка ноды одной командой
+
+На чистом сервере Debian или Ubuntu:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Darkildo/trustme_backend/stable/deploy/install.sh \
+  | sudo sh -s -- install --public-host 203.0.113.10 --with-turn
+```
+
+Что происходит:
+
+1. `install.sh` ставит Docker, если его нет.
+2. Скачивает `tmnode` из GitHub Releases и сверяет SHA-256.
+3. `tmnode install` ставит:
+   - контейнер ноды из образа `ghcr.io/darkildo/trustme_backend:stable`;
+   - с `--with-turn` — coturn и секцию `[ice]` в `runtime.toml`, чтобы
+     нода выдавала учётки для звонков;
+   - `/etc/tmnode/node.toml`.
+4. Печатает адрес, ключ и отпечаток ноды.
+
+Флаги `install`:
+
+| Флаг | Смысл |
+|---|---|
+| `--public-host` | адрес, по которому к ноде ходят клиенты (обязателен) |
+| `--port` | порт ноды (по умолчанию 18081) |
+| `--backend sled\|jetstream` | бэкенд доставки; JetStream ставит рядом NATS |
+| `--with-turn` | поставить coturn для звонков. Нужны открытые порты 3478/udp+tcp и 49160–49200/udp |
+| `--image` | другой образ ноды |
+
+С админкой вместо `install` используется `enroll --url … --token …` —
+команду с токеном показывает панель
+([agent-protocol.md](agent-protocol.md)).
 
 ## Принципы
 
