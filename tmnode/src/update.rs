@@ -25,7 +25,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::doctor::{self, ConfigSource, Input};
-use crate::install::{Layout, Runner};
+use crate::install::{Layout, Runner, Stalled};
 use crate::node_config::{Channel, ManagementMode, NodeConfig};
 use crate::protocol::{UpdateOrder, UpdateState, UpdateStatus, UpdateStep};
 use crate::report::{Report, Status};
@@ -49,6 +49,15 @@ const LOG_TAIL_BYTES: usize = 2048;
 const ERROR_MAX_BYTES: usize = 4096;
 const MAX_BINARY_BYTES: usize = 64 * 1024 * 1024;
 const MAX_SUMS_BYTES: usize = 64 * 1024;
+/// Скачивание файла релиза: столько без единого байта — соединение
+/// зависло, попытка обрывается.
+const FETCH_STALL: Duration = Duration::from_secs(30);
+const FETCH_ATTEMPTS: u32 = 3;
+const FETCH_BACKOFF: Duration = Duration::from_secs(5);
+/// `docker pull` без вывода. Строку он печатает на каждом этапе слоя, а не
+/// на каждом мегабайте: большой слой на медленном канале молчит минутами.
+const PULL_IDLE: Duration = Duration::from_secs(300);
+const PULL_ATTEMPTS: u32 = 3;
 
 /// Версия `X.Y.Z`: только цифры, без ведущих нулей. Сравнивается по
 /// числам, а не как строка: `0.10.0` новее `0.9.0`.
@@ -183,13 +192,33 @@ pub trait Fetch {
     async fn get(&self, url: &str, limit: usize) -> Result<Vec<u8>>;
 }
 
-/// Скачивание по HTTPS.
+/// Скачивание по HTTPS. Зависшее соединение (данные перестали идти)
+/// обрывается через [`FETCH_STALL`], сбой сети и ответ 5xx повторяются до
+/// [`FETCH_ATTEMPTS`] раз: CDN релизов бывает доступен через раз.
 pub struct HttpFetch {
     client: reqwest::Client,
+    stall: Duration,
+    attempts: u32,
+    backoff: Duration,
+}
+
+/// Исход одной попытки: повторять ли.
+enum Attempt {
+    Retry(anyhow::Error),
+    Final(anyhow::Error),
 }
 
 impl HttpFetch {
     pub fn new(sources: &Sources) -> Result<Self> {
+        Self::with_limits(sources, FETCH_STALL, FETCH_ATTEMPTS, FETCH_BACKOFF)
+    }
+
+    pub fn with_limits(
+        sources: &Sources,
+        stall: Duration,
+        attempts: u32,
+        backoff: Duration,
+    ) -> Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder()
                 .connect_timeout(Duration::from_secs(15))
@@ -199,37 +228,75 @@ impl HttpFetch {
                 .https_only(sources.releases_url.starts_with("https://"))
                 .user_agent(concat!("tmnode/", env!("CARGO_PKG_VERSION")))
                 .build()?,
+            stall,
+            attempts: attempts.max(1),
+            backoff,
         })
+    }
+
+    async fn attempt(&self, url: &str, limit: usize) -> Result<Vec<u8>, Attempt> {
+        let stall = self.stall.as_secs();
+        let mut response = match tokio::time::timeout(self.stall, self.client.get(url).send()).await
+        {
+            Err(_) => return Err(Attempt::Retry(anyhow!("{url}: нет ответа {stall} с"))),
+            Ok(Err(err)) => {
+                return Err(Attempt::Retry(
+                    anyhow!(err).context(format!("{url} недоступен")),
+                ));
+            }
+            Ok(Ok(response)) => response,
+        };
+        let status = response.status();
+        if status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return Err(Attempt::Retry(anyhow!("{url}: {status}")));
+        }
+        if !status.is_success() {
+            return Err(Attempt::Final(anyhow!("{url}: {status}")));
+        }
+        if response.content_length().is_some_and(|n| n > limit as u64) {
+            return Err(Attempt::Final(anyhow!("{url}: больше {limit} байт")));
+        }
+        let mut body = Vec::new();
+        loop {
+            let chunk = match tokio::time::timeout(self.stall, response.chunk()).await {
+                Err(_) => {
+                    return Err(Attempt::Retry(anyhow!(
+                        "{url}: данные не идут {stall} с (получено {} байт)",
+                        body.len()
+                    )));
+                }
+                Ok(Err(err)) => {
+                    return Err(Attempt::Retry(
+                        anyhow!(err).context(format!("{url}: обрыв")),
+                    ));
+                }
+                Ok(Ok(None)) => return Ok(body),
+                Ok(Ok(Some(chunk))) => chunk,
+            };
+            if body.len() + chunk.len() > limit {
+                return Err(Attempt::Final(anyhow!("{url}: больше {limit} байт")));
+            }
+            body.extend_from_slice(&chunk);
+        }
     }
 }
 
 impl Fetch for HttpFetch {
     async fn get(&self, url: &str, limit: usize) -> Result<Vec<u8>> {
-        let mut response = self
-            .client
-            .get(url)
-            .send()
-            .await
-            .with_context(|| format!("{url} недоступен"))?;
-        let status = response.status();
-        if !status.is_success() {
-            bail!("{url}: {status}");
-        }
-        if response.content_length().is_some_and(|n| n > limit as u64) {
-            bail!("{url}: больше {limit} байт");
-        }
-        let mut body = Vec::new();
-        while let Some(chunk) = response
-            .chunk()
-            .await
-            .with_context(|| format!("{url}: обрыв"))?
-        {
-            if body.len() + chunk.len() > limit {
-                bail!("{url}: больше {limit} байт");
+        let mut attempt = 1;
+        loop {
+            match self.attempt(url, limit).await {
+                Ok(body) => return Ok(body),
+                Err(Attempt::Final(err)) => return Err(err),
+                Err(Attempt::Retry(err)) if attempt >= self.attempts => {
+                    return Err(err.context(format!("{attempt} попытки")));
+                }
+                Err(Attempt::Retry(_)) => {
+                    tokio::time::sleep(self.backoff * attempt).await;
+                    attempt += 1;
+                }
             }
-            body.extend_from_slice(&chunk);
         }
-        Ok(body)
     }
 }
 
@@ -750,7 +817,8 @@ impl<S: System, F: Fetch> Updater<'_, S, F> {
         self.step(run, UpdateStep::PullImage, progress)
             .await
             .map_err(failed)?;
-        self.docker(&["pull", &image])
+        self.pull(&image)
+            .await
             .with_context(|| format!("docker pull {image}"))
             .map_err(failed)?;
         let old = self
@@ -1036,6 +1104,21 @@ impl<S: System, F: Fetch> Updater<'_, S, F> {
         pin_key(&report).ok_or_else(|| {
             anyhow!("ключ ноды не прочитан: проверить новую ноду не с чем (tmnode doctor покажет причину)")
         })
+    }
+
+    /// `docker pull` с обрывом зависшей загрузки и повтором: прерванный
+    /// pull Docker отменяет, а скачанные слои сохраняет, так что повтор
+    /// докачивает остальное по новому соединению.
+    async fn pull(&self, image: &str) -> Result<()> {
+        let args = ["pull".to_owned(), image.to_owned()];
+        let mut attempt = 1;
+        loop {
+            match self.runner.run_long("docker", &args, PULL_IDLE).await {
+                Ok(_) => return Ok(()),
+                Err(err) if attempt < PULL_ATTEMPTS && err.is::<Stalled>() => attempt += 1,
+                Err(err) => return Err(err),
+            }
+        }
     }
 
     fn docker(&self, args: &[&str]) -> Result<String> {
@@ -1650,6 +1733,102 @@ pub fn parse_image_env(json: &str) -> Result<Vec<Zeroizing<String>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// HTTP-сервер, который отвечает по сценарию: по ответу на соединение,
+    /// `None` — принять запрос и молчать, как зависший CDN.
+    async fn serve(
+        script: Vec<Option<&'static str>>,
+    ) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/file", listener.local_addr().unwrap());
+        let served = std::sync::Arc::new(AtomicUsize::new(0));
+        let count = served.clone();
+        tokio::spawn(async move {
+            for answer in script {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                count.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match socket.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => request.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    match answer {
+                        Some(text) => {
+                            let _ = socket.write_all(text.as_bytes()).await;
+                        }
+                        None => {
+                            let _ = socket
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc")
+                                .await;
+                            tokio::time::sleep(Duration::from_secs(60)).await;
+                        }
+                    }
+                });
+            }
+        });
+        (url, served)
+    }
+
+    fn fetcher(attempts: u32) -> HttpFetch {
+        let sources = Sources {
+            image_repo: DEFAULT_IMAGE_REPO.into(),
+            releases_url: "http://127.0.0.1".into(),
+            arch: "x86_64".into(),
+        };
+        HttpFetch::with_limits(
+            &sources,
+            Duration::from_millis(300),
+            attempts,
+            Duration::from_millis(10),
+        )
+        .unwrap()
+    }
+
+    const FULL: &str =
+        "HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nabcdefghij";
+
+    #[tokio::test]
+    async fn stalled_and_failed_downloads_are_retried() {
+        let (url, served) = serve(vec![
+            None,
+            Some("HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+            Some(FULL),
+        ])
+        .await;
+        let body = fetcher(3).get(&url, 1024).await.unwrap();
+        assert_eq!(body, b"abcdefghij");
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn downloads_give_up_after_the_last_attempt_or_a_final_answer() {
+        let (url, served) = serve(vec![None, None, Some(FULL)]).await;
+        let err = format!("{:#}", fetcher(2).get(&url, 1024).await.unwrap_err());
+        assert!(
+            err.contains("данные не идут") && err.contains("2 попытки"),
+            "{err}"
+        );
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let (url, served) = serve(vec![
+            Some("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"),
+            Some(FULL),
+        ])
+        .await;
+        let err = format!("{:#}", fetcher(3).get(&url, 1024).await.unwrap_err());
+        assert!(err.contains("404"), "{err}");
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let (url, _) = serve(vec![Some(FULL)]).await;
+        let err = format!("{:#}", fetcher(3).get(&url, 4).await.unwrap_err());
+        assert!(err.contains("больше 4 байт"), "{err}");
+    }
 
     #[test]
     fn versions_are_strict_and_compared_as_numbers() {

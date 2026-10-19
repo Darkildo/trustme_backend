@@ -6,10 +6,12 @@
 //! Все действия идут через [`Runner`], и тесты сверяют точный список
 //! команд, не трогая машину.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use trust_message_tcp::net::noise::{NODE_KEY_FILE, NodeIdentity, NodeKeySource, fingerprint};
 
 use crate::node_config::Backend;
@@ -67,6 +69,19 @@ const COTURN_UID: u32 = 65534;
 pub trait Runner {
     /// Выполнить команду; ошибка — ненулевой код выхода с его stderr.
     fn run(&self, program: &str, args: &[String]) -> Result<String>;
+    /// Долгая команда (`docker pull`): не занимает поток, пока идёт, — агент
+    /// тем временем шлёт heartbeat, — и обрывается, если `idle` ничего не
+    /// выводит: зависшее соединение иначе держит её часами. Обрыв — ошибка
+    /// [`Stalled`]. По умолчанию — обычный [`Runner::run`].
+    fn run_long<'a>(
+        &'a self,
+        program: &'a str,
+        args: &'a [String],
+        idle: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
+        let _ = idle;
+        Box::pin(std::future::ready(self.run(program, args)))
+    }
     /// Записать файл атомарно с правами `mode` и владельцем `uid`.
     fn write_file(&self, path: &Path, contents: &[u8], mode: u32, uid: Option<u32>) -> Result<()>;
     fn create_dir(&self, path: &Path, uid: Option<u32>) -> Result<()>;
@@ -81,8 +96,88 @@ pub trait Runner {
     fn sleep(&self, duration: Duration);
 }
 
+/// Команда ничего не выводила дольше допустимого и оборвана.
+#[derive(Debug)]
+pub struct Stalled {
+    pub command: String,
+    pub idle: Duration,
+}
+
+impl std::fmt::Display for Stalled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: нет вывода {} с — оборвано",
+            self.command,
+            self.idle.as_secs()
+        )
+    }
+}
+
+impl std::error::Error for Stalled {}
+
 /// Настоящая машина.
 pub struct HostRunner;
+
+impl HostRunner {
+    async fn run_watched(&self, program: &str, args: &[String], idle: Duration) -> Result<String> {
+        use std::process::Stdio;
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+        let command = format!(
+            "{program} {}",
+            args.first().map(String::as_str).unwrap_or("")
+        );
+        let mut child = tokio::process::Command::new(program)
+            .args(args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("запуск {program}"))?;
+        let mut stderr = child.stderr.take().expect("stderr piped");
+        let errors = tokio::spawn(async move {
+            let mut text = String::new();
+            let _ = stderr.read_to_string(&mut text).await;
+            text
+        });
+        let mut lines = BufReader::new(child.stdout.take().expect("stdout piped")).lines();
+        let mut out = String::new();
+        let read = loop {
+            match tokio::time::timeout(idle, lines.next_line()).await {
+                Err(_) => {
+                    break Err(anyhow!(Stalled {
+                        command: command.clone(),
+                        idle,
+                    }));
+                }
+                Ok(Ok(Some(line))) => {
+                    out.push_str(&line);
+                    out.push('\n');
+                }
+                Ok(Ok(None)) => break Ok(()),
+                Ok(Err(err)) => break Err(anyhow!(err).context(format!("вывод {command}"))),
+            }
+        };
+        if let Err(err) = read {
+            // stderr не дочитывается: его может держать потомок команды.
+            errors.abort();
+            let _ = child.start_kill();
+            let _ = child.wait().await;
+            return Err(err);
+        }
+        let status = child
+            .wait()
+            .await
+            .with_context(|| format!("ожидание {command}"))?;
+        let errors = errors.await.unwrap_or_default();
+        if !status.success() {
+            bail!("{command}: {}", errors.trim());
+        }
+        Ok(out)
+    }
+}
 
 /// Сменить владельца может только root. Без root (агент рядом с нодой,
 /// запущенной тем же пользователем, разработка) владелец остаётся текущим —
@@ -113,6 +208,15 @@ impl Runner for HostRunner {
             );
         }
         Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+
+    fn run_long<'a>(
+        &'a self,
+        program: &'a str,
+        args: &'a [String],
+        idle: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
+        Box::pin(self.run_watched(program, args, idle))
     }
 
     fn write_file(&self, path: &Path, contents: &[u8], mode: u32, uid: Option<u32>) -> Result<()> {
@@ -528,6 +632,38 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::collections::HashMap;
+
+    fn sh(script: &str) -> Vec<String> {
+        vec!["-c".into(), script.into()]
+    }
+
+    #[tokio::test]
+    async fn long_commands_are_cut_when_silent() {
+        let idle = Duration::from_millis(300);
+        let out = HostRunner
+            .run_long("sh", &sh("echo one; sleep 0.1; echo two"), idle)
+            .await
+            .unwrap();
+        assert_eq!(out, "one\ntwo\n");
+
+        let started = std::time::Instant::now();
+        let err = HostRunner
+            .run_long("sh", &sh("echo one; sleep 30"), idle)
+            .await
+            .unwrap_err();
+        assert!(err.is::<Stalled>(), "{err:#}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "команда не убита"
+        );
+
+        let err = HostRunner
+            .run_long("sh", &sh("echo boom >&2; exit 3"), idle)
+            .await
+            .unwrap_err();
+        assert!(!err.is::<Stalled>());
+        assert!(format!("{err:#}").contains("boom"), "{err:#}");
+    }
 
     /// Записанный файл: содержимое, права, владелец.
     type WrittenFile = (String, u32, Option<u32>);
