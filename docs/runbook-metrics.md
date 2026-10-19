@@ -390,6 +390,12 @@ SHA-256 от `queue_id`): сам id — право писать в очеред�
 | `node_key_permissions_ok` | 0 = файл ключа читаем не только владельцем |
 | `process_start_total`, `build_info{version}` | Рестарты и версия |
 
+## Настройки без перезапуска
+
+| Метрика | Тип | Смысл |
+|---|---|---|
+| `runtime_reload_total{result}` | counter | Попытки применить `runtime.toml`: `applied` / `invalid`. Рост `invalid` — нода работает не на тех лимитах, которые ей прислали; причина — в `runtime.status.json` и в логе (docs/runtime-config.md) |
+
 ## Дашборд: минимальный набор панелей
 
 1. **Доступность входа** — `rate(noise_handshake_total[5m])` по `result`,

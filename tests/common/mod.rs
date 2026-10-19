@@ -24,7 +24,7 @@ use trust_message_tcp::delivery::{DeliveryBackend, SledBackend};
 use trust_message_tcp::domain::reject::SendRejectReason;
 use trust_message_tcp::net::device_cert::signed_bytes;
 use trust_message_tcp::net::framing::verify_signed_server_config;
-use trust_message_tcp::net::listener::accept_loop;
+use trust_message_tcp::net::listener::{Live, accept_loop_live};
 use trust_message_tcp::net::noise::{NOISE_PARAMS_IK, NodeIdentity, NoiseFramed, SessionRole};
 use trust_message_tcp::push::{
     InMemoryTokenStore, MockTransport, NoopStatePersistence, PushScheduler,
@@ -113,6 +113,7 @@ pub fn test_config(storage_path: &str, limits: LimitsConfig) -> Config {
         push: disabled_push_config(),
         limits,
         blobs: test_blob_config(storage_path),
+        runtime_config_path: format!("{storage_path}/runtime.toml"),
     }
 }
 
@@ -206,6 +207,10 @@ pub struct NodeInternals {
     /// останавливает ноду и отпускает её хранилище — так тест делает
     /// рестарт на том же каталоге (см. [`NodeOptions::storage_path`]).
     pub accept_task: tokio::task::AbortHandle,
+    /// Живые настройки ноды: их меняет перечитывание `runtime.toml`.
+    pub live: Arc<Live>,
+    /// Конфиг, с которым нода запущена (без `runtime.toml`).
+    pub cfg: Config,
 }
 
 /// Нода на прямом бэкенде вместе с её хранилищем и реестром сессий.
@@ -472,7 +477,8 @@ async fn spawn_node_with_internals(
     };
     let listener = TcpListener::bind(&cfg.bind_addr).await?;
     let addr = listener.local_addr()?;
-    let accept_task = tokio::spawn(accept_loop(
+    let live = Live::new(&cfg, blobs.clone());
+    let accept_task = tokio::spawn(accept_loop_live(
         listener,
         registry.clone(),
         storage.clone(),
@@ -480,8 +486,8 @@ async fn spawn_node_with_internals(
         push_tokens,
         push_scheduler,
         node,
-        cfg,
-        blobs.clone(),
+        cfg.clone(),
+        live.clone(),
     ))
     .abort_handle();
     let internals = NodeInternals {
@@ -489,6 +495,8 @@ async fn spawn_node_with_internals(
         registry,
         blobs,
         accept_task,
+        live,
+        cfg,
     };
 
     Ok((

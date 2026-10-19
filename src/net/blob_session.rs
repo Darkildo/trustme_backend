@@ -25,7 +25,7 @@ use crate::blob::{
     BlobId, BlobReject, BlobStore, ChunkOk, ChunkReject, InitRequest, MAX_STAT_ITEMS, StatQuery,
     StatState, blob_fingerprint, blob_id_of, fixed_32,
 };
-use crate::config::ServerConfigSnapshot;
+use crate::config::SharedServerConfig;
 use crate::domain::reject::SendRejectReason;
 use crate::net::conn::{
     await_session_confirmation, instant_at_unix_secs, is_cert_revoked, is_connection_reset,
@@ -51,8 +51,6 @@ pub(crate) struct BlobContext {
     pub limits: Arc<SessionLimits>,
     /// Данных в одном куске при потолке кадра этой ноды.
     pub chunk_max: usize,
-    /// `MAX_BLOB_SESSIONS_PER_USER`.
-    pub max_sessions_per_user: usize,
 }
 
 /// Кто прислал кадр хранилища.
@@ -622,7 +620,7 @@ pub(crate) async fn serve(
     registry: ConnRegistry,
     cert_revocations: CertRevocationStore,
     ctx: BlobContext,
-    server_config: ServerConfigSnapshot,
+    server_config: SharedServerConfig,
     node: Arc<NodeIdentity>,
     confirm_timeout: Duration,
     admission_guard: AdmissionGuard,
@@ -681,7 +679,7 @@ pub(crate) async fn serve(
         scope: identity.scope,
         connection_id: registration.connection_id,
     };
-    let mut ping_gate = PingGate::new(ctx.limits.cfg.ping_per_sec);
+    let mut ping_gate = PingGate::new(ctx.limits.cfg().ping_per_sec);
     let mut pending = Some(confirming_frame);
     let mut frames_received = 0u64;
     let cert_expiry = async move {
@@ -751,7 +749,8 @@ pub(crate) async fn serve(
                 }
             }
             frame::Payload::GetServerConfig(_) => {
-                let response = encode_signed_server_config(&server_config, &node, unix_now_secs());
+                let response =
+                    encode_signed_server_config(&server_config.current(), &node, unix_now_secs());
                 framed.send_frame(&response).await?;
             }
             // Сессия передачи сообщений не отправляет: отказ, а не разрыв.
@@ -815,7 +814,10 @@ async fn refuse_over_blob_limit(
     ctx: &BlobContext,
     user_id: &UserId,
 ) -> Result<()> {
-    let limit = ctx.max_sessions_per_user;
+    let limit = ctx
+        .store
+        .as_ref()
+        .map_or(0, |store| store.config().max_sessions_per_user);
     if limit == 0 || registry.blob_session_count(user_id) < limit {
         return Ok(());
     }

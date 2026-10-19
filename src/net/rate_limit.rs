@@ -1,9 +1,8 @@
 use dashmap::DashMap;
 use std::net::IpAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::config::{BlobConfig, LimitsConfig};
 use crate::state::registry::{DeviceId, UserId};
@@ -31,8 +30,10 @@ struct UserCounters {
 /// стоит, поэтому записи с истёкшими окнами вычищаются: раз в
 /// [`SWEEP_INTERVAL_SECS`] это делает один из вызовов `check_at`.
 pub struct SendRateLimiter {
-    msgs_per_sec: u32,
-    bytes_per_day: u64,
+    /// Пределы атомарны: настройки ноды меняются без перезапуска
+    /// (`runtime.toml`), а счётчики пользователей при этом не теряются.
+    msgs_per_sec: AtomicU32,
+    bytes_per_day: AtomicU64,
     per_user: DashMap<UserId, UserCounters>,
     /// Номер интервала вычистки, в котором она уже прошла.
     last_sweep_slot: AtomicU64,
@@ -58,11 +59,25 @@ impl UserCounters {
 impl SendRateLimiter {
     pub fn new(msgs_per_sec: u32, bytes_per_day: u64) -> Self {
         Self {
-            msgs_per_sec,
-            bytes_per_day,
+            msgs_per_sec: AtomicU32::new(msgs_per_sec),
+            bytes_per_day: AtomicU64::new(bytes_per_day),
             per_user: DashMap::new(),
             last_sweep_slot: AtomicU64::new(0),
         }
+    }
+
+    /// Сменить пределы на лету. Уже набранные в текущих окнах счётчики
+    /// сравниваются с новыми пределами.
+    pub fn set_limits(&self, msgs_per_sec: u32, bytes_per_day: u64) {
+        self.msgs_per_sec.store(msgs_per_sec, Ordering::Relaxed);
+        self.bytes_per_day.store(bytes_per_day, Ordering::Relaxed);
+    }
+
+    fn limits(&self) -> (u32, u64) {
+        (
+            self.msgs_per_sec.load(Ordering::Relaxed),
+            self.bytes_per_day.load(Ordering::Relaxed),
+        )
     }
 
     /// Сколько пользователей сейчас помнит лимитер (для тестов и
@@ -90,8 +105,9 @@ impl SendRateLimiter {
         {
             return;
         }
-        let msgs_limited = self.msgs_per_sec > 0;
-        let bytes_limited = self.bytes_per_day > 0;
+        let (msgs_per_sec, bytes_per_day) = self.limits();
+        let msgs_limited = msgs_per_sec > 0;
+        let bytes_limited = bytes_per_day > 0;
         self.per_user
             .retain(|_, counters| !counters.is_expired(now_secs, msgs_limited, bytes_limited));
     }
@@ -103,7 +119,8 @@ impl SendRateLimiter {
     /// `true` — посылка укладывается в оба лимита и бюджет списан;
     /// `false` — отказ, бюджет не списывается. Лимит 0 = не ограничено.
     pub fn check_at(&self, user: &UserId, bytes: usize, now_secs: u64) -> bool {
-        if self.msgs_per_sec == 0 && self.bytes_per_day == 0 {
+        let (msgs_per_sec, bytes_per_day) = self.limits();
+        if msgs_per_sec == 0 && bytes_per_day == 0 {
             return true;
         }
         // До захвата записи пользователя: `retain` берёт шарды на запись, и
@@ -129,16 +146,14 @@ impl SendRateLimiter {
             counters.day_key = day_key;
             counters.day_bytes = 0;
         }
-        if self.msgs_per_sec > 0 && counters.sec_count >= u64::from(self.msgs_per_sec) {
+        if msgs_per_sec > 0 && counters.sec_count >= u64::from(msgs_per_sec) {
             return false;
         }
         // Переполнение u64 трактуется как исчерпанный бюджет: `checked_add`,
         // а не `saturating_add` — насыщенное значение прошло бы проверку
         // (`MAX > MAX` ложно) и сорвалось бы на списании ниже.
         let next_day_bytes = counters.day_bytes.checked_add(bytes as u64);
-        if self.bytes_per_day > 0
-            && !matches!(next_day_bytes, Some(value) if value <= self.bytes_per_day)
-        {
+        if bytes_per_day > 0 && !matches!(next_day_bytes, Some(value) if value <= bytes_per_day) {
             return false;
         }
         counters.sec_count = counters.sec_count.saturating_add(1);
@@ -188,6 +203,66 @@ impl PingGate {
     }
 }
 
+/// Счётчик занятых мест с живым потолком: потолок меняется на лету, `0` —
+/// без ограничения. Замена семафору там, где места только пробуют занять,
+/// но не ждут: у семафора нельзя забрать уже выданные разрешения, а
+/// сниженный потолок обязан действовать и при занятых местах.
+pub struct LiveGate {
+    limit: AtomicUsize,
+    used: Arc<AtomicUsize>,
+}
+
+/// Занятое место; освобождается при drop.
+pub struct GatePermit {
+    used: Arc<AtomicUsize>,
+}
+
+impl Drop for GatePermit {
+    fn drop(&mut self) {
+        self.used.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+impl LiveGate {
+    pub fn new(limit: usize) -> Self {
+        Self {
+            limit: AtomicUsize::new(limit),
+            used: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+
+    pub fn set_limit(&self, limit: usize) {
+        self.limit.store(limit, Ordering::Relaxed);
+    }
+
+    pub fn in_use(&self) -> usize {
+        self.used.load(Ordering::Acquire)
+    }
+
+    pub fn try_acquire(&self) -> Option<GatePermit> {
+        let mut current = self.used.load(Ordering::Acquire);
+        loop {
+            let limit = self.limit.load(Ordering::Relaxed);
+            if limit != 0 && current >= limit {
+                return None;
+            }
+            match self.used.compare_exchange_weak(
+                current,
+                current + 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    return Some(GatePermit {
+                        used: self.used.clone(),
+                    });
+                }
+                Err(actual) => current = actual,
+            }
+        }
+    }
+}
+
 /// Ограничитель одновременных хендшейков — глобальный и на IP.
 ///
 /// Респондер выполняет DH до того, как узнал, кто к нему пришёл: стоимость
@@ -201,8 +276,8 @@ impl PingGate {
 /// подтверждения. Подтверждённая сессия разрешение освобождает и дальше
 /// учитывается лимитом сессий на пользователя.
 pub struct HandshakeAdmission {
-    global: Arc<Semaphore>,
-    per_ip_limit: usize,
+    global: LiveGate,
+    per_ip_limit: AtomicUsize,
     per_ip: Arc<DashMap<IpAddr, usize>>,
 }
 
@@ -227,7 +302,7 @@ impl AdmissionReject {
 /// Держатель разрешения. Освобождает оба счётчика при drop — в том числе
 /// когда хендшейк упал с ошибкой или был отменён.
 pub struct AdmissionGuard {
-    _global: Option<OwnedSemaphorePermit>,
+    _global: Option<GatePermit>,
     per_ip: Option<(IpAddr, Arc<DashMap<IpAddr, usize>>)>,
 }
 
@@ -249,27 +324,28 @@ impl HandshakeAdmission {
     /// `0` в любом из лимитов означает «не ограничено».
     pub fn new(max_inflight: usize, max_inflight_per_ip: usize) -> Self {
         Self {
-            global: Arc::new(Semaphore::new(if max_inflight == 0 {
-                Semaphore::MAX_PERMITS
-            } else {
-                max_inflight
-            })),
-            per_ip_limit: max_inflight_per_ip,
+            global: LiveGate::new(max_inflight),
+            per_ip_limit: AtomicUsize::new(max_inflight_per_ip),
             per_ip: Arc::new(DashMap::new()),
         }
+    }
+
+    /// Сменить потолки на лету. Уже идущие хендшейки не прерываются:
+    /// сниженный потолок просто не пускает новых, пока их не станет меньше.
+    pub fn set_limits(&self, max_inflight: usize, max_inflight_per_ip: usize) {
+        self.global.set_limit(max_inflight);
+        self.per_ip_limit
+            .store(max_inflight_per_ip, Ordering::Relaxed);
     }
 
     /// Попытаться занять место под хендшейк. Не ждёт: очередь на вход — это
     /// та же нагрузка, от которой мы защищаемся, поэтому лишнее соединение
     /// закрывается сразу.
     pub fn try_admit(&self, peer: IpAddr) -> Result<AdmissionGuard, AdmissionReject> {
-        let global = self
-            .global
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| AdmissionReject::Global)?;
+        let global = self.global.try_acquire().ok_or(AdmissionReject::Global)?;
 
-        if self.per_ip_limit == 0 {
+        let per_ip_limit = self.per_ip_limit.load(Ordering::Relaxed);
+        if per_ip_limit == 0 {
             return Ok(AdmissionGuard {
                 _global: Some(global),
                 per_ip: None,
@@ -279,7 +355,7 @@ impl HandshakeAdmission {
         let mut admitted = false;
         {
             let mut entry = self.per_ip.entry(peer).or_insert(0);
-            if *entry < self.per_ip_limit {
+            if *entry < per_ip_limit {
                 *entry += 1;
                 admitted = true;
             }
@@ -305,7 +381,9 @@ impl HandshakeAdmission {
 /// Всё, что нужно соединению для применения лимитов: конфиг и общие на
 /// процесс rate-limiter'ы — отправки и операций хранилища файлов.
 pub struct SessionLimits {
-    pub cfg: LimitsConfig,
+    /// Текущие лимиты. За замком, а не полем: настройки ноды меняются без
+    /// перезапуска, и следующая операция любой сессии видит новые.
+    cfg: RwLock<LimitsConfig>,
     pub send: SendRateLimiter,
     /// Недавние ответы «очередь полна» (см. [`QueueFullCache`]).
     pub queue_full: QueueFullCache,
@@ -329,8 +407,22 @@ impl SessionLimits {
             queue_full: QueueFullCache::default(),
             blob_ops: SendRateLimiter::new(blobs.ops_per_sec, 0),
             blob_stat: SendRateLimiter::new(blobs.stat_per_sec, 0),
-            cfg,
+            cfg: RwLock::new(cfg),
         }
+    }
+
+    /// Снимок текущих лимитов.
+    pub fn cfg(&self) -> LimitsConfig {
+        *self.cfg.read().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Применить новые лимиты: и снимок, и пределы общих ограничителей.
+    pub fn apply(&self, cfg: LimitsConfig, blobs: &BlobConfig) {
+        *self.cfg.write().unwrap_or_else(|e| e.into_inner()) = cfg;
+        self.send
+            .set_limits(cfg.send_msgs_per_sec, cfg.send_bytes_per_day);
+        self.blob_ops.set_limits(blobs.ops_per_sec, 0);
+        self.blob_stat.set_limits(blobs.stat_per_sec, 0);
     }
 }
 
@@ -438,6 +530,77 @@ mod tests {
         for i in 0..10_000 {
             assert!(limiter.check_at(&user(1), usize::MAX, i));
         }
+    }
+
+    #[test]
+    fn live_gate_follows_its_limit() {
+        let gate = super::LiveGate::new(2);
+        let a = gate.try_acquire().unwrap();
+        let _b = gate.try_acquire().unwrap();
+        assert!(gate.try_acquire().is_none());
+        assert_eq!(gate.in_use(), 2);
+        // Сниженный потолок действует и при занятых местах.
+        gate.set_limit(1);
+        drop(a);
+        assert!(gate.try_acquire().is_none());
+        gate.set_limit(0);
+        let held: Vec<_> = (0..100).map(|_| gate.try_acquire().unwrap()).collect();
+        assert_eq!(gate.in_use(), 101);
+        drop(held);
+        assert_eq!(gate.in_use(), 1);
+    }
+
+    #[test]
+    fn limits_change_without_losing_counters() {
+        let limiter = SendRateLimiter::new(3, 0);
+        let u = user(9);
+        assert!(limiter.check_at(&u, 1, 10));
+        assert!(limiter.check_at(&u, 1, 10));
+        limiter.set_limits(2, 0);
+        assert!(
+            !limiter.check_at(&u, 1, 10),
+            "two already spent in this second"
+        );
+        limiter.set_limits(0, 5);
+        // Два байта уже списаны: в суточный предел 5 влезают ещё три.
+        assert!(!limiter.check_at(&u, 4, 10));
+        assert!(limiter.check_at(&u, 3, 10));
+        assert!(
+            !limiter.check_at(&u, 1, 10),
+            "the day budget counts the earlier bytes"
+        );
+    }
+
+    #[test]
+    fn admission_limits_change_on_the_fly() {
+        let admission = HandshakeAdmission::new(1, 5);
+        let ip: std::net::IpAddr = "10.0.0.1".parse().unwrap();
+        let first = admission.try_admit(ip).unwrap();
+        assert_eq!(admission.try_admit(ip).err(), Some(AdmissionReject::Global));
+        admission.set_limits(0, 1);
+        assert_eq!(admission.try_admit(ip).err(), Some(AdmissionReject::PerIp));
+        drop(first);
+        assert!(admission.try_admit(ip).is_ok());
+    }
+
+    #[test]
+    fn session_limits_apply_reaches_the_limiters() {
+        let limits = super::SessionLimits::new(crate::config::LimitsConfig::default());
+        let next = crate::config::LimitsConfig {
+            send_msgs_per_sec: 1,
+            ..crate::config::LimitsConfig::default()
+        };
+        let blobs = crate::config::BlobConfig {
+            ops_per_sec: 1,
+            stat_per_sec: 1,
+            ..crate::config::BlobConfig::default()
+        };
+        limits.apply(next, &blobs);
+        assert_eq!(limits.cfg().send_msgs_per_sec, 1);
+        let u = user(4);
+        assert!(limits.send.check_at(&u, 1, 5) && !limits.send.check_at(&u, 1, 5));
+        assert!(limits.blob_ops.check_at(&u, 0, 5) && !limits.blob_ops.check_at(&u, 0, 5));
+        assert!(limits.blob_stat.check_at(&u, 0, 5) && !limits.blob_stat.check_at(&u, 0, 5));
     }
 
     #[test]

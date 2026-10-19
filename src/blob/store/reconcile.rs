@@ -75,7 +75,7 @@ impl BlobStore {
                     let tomb = BlobRecord::Tomb(Tombstone {
                         cause: TombCause::Expired,
                         at: now,
-                        until: now.saturating_add(self.inner.cfg.tombstone_secs),
+                        until: now.saturating_add(self.inner.cfg().tombstone_secs),
                         delete_token_hash: live.delete_token_hash,
                     });
                     self.inner.blobs.insert(id, tomb.encode())?;
@@ -175,7 +175,7 @@ impl BlobStore {
     /// Пересобрать индекс сроков, счётчики квот и итоги по записям.
     /// Возвращает число записей.
     fn rebuild_indexes(&self) -> Result<usize> {
-        let stale_secs = self.inner.cfg.upload_stale_secs;
+        let stale_secs = self.inner.cfg().upload_stale_secs;
         self.inner.expiry.clear()?;
         self.inner.usage.clear()?;
         let mut usage: HashMap<Vec<u8>, u64> = HashMap::new();

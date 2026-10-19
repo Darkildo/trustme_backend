@@ -26,7 +26,7 @@ mod reconcile;
 use std::io::{self, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, RwLock as SyncRwLock};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -143,7 +143,9 @@ pub struct BlobStore {
 }
 
 struct Inner {
-    cfg: BlobConfig,
+    /// Настройки. Снимок за замком: лимиты меняются без перезапуска, а
+    /// операция работает с тем снимком, который взяла в начале.
+    cfg: SyncRwLock<Arc<BlobConfig>>,
     dir: PathBuf,
     /// `blob_id` → запись (`record`).
     blobs: Tree,
@@ -159,6 +161,12 @@ struct Inner {
     /// Суточный объём загрузок пользователя (`BLOB_UPLOAD_BYTES_PER_DAY`).
     upload_budget: SendRateLimiter,
     totals: Totals,
+}
+
+impl Inner {
+    fn cfg(&self) -> Arc<BlobConfig> {
+        self.cfg.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
 }
 
 /// Ворота блоба (см. документацию модуля). `closed` повторяет причину
@@ -223,7 +231,7 @@ impl BlobStore {
         let store = Self {
             inner: Arc::new(Inner {
                 upload_budget: SendRateLimiter::new(0, cfg.upload_bytes_per_day),
-                cfg: cfg.clone(),
+                cfg: SyncRwLock::new(Arc::new(cfg.clone())),
                 dir,
                 blobs: db.open_tree("blobs")?,
                 expiry: db.open_tree("blob_expiry")?,
@@ -239,8 +247,29 @@ impl BlobStore {
         Ok(store)
     }
 
-    pub fn config(&self) -> &BlobConfig {
-        &self.inner.cfg
+    /// Снимок текущих настроек.
+    pub fn config(&self) -> Arc<BlobConfig> {
+        self.inner.cfg()
+    }
+
+    /// Применить новые настройки без перезапуска. Каталог, выключатель и
+    /// значения, вошедшие в постоянные индексы и счётчики (`min_charge`,
+    /// `upload_stale_secs`), а также объявленный клиентам `chunk_max`
+    /// остаются прежними: они меняются только перезапуском.
+    pub fn set_config(&self, next: &BlobConfig) {
+        let current = self.inner.cfg();
+        let merged = BlobConfig {
+            enabled: current.enabled,
+            dir: current.dir.clone(),
+            upload_stale_secs: current.upload_stale_secs,
+            min_charge: current.min_charge,
+            chunk_max: current.chunk_max,
+            ..next.clone()
+        };
+        self.inner
+            .upload_budget
+            .set_limits(0, merged.upload_bytes_per_day);
+        *self.inner.cfg.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(merged);
     }
 
     /// Сколько блоб занимает в квотах: не меньше `BLOB_MIN_CHARGE_BYTES`.
@@ -248,12 +277,12 @@ impl BlobStore {
     /// однобайтовых блобов уложился бы в мегабайт. Резерв диска и метрики
     /// считают настоящий размер.
     pub fn charge(&self, size: u64) -> u64 {
-        size.max(self.inner.cfg.min_charge)
+        size.max(self.inner.cfg().min_charge)
     }
 
     /// Срок после зажима потолком: `0` — потолок.
     pub fn clamp_ttl(&self, requested: u64) -> u64 {
-        let ceiling = self.inner.cfg.max_ttl_secs;
+        let ceiling = self.inner.cfg().max_ttl_secs;
         if requested == 0 || requested > ceiling {
             ceiling
         } else {
@@ -291,7 +320,7 @@ impl BlobStore {
         request: &InitRequest,
         now: u64,
     ) -> Result<Result<InitOk, BlobReject>> {
-        let cfg = &self.inner.cfg;
+        let cfg = self.inner.cfg();
         if request.size == 0 || request.max_releases > MAX_RELEASES {
             return Ok(Err(BlobReject::Invalid));
         }
@@ -365,7 +394,7 @@ impl BlobStore {
         size: u64,
         now: u64,
     ) -> Result<Option<BlobReject>> {
-        let cfg = &self.inner.cfg;
+        let cfg = self.inner.cfg();
         let charge = self.charge(size);
         let over = |used: u64, ceiling: u64| ceiling > 0 && used.saturating_add(charge) > ceiling;
         if over(self.usage_of(&owner_usage_key(owner))?, cfg.quota_per_owner) {
@@ -484,7 +513,7 @@ impl BlobStore {
         slot.written += len;
         observability::observe_blob_bytes("upload", len);
 
-        let due = slot.written - slot.synced >= self.inner.cfg.sync_every.max(1);
+        let due = slot.written - slot.synced >= self.inner.cfg().sync_every.max(1);
         if !due && slot.written < live.size {
             return Ok(Ok(ChunkOk { synced: None }));
         }
@@ -721,7 +750,7 @@ impl BlobStore {
                 committed_offset: live.committed_offset,
                 expires_at: live
                     .last_activity
-                    .saturating_add(self.inner.cfg.upload_stale_secs),
+                    .saturating_add(self.inner.cfg().upload_stale_secs),
             }),
         })
     }
@@ -794,7 +823,7 @@ impl BlobStore {
         if wanted > available {
             return Ok(Err(BlobReject::Invalid));
         }
-        let window = self.inner.cfg.get_window.max(1);
+        let window = self.inner.cfg().get_window.max(1);
         let end = offset + wanted.min(window);
         let mut file = match tokio::fs::File::open(self.final_path(id)).await {
             Ok(file) => file,
@@ -1055,7 +1084,7 @@ impl BlobStore {
         } else {
             let stale_at = live
                 .last_activity
-                .saturating_add(self.inner.cfg.upload_stale_secs);
+                .saturating_add(self.inner.cfg().upload_stale_secs);
             if stale_at <= now {
                 entry(StatState::NotFound, 0)
             } else {
@@ -1086,7 +1115,7 @@ impl BlobStore {
             let record = self.get_record(&id)?;
             let stale_key = match &record {
                 None => true,
-                Some(record) => record.due_at(self.inner.cfg.upload_stale_secs) != due_at,
+                Some(record) => record.due_at(self.inner.cfg().upload_stale_secs) != due_at,
             };
             if stale_key {
                 // Индекс разошёлся с записью: ключ лишний, а нужный ключ
@@ -1146,7 +1175,7 @@ impl BlobStore {
         let Some(record @ BlobRecord::Live(_)) = self.get_record(id)? else {
             return Ok(false);
         };
-        if record.due_at(self.inner.cfg.upload_stale_secs) > now {
+        if record.due_at(self.inner.cfg().upload_stale_secs) > now {
             return Ok(false);
         }
         let BlobRecord::Live(live) = record else {
@@ -1254,7 +1283,7 @@ impl BlobStore {
 
     /// Записать запись и переставить её ключ в индексе сроков.
     fn put_record(&self, id: &BlobId, old: Option<&BlobRecord>, new: &BlobRecord) -> Result<()> {
-        let stale_secs = self.inner.cfg.upload_stale_secs;
+        let stale_secs = self.inner.cfg().upload_stale_secs;
         self.inner.blobs.insert(id, new.encode())?;
         let new_due = new.due_at(stale_secs);
         if let Some(old) = old {
@@ -1271,9 +1300,10 @@ impl BlobStore {
 
     fn delete_record(&self, id: &BlobId, old: &BlobRecord) -> Result<()> {
         self.inner.blobs.remove(id)?;
-        self.inner
-            .expiry
-            .remove(expiry_key(old.due_at(self.inner.cfg.upload_stale_secs), id))?;
+        self.inner.expiry.remove(expiry_key(
+            old.due_at(self.inner.cfg().upload_stale_secs),
+            id,
+        ))?;
         Ok(())
     }
 
@@ -1302,7 +1332,7 @@ impl BlobStore {
                 &BlobRecord::Tomb(Tombstone {
                     cause,
                     at: now,
-                    until: now.saturating_add(self.inner.cfg.tombstone_secs),
+                    until: now.saturating_add(self.inner.cfg().tombstone_secs),
                     delete_token_hash: live.delete_token_hash,
                 }),
             )?,
@@ -1743,6 +1773,30 @@ mod tests {
 
     fn usage(fixture: &Fixture, key: &[u8]) -> u64 {
         fixture.store.usage_of(key).unwrap()
+    }
+
+    #[test]
+    fn config_swaps_live_but_keeps_restart_only_values() {
+        let fx = fixture("set_config");
+        let next = BlobConfig {
+            dir: "/elsewhere".into(),
+            max_size: 10,
+            max_ttl_secs: 60,
+            upload_bytes_per_day: 1,
+            upload_stale_secs: 1,
+            min_charge: 99,
+            chunk_max: 4096,
+            ..fx.cfg.clone()
+        };
+        fx.store.set_config(&next);
+        let now = fx.store.config();
+        assert_eq!(now.max_size, 10);
+        assert_eq!(fx.store.clamp_ttl(0), 60);
+        assert_eq!(now.dir, fx.cfg.dir);
+        assert_eq!(now.upload_stale_secs, fx.cfg.upload_stale_secs);
+        assert_eq!(now.min_charge, fx.cfg.min_charge);
+        assert_eq!(now.chunk_max, fx.cfg.chunk_max);
+        assert_eq!(fx.store.charge(1), 1);
     }
 
     #[tokio::test]

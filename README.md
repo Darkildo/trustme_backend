@@ -277,6 +277,7 @@ docker run --rm \
 | `BIND_HOST` | `0.0.0.0` | |
 | `BIND_PORT` | `443` | |
 | `STORAGE_PATH` | `data` | Каталог sled и файла ключа ноды |
+| `RUNTIME_CONFIG_PATH` | `<STORAGE_PATH>/runtime.toml` | Файл лимитов, которые меняются без перезапуска, см. [docs/runtime-config.md](docs/runtime-config.md) |
 | `NODE_IDENTITY_KEY` | — | Секрет ноды: Ed25519 seed, 64 hex-символа. Перекрывает файл `STORAGE_PATH/node_identity_key`. См. [docs/runbook-node-key.md](docs/runbook-node-key.md) |
 | `NOISE_HANDSHAKE_TIMEOUT_MS` | `10000` | Потолок времени на хендшейк; `0` запрещён |
 | `SESSION_CONFIRM_TIMEOUT_SECS` | `30` | Сколько нода ждёт первый кадр клиента после `AuthOk`; без него соединение закрывается. До подтверждения соединение держит место в `LIMIT_HANDSHAKE_INFLIGHT*`. `0` запрещён |
@@ -417,6 +418,8 @@ account- и device-scope), `queue_stats` (счётчики квот, перес�
 
 - [docs/deployment.md](docs/deployment.md) — развёртывание, решения до
   запуска, лимиты соединений, бэкапы, выкладка, обновление и откат.
+- [docs/runtime-config.md](docs/runtime-config.md) — лимиты и квоты без
+  перезапуска: `runtime.toml`, каталог настроек, статус.
 - [docs/tmnode.md](docs/tmnode.md) — `tmnode doctor`: проверка ноды на хосте
   и снаружи, схема `node.toml`, формат отчёта.
 - [docs/runbook-node-key.md](docs/runbook-node-key.md) — ключ ноды: бэкап,
