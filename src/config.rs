@@ -65,6 +65,9 @@ pub struct Config {
     pub device_cert_max_ttl: Duration,
     /// Хранилище файлов (`BLOB_*`, server-contract.md §6.11).
     pub blobs: BlobConfig,
+    /// ICE-серверы для звонков (§6.12). Задаются только в `runtime.toml`
+    /// (секция `[ice]`): в окружении списка серверов с секретами нет.
+    pub ice: IceConfig,
     /// Файл настроек без перезапуска (`RUNTIME_CONFIG_PATH`,
     /// docs/runtime-config.md). Default: `<STORAGE_PATH>/runtime.toml`.
     pub runtime_config_path: String,
@@ -310,6 +313,42 @@ impl Default for LimitsConfig {
     }
 }
 
+/// ICE-серверы и срок временных TURN-учёток (server-contract.md §6.12).
+#[derive(Clone, Debug, PartialEq)]
+pub struct IceConfig {
+    pub servers: Vec<IceServerConfig>,
+    /// Срок учёток TURN, сек (`ICE_CREDENTIAL_TTL_SECS`). Default: 2 ч —
+    /// почти любой звонок; более долгий клиент продлевает ICE restart.
+    pub credential_ttl_secs: u64,
+}
+
+impl Default for IceConfig {
+    fn default() -> Self {
+        Self {
+            servers: Vec::new(),
+            credential_ttl_secs: 2 * 3600,
+        }
+    }
+}
+
+/// Один ICE-сервер: STUN без секрета или TURN с общим секретом coturn
+/// (`static-auth-secret`).
+#[derive(Clone, PartialEq)]
+pub struct IceServerConfig {
+    pub urls: Vec<String>,
+    pub secret: Option<String>,
+}
+
+/// Секрет TURN в логах и отладочном выводе не показывается.
+impl std::fmt::Debug for IceServerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IceServerConfig")
+            .field("urls", &self.urls)
+            .field("secret", &self.secret.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 /// Снапшот возможностей, общий для всех сессий и заменяемый на лету: новые
 /// лимиты (`runtime.toml`) попадают в следующий подписанный конфиг любой
 /// сессии.
@@ -371,6 +410,8 @@ pub struct ServerConfigSnapshot {
     /// Хранилище файлов в подписанном снапшоте; `None` — выключено
     /// (`BLOB_ENABLED=false`).
     pub blobs: Option<BlobAnnouncement>,
+    /// Настроен ли хоть один ICE-сервер (`ServerConfig.supports_ice_servers`).
+    pub supports_ice_servers: bool,
 }
 
 /// Потолки хранилища файлов, которые нода объявляет клиенту
@@ -720,6 +761,7 @@ impl Config {
                 get_window: self.blobs.get_window,
                 min_charge: self.blobs.min_charge,
             }),
+            supports_ice_servers: !self.ice.servers.is_empty(),
         }
     }
 }
@@ -1211,6 +1253,7 @@ fn resolve(raw: RawConfig) -> anyhow::Result<Config> {
     });
 
     Ok(Config {
+        ice: IceConfig::default(),
         runtime_config_path,
         blobs,
         queue_addressing_enabled: queue_addressing_enabled.unwrap_or(false),
@@ -2294,6 +2337,7 @@ mod tests {
     #[test]
     fn sled_advertises_delivery_acks_unless_retention_is_immediate() {
         let mut cfg = super::Config {
+            ice: Default::default(),
             runtime_config_path: String::new(),
             blobs: super::BlobConfig::default(),
             queue_addressing_enabled: false,

@@ -395,6 +395,7 @@ SHA-256 от `queue_id`): сам id — право писать в очеред�
 | Метрика | Тип | Смысл |
 |---|---|---|
 | `runtime_reload_total{result}` | counter | Попытки применить `runtime.toml`: `applied` / `invalid`. Рост `invalid` — нода работает не на тех лимитах, которые ей прислали; причина — в `runtime.status.json` и в логе (docs/runtime-config.md) |
+| `ice_requests_total{result}` | counter | Запросы учёток для звонков: `issued` / `not_configured` / `rate_limited`. Рост `not_configured` при живых звонках — клиенты ждут TURN, а оператор его не настроил (server-contract.md §6.12) |
 
 ## Дашборд: минимальный набор панелей
 

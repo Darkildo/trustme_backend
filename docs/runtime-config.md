@@ -42,6 +42,31 @@ limit_max_connections = 2048
 **Неверный файл при старте.** Нода стартует на настройках окружения:
 ошибка в лимитах не должна класть ноду.
 
+## ICE-серверы для звонков
+
+Серверы для `GetIceServers` (server-contract.md §6.12) задаются секцией
+`[ice]`. В окружении их нет: это список с секретами.
+
+```toml
+[settings]
+ice_credential_ttl_secs = 7200
+
+[[ice.servers]]
+urls = ["stun:turn.example.org:3478"]
+
+[[ice.servers]]
+urls = ["turn:turn.example.org:3478?transport=udp", "turn:turn.example.org:3478?transport=tcp", "turns:turn.example.org:5349"]
+secret = "…"   # static-auth-secret coturn, не короче 16 символов
+```
+
+- **STUN** — без `secret`.
+- **TURN** (`turn:` / `turns:`) — обязательно с общим секретом coturn.
+  coturn настраивается с `use-auth-secret` и тем же `static-auth-secret`.
+- **Пределы:** до 8 серверов, до 8 URL у каждого.
+- **Без секции** серверов нет: `supportsIceServers = false`, запрос
+  получает `NOT_CONFIGURED`.
+- **Секреты** не попадают ни в логи, ни в отладочный вывод.
+
 ## Когда изменение вступает в силу
 
 Нода проверяет файл раз в 2 секунды и сразу — по `SIGHUP`
@@ -144,3 +169,9 @@ limit_max_connections = 2048
 |---|---|---|
 | `device_cert_max_ttl_seconds` | перезапуск | Потолок срока сертификата устройства (0 — делегированный вход выключен). `0` — без ограничения. |
 | `server_config_ttl_seconds` | перезапуск | Срок жизни подписанного конфига у клиента. |
+
+**Звонки**
+
+| Настройка | Когда действует | Смысл |
+|---|---|---|
+| `ice_credential_ttl_secs` | сразу | Срок временной учётки TURN; звонок длиннее продлевается ICE restart. |

@@ -113,6 +113,7 @@ pub fn test_config(storage_path: &str, limits: LimitsConfig) -> Config {
         push: disabled_push_config(),
         limits,
         blobs: test_blob_config(storage_path),
+        ice: Default::default(),
         runtime_config_path: format!("{storage_path}/runtime.toml"),
     }
 }
@@ -133,6 +134,7 @@ pub fn test_blob_config(storage_path: &str) -> trust_message_tcp::config::BlobCo
 
 pub fn snapshot() -> ServerConfigSnapshot {
     ServerConfigSnapshot {
+        supports_ice_servers: false,
         supports_queue_addressing: false,
         device_cert_max_ttl: Duration::from_secs(30 * 24 * 3600),
         max_frame_len: FRAME_MAX,

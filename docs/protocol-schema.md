@@ -214,6 +214,13 @@ X25519-пару устройства, и сессию дальше держит 
 `ServerConfig.device_cert_max_ttl_secs` (в прямой сессии) и только потом
 пользоваться сертификатом.
 
+## Учётки ICE для звонков
+
+Кадры `GetIceServers` и `IceServers` (ветки `Frame.payload` 35–36), перечисление
+`IceRejectReason` и поле `ServerConfig.supports_ice_servers` (31) — временные
+учётки STUN/TURN для звонков, server-contract.md §6.12. Схема аддитивна:
+клиент спрашивает учётки, только увидев `supports_ice_servers = true`.
+
 ## Хранилище файлов и роль сессии
 
 Кадры `BlobUploadInit` … `BlobStatResult` (ветки `Frame.payload` 23–34) и

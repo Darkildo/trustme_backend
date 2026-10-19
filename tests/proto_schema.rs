@@ -11,11 +11,11 @@ use trust_message_tcp::wire::{
     AllocateQueue, AuthError, AuthOk, BlobAck, BlobData, BlobDelete, BlobExtend, BlobGet,
     BlobRejectReason, BlobRelease, BlobStat, BlobStatEntry, BlobStatQuery, BlobStatResult,
     BlobState, BlobUploadChunk, BlobUploadCommit, BlobUploadInit, BlobUploadStatus, ClientSend,
-    DeliveryAck, Frame, GetServerConfig, IncomingMessage, ListQueues, MessagePriority, Ping, Pong,
-    PushPlatform, PushTokenAck, QueueAck, QueueList, QueueRecord, QueueRejectReason,
-    RegisterPushToken, RetentionConfig, RetentionMode, RevokeDeviceCerts, RevokeQueue, SendAck,
-    SendRejectReason, ServerConfig, SessionRole, SetAccountRecord, SetQueueOnly,
-    SignedServerConfig, UnregisterPushToken, WakeHint, frame,
+    DeliveryAck, Frame, GetIceServers, GetServerConfig, IceRejectReason, IceServer, IceServers,
+    IncomingMessage, ListQueues, MessagePriority, Ping, Pong, PushPlatform, PushTokenAck, QueueAck,
+    QueueList, QueueRecord, QueueRejectReason, RegisterPushToken, RetentionConfig, RetentionMode,
+    RevokeDeviceCerts, RevokeQueue, SendAck, SendRejectReason, ServerConfig, SessionRole,
+    SetAccountRecord, SetQueueOnly, SignedServerConfig, UnregisterPushToken, WakeHint, frame,
 };
 
 const PROTO_VERSION: u32 = 1;
@@ -33,7 +33,7 @@ fn roundtrip(frame: &Frame) -> Frame {
 }
 
 /// Число вариантов `Frame.payload`. Обновляется вместе с `variant_index`.
-const PAYLOAD_VARIANTS: usize = 33;
+const PAYLOAD_VARIANTS: usize = 35;
 
 /// Порядковый номер варианта. `match` без `_`: новый вариант oneof в схеме
 /// ломает компиляцию теста, а не проходит мимо него.
@@ -73,6 +73,8 @@ fn variant_index(payload: &frame::Payload) -> usize {
         P::BlobAck(_) => 30,
         P::BlobData(_) => 31,
         P::BlobStatResult(_) => 32,
+        P::GetIceServers(_) => 33,
+        P::IceServers(_) => 34,
     }
 }
 
@@ -152,6 +154,7 @@ fn every_payload_variant_roundtrips() {
                 blob_quota_per_owner: 2 * 1024 * 1024 * 1024,
                 blob_get_window: 8 * 1024 * 1024,
                 blob_min_charge: 64 * 1024,
+                supports_ice_servers: true,
             }
             .encode_to_vec(),
             node_identity_key: vec![6u8; 32],
@@ -301,6 +304,16 @@ fn every_payload_variant_roundtrips() {
                     max_releases: 2,
                 },
             ],
+        }),
+        frame::Payload::GetIceServers(GetIceServers {}),
+        frame::Payload::IceServers(IceServers {
+            servers: vec![IceServer {
+                urls: vec!["turn:turn.example:3478".to_string()],
+                username: "1700007200:0123456789abcdef".to_string(),
+                credential: "c2VjcmV0".to_string(),
+            }],
+            expires_at: 1_700_007_200,
+            reason: IceRejectReason::Unspecified as i32,
         }),
     ];
 
@@ -603,6 +616,8 @@ fn blob_store_wire_numbers_are_pinned() {
         frame::Payload::BlobAck(BlobAck::default()),
         frame::Payload::BlobData(BlobData::default()),
         frame::Payload::BlobStatResult(BlobStatResult::default()),
+        frame::Payload::GetIceServers(GetIceServers::default()),
+        frame::Payload::IceServers(IceServers::default()),
     ]
     .into_iter()
     .map(|payload| {
@@ -611,7 +626,7 @@ fn blob_store_wire_numbers_are_pinned() {
         [encoded[2], encoded[3]]
     })
     .collect();
-    let expected: Vec<[u8; 2]> = (23u32..=34)
+    let expected: Vec<[u8; 2]> = (23u32..=36)
         .map(|number| {
             let key = (number << 3) | 2;
             [(key as u8 & 0x7f) | 0x80, (key >> 7) as u8]
@@ -651,6 +666,13 @@ fn blob_store_wire_numbers_are_pinned() {
             0x04, 0xe8, 0x01, 0x05, 0xf0, 0x01, 0x06
         ]
     );
+
+    // ServerConfig.supports_ice_servers = 31.
+    let config = ServerConfig {
+        supports_ice_servers: true,
+        ..ServerConfig::default()
+    };
+    assert_eq!(config.encode_to_vec(), [0xf8, 0x01, 0x01]);
 
     // NoiseClientHello.role = 4.
     let hello = trust_message_tcp::wire::NoiseClientHello {

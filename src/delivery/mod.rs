@@ -1699,6 +1699,7 @@ mod tests {
     async fn jetstream_backend_refuses_to_start_without_a_broker() {
         let (storage, path) = temp_storage("jetstream_down");
         let cfg = Config {
+            ice: Default::default(),
             runtime_config_path: String::new(),
             blobs: crate::config::BlobConfig::default(),
             queue_addressing_enabled: false,
