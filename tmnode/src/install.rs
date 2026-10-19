@@ -26,6 +26,21 @@ pub struct Layout {
     pub unit_path: PathBuf,
 }
 
+impl Layout {
+    /// Пути по умолчанию с переопределением из окружения:
+    /// `TMNODE_ETC_DIR`, `TMNODE_DATA_DIR`, `TMNODE_UNIT_PATH`. Нужны, когда
+    /// `tmnode` работает не в стандартных каталогах — например, агент рядом
+    /// с нодой, запущенной без Docker.
+    pub fn from_env(env: impl Fn(&str) -> Option<String>) -> Self {
+        let default = Self::default();
+        Self {
+            data_dir: env("TMNODE_DATA_DIR").map_or(default.data_dir, PathBuf::from),
+            etc_dir: env("TMNODE_ETC_DIR").map_or(default.etc_dir, PathBuf::from),
+            unit_path: env("TMNODE_UNIT_PATH").map_or(default.unit_path, PathBuf::from),
+        }
+    }
+}
+
 impl Default for Layout {
     fn default() -> Self {
         Self {
@@ -62,6 +77,21 @@ pub trait Runner {
 /// Настоящая машина.
 pub struct HostRunner;
 
+/// Сменить владельца может только root. Без root (агент рядом с нодой,
+/// запущенной тем же пользователем, разработка) владелец остаётся текущим —
+/// он и так может читать свои файлы.
+fn chown_if_root(path: &Path, uid: u32) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let euid = std::fs::metadata("/proc/self")
+        .map(|m| m.uid())
+        .unwrap_or(0);
+    if euid != 0 {
+        return Ok(());
+    }
+    std::os::unix::fs::chown(path, Some(uid), Some(uid))
+        .with_context(|| format!("владелец {}", path.display()))
+}
+
 impl Runner for HostRunner {
     fn run(&self, program: &str, args: &[String]) -> Result<String> {
         let output = std::process::Command::new(program)
@@ -94,8 +124,7 @@ impl Runner for HostRunner {
         // `mode` при создании режет umask: выставляем явно.
         std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
         if let Some(uid) = uid {
-            std::os::unix::fs::chown(&tmp, Some(uid), Some(uid))
-                .with_context(|| format!("владелец {}", tmp.display()))?;
+            chown_if_root(&tmp, uid)?;
         }
         std::fs::rename(&tmp, path).with_context(|| format!("запись {}", path.display()))?;
         Ok(())
@@ -104,8 +133,7 @@ impl Runner for HostRunner {
     fn create_dir(&self, path: &Path, uid: Option<u32>) -> Result<()> {
         std::fs::create_dir_all(path).with_context(|| format!("каталог {}", path.display()))?;
         if let Some(uid) = uid {
-            std::os::unix::fs::chown(path, Some(uid), Some(uid))
-                .with_context(|| format!("владелец {}", path.display()))?;
+            chown_if_root(path, uid)?;
         }
         Ok(())
     }
@@ -735,7 +763,10 @@ mod tests {
         let host = HostRunner;
         host.create_dir(&dir.join("a/b"), None).unwrap();
         let file = dir.join("a/b/x.toml");
-        host.write_file(&file, b"hello", 0o600, None).unwrap();
+        // Не root: владелец не меняется, запись проходит.
+        host.write_file(&file, b"hello", 0o600, Some(10001))
+            .unwrap();
+        host.create_dir(&dir.join("c"), Some(10001)).unwrap();
         assert_eq!(host.read_file(&file).unwrap().as_deref(), Some("hello"));
         let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
@@ -745,6 +776,18 @@ mod tests {
         assert!(host.run("/nonexistent/program", &[]).is_err());
         host.sleep(Duration::from_millis(1));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn layout_follows_the_environment() {
+        let layout = Layout::from_env(|key| match key {
+            "TMNODE_ETC_DIR" => Some("/tmp/etc".into()),
+            "TMNODE_DATA_DIR" => Some("/tmp/data".into()),
+            _ => None,
+        });
+        assert_eq!(layout.etc_dir, PathBuf::from("/tmp/etc"));
+        assert_eq!(layout.data_dir, PathBuf::from("/tmp/data"));
+        assert_eq!(layout.unit_path, Layout::default().unit_path);
     }
 
     #[test]

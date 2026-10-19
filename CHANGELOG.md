@@ -16,6 +16,10 @@
   статусом `runtime.toml`; желаемые настройки агент записывает на диск, а
   нода подхватывает их без перезапуска. Протокол v1 —
   docs/agent-protocol.md, типы — `tmnode::protocol`.
+- Каталоги `tmnode` переопределяются окружением (`TMNODE_ETC_DIR`,
+  `TMNODE_DATA_DIR`, `TMNODE_UNIT_PATH`). Владельца файлов `tmnode` меняет,
+  только когда запущен от root: агент работает и рядом с нодой,
+  запущенной без Docker тем же пользователем.
 - `deploy/install.sh` — ставит Docker, скачивает `tmnode` из GitHub
   Releases со сверкой SHA-256 и запускает его.
 - Релиз по тегу `v*` (`release.yml`): бинари `tmnode` для x86_64 и
