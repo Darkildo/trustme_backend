@@ -439,6 +439,41 @@ async fn image_that_cannot_be_pulled_changes_nothing() {
 }
 
 #[tokio::test]
+async fn stalled_pull_is_retried_on_a_new_connection() {
+    let s = setup("pull_stalls", MANAGED, "");
+    *s.host.stalled_pulls.borrow_mut() = 2;
+    let status = done(
+        s.updater("0.6.0", Origin::Admin)
+            .execute(&order("st", Some("0.7.0")), &())
+            .await,
+    );
+    assert_eq!(status.state, UpdateState::Succeeded, "{:?}", status.error);
+    let mut expected = vec![format!("docker pull {}", image("0.7.0")); 2];
+    expected.extend(recreate_commands(&s, "0.7.0"));
+    expected.push(format!("docker rm {PREV}"));
+    assert_eq!(s.host.commands(), expected);
+}
+
+#[tokio::test]
+async fn pull_that_keeps_stalling_changes_nothing() {
+    let s = setup("pull_stalls_always", MANAGED, "");
+    *s.host.stalled_pulls.borrow_mut() = 10;
+    let status = done(
+        s.updater("0.6.0", Origin::Admin)
+            .execute(&order("st", Some("0.7.0")), &())
+            .await,
+    );
+    assert_eq!(status.state, UpdateState::Failed);
+    let error = status.error.unwrap();
+    assert!(error.contains("нет вывода 300 с"), "{error}");
+    assert_eq!(
+        s.host.commands(),
+        vec![format!("docker pull {}", image("0.7.0")); 3]
+    );
+    assert_eq!(s.host.ctr(NODE).unwrap(), node_ctr("0.6.0"));
+}
+
+#[tokio::test]
 async fn checksums_must_match_both_the_release_and_the_order() {
     let binary = b"new tmnode 0.7.0".to_vec();
 
@@ -917,6 +952,43 @@ async fn agent_runs_the_order_and_reports_until_the_panel_stops() {
     agent::tick(&panel, &up).await.unwrap();
     assert!(panel.beats.borrow().last().unwrap().update.is_none());
     assert_eq!(s.host.commands().len(), ran);
+}
+
+/// Скачивание идёт минуты: агент всё это время шлёт heartbeat с шагом,
+/// иначе панель через три интервала сочтёт его пропавшим.
+#[tokio::test(start_paused = true)]
+async fn agent_keeps_reporting_during_a_long_step() {
+    let s = setup("agent_keepalive", MANAGED, "");
+    let binary = b"new tmnode 0.7.0".to_vec();
+    s.releases.publish("0.7.0", &binary);
+    *s.releases.delay.borrow_mut() = std::time::Duration::from_secs(50);
+    *s.host.new_binary_says.borrow_mut() = "tmnode 0.7.0\n".into();
+    let panel = Panel::sending(with_tmnode(
+        order("01slow", None),
+        "0.7.0",
+        &sha256(&binary),
+    ));
+    let up = s.updater("0.6.0", Origin::Admin);
+
+    let started = tokio::time::Instant::now();
+    assert_eq!(agent::tick(&panel, &up).await.unwrap(), Next::Restart);
+    // SHA256SUMS и бинарь — по 50 с.
+    assert!(started.elapsed() >= std::time::Duration::from_secs(100));
+    let steps: Vec<_> = panel.beats.borrow()[1..]
+        .iter()
+        .map(|b| b.update.as_ref().unwrap().step.unwrap())
+        .collect();
+    // Перед шагом, затем раз в 30 с (30, 60, 90), затем следующий шаг.
+    assert_eq!(
+        steps,
+        [
+            UpdateStep::DownloadTmnode,
+            UpdateStep::DownloadTmnode,
+            UpdateStep::DownloadTmnode,
+            UpdateStep::DownloadTmnode,
+            UpdateStep::RestartAgent
+        ]
+    );
 }
 
 #[tokio::test]

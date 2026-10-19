@@ -4,14 +4,16 @@
 
 use std::cell::RefCell;
 use std::collections::BTreeMap;
+use std::future::Future;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::time::Duration;
 
 use anyhow::{Result, anyhow, bail};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tmnode::install::{Layout, Runner};
+use tmnode::install::{Layout, Runner, Stalled};
 use tmnode::protocol::UpdateStatus;
 use tmnode::system::{Container, DiskSpace, DockerError, MemInfo, System, parse_inspect};
 use tmnode::update::{Fetch, Origin, Progress, Sources, Updater};
@@ -183,6 +185,8 @@ pub struct Host {
     pub new_binary_says: RefCell<String>,
     /// Содержимое `--env-file` при каждом `docker create`.
     pub created_env: RefCell<Vec<String>>,
+    /// Сколько ближайших `docker pull` зависнут (обрыв по простою).
+    pub stalled_pulls: RefCell<u32>,
 }
 
 impl Host {
@@ -211,6 +215,7 @@ impl Host {
             failing: RefCell::new(Vec::new()),
             new_binary_says: RefCell::new(String::new()),
             created_env: RefCell::new(Vec::new()),
+            stalled_pulls: RefCell::new(0),
         }
     }
 
@@ -424,6 +429,29 @@ impl Default for Host {
 }
 
 impl Runner for Host {
+    fn run_long<'a>(
+        &'a self,
+        program: &'a str,
+        args: &'a [String],
+        idle: Duration,
+    ) -> Pin<Box<dyn Future<Output = Result<String>> + 'a>> {
+        let stalls = program == "docker"
+            && args.first().is_some_and(|a| a == "pull")
+            && *self.stalled_pulls.borrow() > 0;
+        if stalls {
+            *self.stalled_pulls.borrow_mut() -= 1;
+            self.commands
+                .borrow_mut()
+                .push(format!("{program} {}", args.join(" ")));
+            let stalled = Stalled {
+                command: "docker pull".into(),
+                idle,
+            };
+            return Box::pin(std::future::ready(Err(anyhow::Error::new(stalled))));
+        }
+        Box::pin(std::future::ready(self.run(program, args)))
+    }
+
     fn run(&self, program: &str, args: &[String]) -> Result<String> {
         let line = format!("{program} {}", args.join(" "));
         self.commands.borrow_mut().push(line.clone());
@@ -555,6 +583,8 @@ impl System for Host {
 pub struct Releases {
     pub files: RefCell<BTreeMap<String, Vec<u8>>>,
     pub fetched: RefCell<Vec<String>>,
+    /// Сколько идёт каждое скачивание (по часам tokio).
+    pub delay: RefCell<Duration>,
 }
 
 impl Releases {
@@ -582,6 +612,10 @@ impl Releases {
 impl Fetch for Releases {
     async fn get(&self, url: &str, limit: usize) -> Result<Vec<u8>> {
         self.fetched.borrow_mut().push(url.to_owned());
+        let delay = *self.delay.borrow();
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
         let body = self
             .files
             .borrow()

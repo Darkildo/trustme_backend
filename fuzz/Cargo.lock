@@ -3308,7 +3308,7 @@ dependencies = [
 
 [[package]]
 name = "trust_message_tcp"
-version = "0.8.0"
+version = "0.8.1"
 dependencies = [
  "anyhow",
  "async-nats",

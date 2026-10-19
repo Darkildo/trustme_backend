@@ -28,6 +28,10 @@ use crate::update::{Fetch, Outcome, Progress, Updater};
 /// Пользователь ноды в контейнере: `runtime.toml` читает она.
 const NODE_UID: u32 = 10001;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(15);
+/// Пока идёт обновление — heartbeat с этим шагом: скачивание и `docker pull`
+/// длятся минутами, а агент без heartbeat через три интервала считается
+/// пропавшим.
+const KEEPALIVE: Duration = Duration::from_secs(DEFAULT_INTERVAL_SECS);
 
 /// `/etc/tmnode/agent.toml`: куда звонить и с каким токеном. Права 0600.
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
@@ -227,6 +231,31 @@ impl<A: AdminApi> Progress for BeatProgress<'_, A> {
     }
 }
 
+impl<A: AdminApi> BeatProgress<'_, A> {
+    /// Выполнять `work`, а раз в [`KEEPALIVE`] сообщать текущий шаг задания.
+    async fn keep_alive<T, S: System, F: Fetch>(
+        &self,
+        up: &Updater<'_, S, F>,
+        work: impl Future<Output = T>,
+    ) -> T {
+        let mut work = std::pin::pin!(work);
+        let mut ticker = tokio::time::interval(KEEPALIVE);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Первый тик — сразу: о начале шага уже сообщил `running`.
+        ticker.tick().await;
+        loop {
+            tokio::select! {
+                out = &mut work => return out,
+                _ = ticker.tick() => {
+                    if let Some(status) = up.report() {
+                        self.running(&status).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Один цикл: отчёт и статус в админку, желаемые настройки — на диск,
 /// задание на обновление — к исполнению.
 pub async fn tick<S: System, F: Fetch>(
@@ -274,7 +303,7 @@ pub async fn tick<S: System, F: Fetch>(
         return Ok(Next::Wait(interval));
     }
     let progress = BeatProgress { api, base };
-    match up.execute(order, &progress).await {
+    match progress.keep_alive(up, up.execute(order, &progress)).await {
         Outcome::Restart(_) => Ok(Next::Restart),
         // Итог — в админку поскорее.
         Outcome::Done(_) => Ok(Next::Wait(MIN_INTERVAL_SECS)),
@@ -292,7 +321,8 @@ pub async fn resume<S: System, F: Fetch>(
     }
     let (config, data_dir) = load_config(up.node_toml)?;
     let base = base_beat(up, &config, &data_dir)?;
-    Ok(up.resume(&BeatProgress { api, base }).await)
+    let progress = BeatProgress { api, base };
+    Ok(progress.keep_alive(up, up.resume(&progress)).await)
 }
 
 /// Записать желаемый `runtime.toml`, если на диске другая версия. Файл
