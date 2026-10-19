@@ -121,6 +121,142 @@ async fn prod_like_disk_warns_about_blob_quota() {
     assert_eq!(status(&map, "host.blob_reserve"), Status::Error);
 }
 
+/// Как на живой ноде: резерв 5 ГиБ в окружении, свободно 4,4 ГиБ.
+fn reserve_case() -> Fake {
+    let mut sys = healthy();
+    sys.set_env("BLOB_DISK_RESERVE_BYTES", &(5 * GIB).to_string());
+    sys.disk = Some(DiskSpace {
+        total: 14 * GIB,
+        available: 4_766_261_248,
+    });
+    sys
+}
+
+fn runtime_toml(sys: &mut Fake, text: &str) {
+    sys.files.insert(
+        PathBuf::from(DATA).join("runtime.toml"),
+        Ok((text.to_owned(), 0o600)),
+    );
+}
+
+fn blob_reserve(report: &Report) -> &tmnode::report::Check {
+    report
+        .checks
+        .iter()
+        .find(|c| c.id == "host.blob_reserve")
+        .unwrap()
+}
+
+#[tokio::test]
+async fn runtime_toml_overrides_the_reserve_from_the_environment() {
+    let mut sys = reserve_case();
+    runtime_toml(
+        &mut sys,
+        "version = \"7\"\n[settings]\nblob_disk_reserve_bytes = 1342177280\n",
+    );
+    let report = run(&sys, &input(), 0).await;
+    statuses(&report);
+    let check = blob_reserve(&report);
+
+    assert_eq!(check.status, Status::Ok, "{}", check.summary);
+    assert_eq!(check.data["reserve_bytes"], 1_342_177_280u64);
+    assert_eq!(check.data["reserve_source"], "runtime");
+    assert_eq!(check.data["available_bytes"], 4_766_261_248u64);
+    assert_eq!(
+        check.data["runtime_path"],
+        format!("{DATA}/runtime.toml").as_str()
+    );
+
+    // Файл есть, но резерв в нём не задан — резерв из окружения.
+    runtime_toml(&mut sys, "[settings]\nrate_limit_send_msgs_per_sec = 20\n");
+    let report = run(&sys, &input(), 0).await;
+    let check = blob_reserve(&report);
+    assert_eq!(check.status, Status::Warn);
+    assert_eq!(check.data["reserve_source"], "env");
+}
+
+#[tokio::test]
+async fn without_runtime_toml_the_reserve_comes_from_the_environment() {
+    let sys = reserve_case();
+    let report = run(&sys, &input(), 0).await;
+    let check = blob_reserve(&report);
+
+    assert_eq!(check.status, Status::Warn);
+    assert!(check.summary.contains("QUOTA"), "{}", check.summary);
+    assert_eq!(check.data["reserve_bytes"], 5 * GIB);
+    assert_eq!(check.data["reserve_source"], "env");
+    assert!(!check.data.contains_key("runtime_path"));
+    assert!(!check.data.contains_key("runtime_error"));
+}
+
+#[tokio::test]
+async fn broken_runtime_toml_falls_back_to_the_environment() {
+    let mut sys = reserve_case();
+    sys.disk = Some(DiskSpace {
+        total: 14 * GIB,
+        available: 8 * GIB,
+    });
+
+    // Значение вне каталога: нода отвергла бы файл целиком.
+    runtime_toml(
+        &mut sys,
+        "[settings]\nblob_disk_reserve_bytes = 1342177280\nno_such_setting = 1\n",
+    );
+    let report = run(&sys, &input(), 0).await;
+    let check = blob_reserve(&report);
+    assert_eq!(check.status, Status::Warn, "{}", check.summary);
+    assert_eq!(check.data["reserve_bytes"], 5 * GIB);
+    assert_eq!(check.data["reserve_source"], "env");
+    assert!(
+        check.summary.contains("runtime.toml не разобран")
+            && check.summary.contains("no_such_setting"),
+        "{}",
+        check.summary
+    );
+    assert!(check.hint.as_deref().unwrap().contains("runtime.toml"));
+    assert!(
+        check.data["runtime_error"]
+            .as_str()
+            .unwrap()
+            .contains("no_such_setting")
+    );
+
+    // Синтаксическая ошибка: toml цитирует строку, но секрет TURN в отчёт
+    // не попадает.
+    let secret = "turn-shared-secret-0123456789";
+    runtime_toml(
+        &mut sys,
+        &format!("[[ice.servers]]\nurls = [\"turn:turn.example:3478\"]\nsecret = \"{secret}\n"),
+    );
+    let report = run(&sys, &input(), 0).await;
+    let check = blob_reserve(&report);
+    assert_eq!(check.status, Status::Warn);
+    assert_eq!(check.data["reserve_source"], "env");
+    assert!(check.summary.contains("line 3"), "{}", check.summary);
+    assert!(!report.to_json().contains(secret), "{}", report.to_json());
+
+    // Хранилище файлов выключено — о битом файле всё равно сказано.
+    sys.set_env("BLOB_ENABLED", "false");
+    let map = doctor(&sys, &input()).await;
+    assert_eq!(status(&map, "host.blob_reserve"), Status::Warn);
+    assert!(
+        map["host.blob_reserve"]
+            .1
+            .contains("хранилище файлов выключено")
+    );
+
+    // Прочитать не удалось — не знаем, а не «сломано».
+    sys.set_env("BLOB_ENABLED", "true");
+    sys.files.insert(
+        PathBuf::from(DATA).join("runtime.toml"),
+        Err(io::ErrorKind::PermissionDenied.into()),
+    );
+    let report = run(&sys, &input(), 0).await;
+    let check = blob_reserve(&report);
+    assert_eq!(check.status, Status::Error, "{}", check.summary);
+    assert_eq!(check.data["reserve_source"], "env");
+}
+
 const KEY_LINE: &str = "node_key = \"";
 
 fn toml_for(addr: &str, key: [u8; 32], backend: &str) -> String {
