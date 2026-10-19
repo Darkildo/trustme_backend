@@ -63,13 +63,13 @@ curl -fsSL https://raw.githubusercontent.com/Darkildo/trustme_backend/stable/dep
 
 ```bash
 sudo tmnode update --node-version 0.7.0                         # только нода
-sudo tmnode update --node-version 0.7.0 --tmnode-version 0.3.0  # и сам tmnode
+sudo tmnode update --node-version 0.7.0 --tmnode-version 0.7.0  # и сам tmnode
 ```
 
 | Флаг | Смысл |
 |---|---|
 | `--node-version X.Y.Z` | образ ноды `ghcr.io/darkildo/trustme_backend:vX.Y.Z` |
-| `--tmnode-version X.Y.Z` | новый `tmnode` из того же релиза бэкенда |
+| `--tmnode-version X.Y.Z` | новый `tmnode` из релиза `vX.Y.Z`: с 0.7.0 его версия — версия релиза бэкенда |
 | `--allow-downgrade` | разрешить версию ниже текущей. Данные при откате не восстанавливаются |
 | `--json` | итог в JSON — тот же `UpdateStatus`, что агент шлёт админке |
 | `--resume` | только дочитать прерванное обновление |
@@ -106,7 +106,7 @@ sudo tmnode update --node-version 0.7.0 --tmnode-version 0.3.0  # и сам tmno
 `https://github.com/Darkildo/trustme_backend/releases/download`). У
 агента они задаются в юните службы (`Environment=`).
 
-**Агент.** Служба `tmnode-agent` с 0.3.0:
+**Агент.** Служба `tmnode-agent` с 0.7.0:
 - присылает в heartbeat образ контейнера ноды (`node_image`) и ход
   задания на обновление (`update`);
 - выполняет задание из ответа админки. Перед долгими шагами шлёт
@@ -115,7 +115,7 @@ sudo tmnode update --node-version 0.7.0 --tmnode-version 0.3.0  # и сам tmno
   новым (`Restart=always`);
 - при старте сначала дочитывает незавершённое задание.
 
-Агент до 0.3.0 обновляться не умеет. Его обновляют на сервере:
+Агент до 0.7.0 обновляться не умеет. Его обновляют на сервере:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/Darkildo/trustme_backend/stable/deploy/install.sh \
