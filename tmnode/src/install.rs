@@ -175,6 +175,17 @@ pub fn install(
     meta: &NodeMeta<'_>,
 ) -> Result<Installed> {
     check_spec(spec)?;
+    // node.toml пишется последним, но проверяется до первого шага: с
+    // файлом, который не примет сам tmnode, агент не работает, а ставить
+    // ради этого ноду незачем. Ключ ещё не известен — на его месте нули.
+    let addr = format!("{}:{}", spec.public_host, spec.port);
+    check_node_toml(&node_toml(
+        meta,
+        &addr,
+        &"0".repeat(64),
+        layout,
+        spec.backend,
+    ))?;
     let docker = |args: &[&str]| -> Result<String> {
         runner.run(
             "docker",
@@ -244,10 +255,11 @@ pub fn install(
     }
 
     let key = wait_for_key(runner, &layout.data_dir)?;
-    let addr = format!("{}:{}", spec.public_host, spec.port);
+    let text = node_toml(meta, &addr, &key, layout, spec.backend);
+    check_node_toml(&text)?;
     runner.write_file(
         &layout.etc_dir.join("node.toml"),
-        node_toml(meta, &addr, &key, layout, spec.backend).as_bytes(),
+        text.as_bytes(),
         0o644,
         None,
     )?;
@@ -428,6 +440,13 @@ fn node_toml(
         backend.as_str()
     ));
     out
+}
+
+/// Тот же разбор, что у `tmnode doctor` и агента.
+fn check_node_toml(text: &str) -> Result<()> {
+    crate::node_config::NodeConfig::parse(text)
+        .map(drop)
+        .context("node.toml для этой ноды не прошёл бы проверку")
 }
 
 fn toml_string(value: &str) -> String {

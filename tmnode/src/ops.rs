@@ -171,13 +171,17 @@ pub async fn enroll_and_install(
     if args.no_install {
         return Ok(None);
     }
+    // Панель выдавала id как ULID в верхнем регистре, а node.toml пускает
+    // только строчные. ULID к регистру нечувствителен, ноду в heartbeat
+    // админка узнаёт по токену агента — приводим, а не отказываем.
+    let node_id = response.node_id.to_ascii_lowercase();
     let done = install::install(
         runner,
         layout,
         &response.install,
         response.runtime.as_ref(),
         &NodeMeta {
-            id: Some(&response.node_id),
+            id: Some(&node_id),
             name: Some(&response.node_name),
             managed: true,
         },
