@@ -54,6 +54,30 @@ impl Runner for MemRunner {
         }
         Ok(self.files.borrow().get(path).map(|f| f.0.clone()))
     }
+    fn rename(&self, from: &Path, to: &Path) -> Result<()> {
+        let file = self.files.borrow_mut().remove(from);
+        match file {
+            Some(file) => {
+                self.files.borrow_mut().insert(to.to_owned(), file);
+                Ok(())
+            }
+            None => bail!("нет {}", from.display()),
+        }
+    }
+    fn copy_file(&self, from: &Path, to: &Path) -> Result<()> {
+        let file = self.files.borrow().get(from).cloned();
+        match file {
+            Some(file) => {
+                self.files.borrow_mut().insert(to.to_owned(), file);
+                Ok(())
+            }
+            None => bail!("нет {}", from.display()),
+        }
+    }
+    fn remove_file(&self, path: &Path) -> Result<()> {
+        self.files.borrow_mut().remove(path);
+        Ok(())
+    }
     fn sleep(&self, _duration: Duration) {}
 }
 

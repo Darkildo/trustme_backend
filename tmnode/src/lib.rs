@@ -13,3 +13,4 @@ pub mod ops;
 pub mod protocol;
 pub mod report;
 pub mod system;
+pub mod update;
