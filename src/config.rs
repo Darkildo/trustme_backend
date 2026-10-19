@@ -50,8 +50,8 @@ pub struct Config {
     pub push: PushConfig,
     /// Лимиты и backpressure (квоты очередей, rate-limit, пол ttl).
     pub limits: LimitsConfig,
-    /// Управляет ли `ClientSend.queueId` доставкой (`QUEUE_ADDRESSING_ENABLED`).
-    /// Default: false.
+    /// Управляет ли `ClientSend.queueId` доставкой (`QUEUE_ADDRESSING_ENABLED`,
+    /// в каталоге — `queue_addressing_enabled`). Default: true.
     pub queue_addressing_enabled: bool,
     /// Потолок срока жизни сертификата устройства
     /// (`DEVICE_CERT_MAX_TTL_SECONDS`). Default: 30 суток. `0` выключает
@@ -388,8 +388,8 @@ pub struct ServerConfigSnapshot {
     /// сессию с `message_id = 0` — подтверждать там нечего.
     pub supports_delivery_ack: bool,
     /// Включена ли адресация по очередям (`QUEUE_ADDRESSING_ENABLED`).
-    /// Default: false — `queueId` принимается и игнорируется, доставка идёт
-    /// по `recipientId`.
+    /// Default: true. Снятый флаг — `queueId` принимается и игнорируется,
+    /// доставка идёт по `recipientId`.
     ///
     /// Флаг существует ради порядка выкатки: нода и клиент обновляются
     /// врозь, и включать маршрутизацию по очередям осмысленно только после
@@ -1256,7 +1256,7 @@ fn resolve(raw: RawConfig) -> anyhow::Result<Config> {
         ice: IceConfig::default(),
         runtime_config_path,
         blobs,
-        queue_addressing_enabled: queue_addressing_enabled.unwrap_or(false),
+        queue_addressing_enabled: queue_addressing_enabled.unwrap_or(true),
         device_cert_max_ttl: Duration::from_secs(
             device_cert_max_ttl_seconds.unwrap_or(30 * 24 * 3600),
         ),
@@ -2291,6 +2291,13 @@ mod tests {
         assert_eq!(cfg.blobs.dir, "/srv/trust-message/data/blobs");
         assert_eq!(cfg.blobs.disk_reserve, 1_048_576);
         assert!(cfg.node_identity_key.is_none());
+        assert!(
+            cfg.queue_addressing_enabled,
+            "адресация по очередям включена по умолчанию"
+        );
+        let off =
+            from_env_vars([("QUEUE_ADDRESSING_ENABLED".to_owned(), "false".to_owned())]).unwrap();
+        assert!(!off.queue_addressing_enabled);
 
         let err = from_env_vars([("DELIVERY_BACKEND".to_owned(), "kafka".to_owned())])
             .expect_err("unknown backend must not resolve");

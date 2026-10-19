@@ -613,6 +613,40 @@ secret = "0123456789abcdef0123"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Адресация по очередям объявляется в подписанном конфиге: правка файла
+    /// ждёт перезапуска, при старте применяется.
+    #[tokio::test]
+    async fn queue_addressing_waits_for_restart() {
+        let dir = temp_dir("queue_addressing");
+        let path = default_path(&dir.display().to_string());
+        let base = env_config(&dir);
+        assert!(base.queue_addressing_enabled, "включена по умолчанию");
+        let mut running = base.clone();
+        let startup = apply_at_startup(&mut running, &path);
+        let live = Live::new(&running, None);
+        let mut reloader =
+            Reloader::new(path.clone(), base.clone(), &running, live.clone(), &startup);
+
+        std::fs::write(&path, "[settings]\nqueue_addressing_enabled = 0\n").unwrap();
+        let status = reloader.reload(false).unwrap();
+        assert_eq!(status.result, "applied");
+        assert_eq!(
+            status.pending_restart,
+            vec!["queue_addressing_enabled".to_owned()]
+        );
+        assert!(live.server_config.current().supports_queue_addressing);
+
+        let mut restarted = base;
+        assert_eq!(apply_at_startup(&mut restarted, &path).result, "applied");
+        assert!(!restarted.queue_addressing_enabled);
+        assert!(!restarted.server_config_snapshot().supports_queue_addressing);
+
+        std::fs::write(&path, "[settings]\nqueue_addressing_enabled = 2\n").unwrap();
+        assert_eq!(reloader.reload(false).unwrap().result, "invalid");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn oversized_files_are_refused() {
         let dir = temp_dir("big");
