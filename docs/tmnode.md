@@ -190,7 +190,12 @@ channel = "stable"            # stable | pinned
       "status": "warn",
       "summary": "свободно 1.7 ГиБ при резерве 5.0 ГиБ: загрузка файлов получает QUOTA",
       "hint": "расширьте диск или уменьшите BLOB_DISK_RESERVE_BYTES",
-      "data": { "available_bytes": 1825361100, "reserve_bytes": 5368709120, "host_path": "…" }
+      "data": {
+        "available_bytes": 1825361100,
+        "reserve_bytes": 5368709120,
+        "reserve_source": "env",
+        "host_path": "…"
+      }
     }
   ]
 }
@@ -230,7 +235,7 @@ channel = "stable"            # stable | pinned
 | `identity.secret` | секрет ключа на месте и читается | `fail` — нет или повреждён (нода создаст новый ключ); `warn` — права шире 0600; `error` — нет прав прочитать |
 | `identity.pin` | ключ совпадает с `endpoint.node_key` | `fail` — не совпадает: клиенты с этим пином не подключатся |
 | `host.disk` | свободное место в каталоге данных | `fail` — < 512 МиБ; `warn` — < 2 ГиБ |
-| `host.blob_reserve` | место под файлы сверх `BLOB_DISK_RESERVE_BYTES` | `warn` — места меньше резерва, загрузка получает `QUOTA`; `fail` — каталог блобов в слое контейнера |
+| `host.blob_reserve` | место под файлы сверх действующего резерва: `BLOB_DISK_RESERVE_BYTES` из окружения, поверх — `blob_disk_reserve_bytes` из `runtime.toml` (как у ноды, docs/runtime-config.md). `data.reserve_source`: `env` или `runtime`; `runtime_path`, `runtime_error` — если файл есть | `warn` — места меньше резерва, загрузка получает `QUOTA`, или `runtime.toml` не разобран (нода его тоже не применила, резерв по окружению); `error` — `runtime.toml` не прочитать; `fail` — каталог блобов в слое контейнера |
 | `host.memory` | память хоста | `warn` — меньше ~90 % рекомендации (sled 512 МиБ, JetStream 1 ГиБ) или почти нет свободной |
 | `host.clock` | часы синхронизированы (NTP) | `warn` — нет; от часов зависят сроки сертификатов и подписанного конфига |
 | `endpoint.tcp` | порт открыт | `fail` — нет соединения |

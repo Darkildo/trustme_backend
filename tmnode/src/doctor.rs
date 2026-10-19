@@ -5,12 +5,14 @@
 //! даже неприменимая — со статусом `skip` и причиной. Так admin-сервис
 //! сравнивает отчёты разных нод построчно, а не гадает, почему строки нет.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use trust_message_tcp::config::{self as node_config, DeliveryBackendKind};
 use trust_message_tcp::net::noise::{NODE_KEY_FILE, NodeIdentity, NodeKeySource, fingerprint};
 use trust_message_tcp::net::probe::ProbeStage;
+use trust_message_tcp::runtime::{self, RuntimeFile, catalog::Tunables};
 
 use crate::node_config::NodeConfig;
 use crate::report::{Check, Report, Status, Target};
@@ -198,7 +200,7 @@ fn host_checks<S: System>(
     };
 
     // runtime.config — окружение контейнера тем же кодом, что у ноды.
-    let effective = match &container {
+    let mut effective = match &container {
         None => {
             checks.push(Check::skip("runtime.config", "нет контейнера"));
             None
@@ -263,6 +265,13 @@ fn host_checks<S: System>(
         }
     };
 
+    // Настройки без перезапуска: поверх окружения — runtime.toml, как у
+    // ноды (docs/runtime-config.md).
+    let layer = match (&mut effective, &container) {
+        (Some(cfg), Some(c)) => runtime_layer(sys, cfg, c, config),
+        _ => RuntimeLayer::Absent,
+    };
+
     // identity.secret / identity.pin
     let identity = identity_secret_check(sys, effective.as_ref(), data_dir.as_deref(), checks);
     checks.push(pin_check(config, identity.as_ref()));
@@ -278,6 +287,7 @@ fn host_checks<S: System>(
         effective.as_ref(),
         container.as_ref(),
         config,
+        &layer,
     ));
 
     // host.memory / host.clock — от контейнера не зависят.
@@ -414,6 +424,114 @@ fn drift_check(
         Check::new("config.drift", Status::Warn, diffs.join("; "))
             .hint("приведите node.toml или окружение контейнера к одному виду")
     }
+}
+
+/// `runtime.toml` ноды глазами doctor.
+enum RuntimeLayer {
+    /// Файла нет или он не вынесен на хост — действует окружение.
+    Absent,
+    /// Наложен на окружение. `settings` — какие настройки файл задаёт.
+    Applied {
+        path: PathBuf,
+        settings: BTreeSet<String>,
+    },
+    /// Не наложен — действует окружение. `Warn`: нода тоже отвергнет файл;
+    /// `Error`: doctor не смог его прочитать.
+    Broken {
+        path: PathBuf,
+        status: Status,
+        error: String,
+    },
+}
+
+impl RuntimeLayer {
+    /// Откуда взято значение настройки каталога: `runtime` или `env`.
+    fn source(&self, setting: &str) -> &'static str {
+        match self {
+            Self::Applied { settings, .. } if settings.contains(setting) => "runtime",
+            _ => "env",
+        }
+    }
+}
+
+/// Наложить `runtime.toml` на конфиг из окружения тем же кодом, что у ноды.
+/// Неверный файл конфиг не меняет: нода в этом случае тоже работает на
+/// окружении.
+fn runtime_layer<S: System>(
+    sys: &S,
+    cfg: &mut node_config::Config,
+    container: &Container,
+    config: Option<&NodeConfig>,
+) -> RuntimeLayer {
+    let inside = Path::new(&cfg.runtime_config_path);
+    let Some(path) = host_path_of(inside, cfg, container, config) else {
+        return RuntimeLayer::Absent;
+    };
+    // В файле бывают секреты TURN ([ice]): читается как секрет.
+    let text = match sys.read_secret(&path) {
+        Ok(text) => text,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return RuntimeLayer::Absent,
+        Err(err) => {
+            return RuntimeLayer::Broken {
+                path,
+                status: Status::Error,
+                error: format!("не удалось прочитать: {err}"),
+            };
+        }
+    };
+    let parsed = if text.len() as u64 > runtime::MAX_FILE_BYTES {
+        Err(anyhow::anyhow!("больше {} байт", runtime::MAX_FILE_BYTES))
+    } else {
+        let base = Tunables::from_config(cfg);
+        RuntimeFile::parse(&text)
+            .and_then(|file| Ok((file.overlay(&base, cfg.max_frame_len)?, file)))
+    };
+    match parsed {
+        Ok((tunables, file)) => {
+            tunables.apply_to(cfg);
+            RuntimeLayer::Applied {
+                path,
+                settings: file.settings.into_keys().collect(),
+            }
+        }
+        Err(err) => RuntimeLayer::Broken {
+            path,
+            status: Status::Warn,
+            error: without_snippet(&format!("{err:#}")),
+        },
+    }
+}
+
+/// Ошибка разбора без цитаты из файла: toml показывает строку с ошибкой, а
+/// в ней может оказаться секрет TURN. Остаются номер строки и причина.
+fn without_snippet(error: &str) -> String {
+    error
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            let quoted = line
+                .trim_start_matches(|c: char| c.is_ascii_digit())
+                .trim_start()
+                .starts_with('|');
+            !line.is_empty() && !quoted
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Путь на хосте для пути внутри контейнера: через точку монтирования, а
+/// если каталог данных переопределён в node.toml — внутри него.
+fn host_path_of(
+    inside: &Path,
+    effective: &node_config::Config,
+    container: &Container,
+    config: Option<&NodeConfig>,
+) -> Option<PathBuf> {
+    container.host_path(inside).or_else(|| {
+        let data = config.and_then(|c| c.runtime.data_dir.as_ref())?;
+        let rest = inside.strip_prefix(&effective.storage_path).ok()?;
+        Some(data.join(rest))
+    })
 }
 
 fn identity_secret_check<S: System>(
@@ -561,26 +679,71 @@ fn disk_check<S: System>(sys: &S, dir: &Path) -> Check {
     }
 }
 
+/// Резерв — действующий: из окружения, поверх — из `runtime.toml`. Если
+/// файл не наложился, это видно здесь же: резерв тогда по окружению.
 fn blob_reserve_check<S: System>(
     sys: &S,
     effective: Option<&node_config::Config>,
     container: Option<&Container>,
     config: Option<&NodeConfig>,
+    layer: &RuntimeLayer,
 ) -> Check {
     let (Some(effective), Some(container)) = (effective, container) else {
         return Check::skip("host.blob_reserve", "конфиг ноды не разобран");
     };
-    if !effective.blobs.enabled {
-        return Check::skip("host.blob_reserve", "хранилище файлов выключено");
+    let check = if effective.blobs.enabled {
+        reserve_against_disk(sys, effective, container, config, layer)
+    } else {
+        Check::skip("host.blob_reserve", "хранилище файлов выключено")
+    };
+    match layer {
+        RuntimeLayer::Absent => check,
+        RuntimeLayer::Applied { path, .. } => {
+            check.data("runtime_path", path.display().to_string())
+        }
+        RuntimeLayer::Broken {
+            path,
+            status,
+            error,
+        } => {
+            let hint = match *status {
+                Status::Error => "запустите от root",
+                _ => {
+                    "исправьте runtime.toml или задайте настройки в панели заново: нода его тоже не применила"
+                }
+            };
+            let hint = match &check.hint {
+                Some(own) => format!("{hint}; {own}"),
+                None => hint.to_owned(),
+            };
+            Check {
+                status: check.status.max(*status),
+                summary: format!(
+                    "{}; runtime.toml не разобран: {error} — резерв по окружению",
+                    check.summary
+                ),
+                hint: Some(hint),
+                ..check
+            }
+            .data("runtime_path", path.display().to_string())
+            .data("runtime_error", error.clone())
+        }
     }
-    let inside = Path::new(&effective.blobs.dir);
-    let host = container.host_path(inside).or_else(|| {
-        // Каталог данных переопределён в node.toml: блобы по умолчанию
-        // лежат внутри него.
-        let data = config.and_then(|c| c.runtime.data_dir.as_ref())?;
-        let rest = inside.strip_prefix(&effective.storage_path).ok()?;
-        Some(data.join(rest))
-    });
+}
+
+fn reserve_against_disk<S: System>(
+    sys: &S,
+    effective: &node_config::Config,
+    container: &Container,
+    config: Option<&NodeConfig>,
+    layer: &RuntimeLayer,
+) -> Check {
+    let host = host_path_of(
+        Path::new(&effective.blobs.dir),
+        effective,
+        container,
+        config,
+    );
     let Some(host) = host else {
         return Check::new(
             "host.blob_reserve",
@@ -607,6 +770,7 @@ fn blob_reserve_check<S: System>(
         ),
         Ok(space) => {
             let reserve = effective.blobs.disk_reserve;
+            let source = layer.source("blob_disk_reserve_bytes");
             let check = if space.available <= reserve {
                 Check::new(
                     "host.blob_reserve",
@@ -617,7 +781,10 @@ fn blob_reserve_check<S: System>(
                         human_bytes(reserve)
                     ),
                 )
-                .hint("расширьте диск или уменьшите BLOB_DISK_RESERVE_BYTES")
+                .hint(match source {
+                    "runtime" => "расширьте диск или уменьшите blob_disk_reserve_bytes в runtime.toml (в панели)",
+                    _ => "расширьте диск или уменьшите BLOB_DISK_RESERVE_BYTES",
+                })
             } else {
                 Check::ok(
                     "host.blob_reserve",
@@ -631,6 +798,7 @@ fn blob_reserve_check<S: System>(
             check
                 .data("available_bytes", space.available)
                 .data("reserve_bytes", reserve)
+                .data("reserve_source", source)
                 .data("host_path", host.display().to_string())
         }
     }

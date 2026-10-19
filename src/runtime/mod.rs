@@ -34,7 +34,7 @@ use catalog::{CATALOG, Scope, Tunables};
 /// Как часто нода смотрит, не изменился ли файл.
 pub const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Потолок размера файла: настроек несколько десятков.
-const MAX_FILE_BYTES: u64 = 256 * 1024;
+pub const MAX_FILE_BYTES: u64 = 256 * 1024;
 
 /// Содержимое `runtime.toml`.
 #[derive(Debug, Clone, Default, Deserialize, PartialEq)]
