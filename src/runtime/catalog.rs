@@ -1,7 +1,7 @@
 //! Каталог настраиваемых лимитов ноды — общий контракт ноды, `tmnode` и
 //! админки (docs/runtime-config.md).
 //!
-//! Каждая настройка — число. Её имя — имя переменной окружения в нижнем
+//! Каждая настройка — число; переключатель — `0` или `1`. Её имя — имя переменной окружения в нижнем
 //! регистре: одно и то же имя в `.env`, в файле `runtime.toml` и в панели.
 //! Здесь же её единица, пределы, значение по умолчанию и то, когда она
 //! вступает в силу без перезапуска.
@@ -51,6 +51,8 @@ pub enum Unit {
     Bytes,
     BytesPerDay,
     Seconds,
+    /// Переключатель: `0` — выключено, `1` — включено.
+    Flag,
 }
 
 /// Значения, которые настраиваются каталогом. Отдельно от [`Config`]: у
@@ -62,6 +64,8 @@ pub struct Tunables {
     pub blobs: BlobConfig,
     pub device_cert_max_ttl_secs: u64,
     pub server_config_ttl_secs: u64,
+    /// Адресация депозита по `queueId` (`QUEUE_ADDRESSING_ENABLED`).
+    pub queue_addressing_enabled: bool,
     /// ICE-серверы и срок учёток. Серверы — не настройки каталога: это
     /// список с секретами, он задаётся секцией `[ice]` файла.
     pub ice: IceConfig,
@@ -74,6 +78,7 @@ impl Default for Tunables {
             blobs: BlobConfig::default(),
             device_cert_max_ttl_secs: 30 * 24 * 3600,
             server_config_ttl_secs: 24 * 3600,
+            queue_addressing_enabled: true,
             ice: IceConfig::default(),
         }
     }
@@ -86,6 +91,7 @@ impl Tunables {
             blobs: cfg.blobs.clone(),
             device_cert_max_ttl_secs: cfg.device_cert_max_ttl.as_secs(),
             server_config_ttl_secs: cfg.server_config_ttl.as_secs(),
+            queue_addressing_enabled: cfg.queue_addressing_enabled,
             ice: cfg.ice.clone(),
         }
     }
@@ -95,6 +101,7 @@ impl Tunables {
         cfg.blobs = self.blobs.clone();
         cfg.device_cert_max_ttl = Duration::from_secs(self.device_cert_max_ttl_secs);
         cfg.server_config_ttl = Duration::from_secs(self.server_config_ttl_secs);
+        cfg.queue_addressing_enabled = self.queue_addressing_enabled;
         cfg.ice = self.ice.clone();
     }
 }
@@ -250,6 +257,22 @@ pub static CATALOG: &[Setting] = &[
         |t| t.limits.send_bytes_per_day,
         u64
     ),
+    // Переключатель: макрос приводит `u64` к типу поля через `as`, а к
+    // `bool` так не привести.
+    Setting {
+        key: "queue_addressing_enabled",
+        group: Group::Messages,
+        unit: Unit::Flag,
+        // Флаг объявляется клиентам в подписанном конфиге, и сессия
+        // запоминает его при входе.
+        scope: Scope::Restart,
+        min: 0,
+        max: 1,
+        zero_unlimited: false,
+        summary: "Адресация по очередям: получателя определяет queueId",
+        get: |t| t.queue_addressing_enabled as u64,
+        set: |t, value| t.queue_addressing_enabled = value != 0,
+    },
     // Сессии и управляющие кадры.
     setting!(
         "limit_max_sessions_per_user",
@@ -689,7 +712,11 @@ mod tests {
     fn setters_round_trip() {
         for setting in CATALOG {
             let mut t = Tunables::default();
-            let value = setting.min.max(1) + 1;
+            let value = if setting.unit == Unit::Flag {
+                1 - setting.default_value()
+            } else {
+                setting.min.max(1) + 1
+            };
             (setting.set)(&mut t, value);
             assert_eq!((setting.get)(&t), value, "{}", setting.key);
         }
@@ -708,5 +735,18 @@ mod tests {
         assert!(s.check(0).is_err());
         assert!(find("nope").is_none());
         assert_eq!(describe().len(), CATALOG.len());
+    }
+
+    #[test]
+    fn flags_are_zero_or_one() {
+        for setting in CATALOG.iter().filter(|s| s.unit == Unit::Flag) {
+            assert_eq!((setting.min, setting.max), (0, 1), "{}", setting.key);
+            assert!(!setting.zero_unlimited, "{}", setting.key);
+        }
+        let s = find("queue_addressing_enabled").unwrap();
+        assert_eq!(s.default_value(), 1, "включена по умолчанию");
+        assert_eq!(s.scope, Scope::Restart);
+        assert!(s.check(0).is_ok());
+        assert!(s.check(2).is_err());
     }
 }
