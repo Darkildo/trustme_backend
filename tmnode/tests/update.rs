@@ -94,7 +94,7 @@ async fn node_is_updated_and_verified() {
     let s = setup("node_ok", MANAGED, "");
     let steps = Steps::default();
     let status = done(
-        s.updater("0.2.0", Origin::Admin)
+        s.updater("0.6.0", Origin::Admin)
             .execute(&order("01upd", Some("0.7.0")), &steps)
             .await,
     );
@@ -102,7 +102,7 @@ async fn node_is_updated_and_verified() {
     assert_eq!(status.step, Some(UpdateStep::Verify));
     assert_eq!(status.from_node_image, Some(image("0.6.0")));
     assert_eq!(status.node_image, Some(image("0.7.0")));
-    assert_eq!(status.tmnode.as_deref(), Some("0.2.0"));
+    assert_eq!(status.tmnode.as_deref(), Some("0.6.0"));
     assert_eq!((status.started_at, status.finished_at), (NOW, Some(NOW)));
     assert_eq!(steps.names(), ["pull_image", "recreate", "verify"]);
     assert!(
@@ -168,7 +168,7 @@ async fn recreated_container_keeps_ports_volumes_networks_and_restart_policy() {
         .insert(NODE.into(), old.clone());
 
     let status = done(
-        s.updater("0.2.0", Origin::Admin)
+        s.updater("0.6.0", Origin::Admin)
             .execute(&order("01par", Some("0.7.0")), &())
             .await,
     );
@@ -199,7 +199,7 @@ async fn changed_key_rolls_back_to_the_previous_container() {
     s.host.set_behaviour("0.7.0", Behaviour::RotatesKey);
     let steps = Steps::default();
     let status = done(
-        s.updater("0.2.0", Origin::Admin)
+        s.updater("0.6.0", Origin::Admin)
             .execute(&order("01key", Some("0.7.0")), &steps)
             .await,
     );
@@ -238,7 +238,7 @@ async fn failed_handshake_is_retried_for_two_minutes_then_rolled_back() {
     let s = setup("rollback_handshake", MANAGED, "");
     s.host.set_behaviour("0.7.0", Behaviour::NoHandshake);
     let status = done(
-        s.updater("0.2.0", Origin::Admin)
+        s.updater("0.6.0", Origin::Admin)
             .execute(&order("01hs", Some("0.7.0")), &())
             .await,
     );
@@ -258,7 +258,7 @@ async fn container_that_does_not_start_is_replaced_by_the_previous_one() {
     let s = setup("rollback_crash", MANAGED, "");
     s.host.set_behaviour("0.7.0", Behaviour::Crashes);
     let status = done(
-        s.updater("0.2.0", Origin::Admin)
+        s.updater("0.6.0", Origin::Admin)
             .execute(&order("01crash", Some("0.7.0")), &())
             .await,
     );
@@ -270,7 +270,7 @@ async fn container_that_does_not_start_is_replaced_by_the_previous_one() {
     let s = setup("create_fails", MANAGED, "");
     s.host.failing.borrow_mut().push("docker create".into());
     let status = done(
-        s.updater("0.2.0", Origin::Admin)
+        s.updater("0.6.0", Origin::Admin)
             .execute(&order("01create", Some("0.7.0")), &())
             .await,
     );
@@ -288,7 +288,7 @@ async fn orders_the_agent_must_refuse() {
         let extra = extra.to_owned();
         async move {
             let s = setup(&label, &mode, &extra);
-            let status = done(s.updater("0.2.0", origin).execute(&order, &()).await);
+            let status = done(s.updater("0.6.0", origin).execute(&order, &()).await);
             assert_eq!(
                 status.state,
                 UpdateState::Refused,
@@ -344,7 +344,7 @@ async fn orders_the_agent_must_refuse() {
     )
     .await;
     assert!(why.contains("allow_downgrade"), "{why}");
-    let bad_sha = with_tmnode(order("a", Some("0.7.0")), "0.3.0", "xyz");
+    let bad_sha = with_tmnode(order("a", Some("0.7.0")), "0.7.0", "xyz");
     let why = refused("sha", MANAGED, "", bad_sha, Origin::Admin).await;
     assert!(why.contains("64 hex"), "{why}");
     let why = refused("ver", MANAGED, "", order("a", Some("0.7")), Origin::Admin).await;
@@ -362,7 +362,7 @@ async fn orders_the_agent_must_refuse() {
     assert!(why.contains("пустое"), "{why}");
     let old_tmnode = with_tmnode(order("a", None), "0.1.9", &"a".repeat(64));
     let why = refused("tm_down", MANAGED, "", old_tmnode, Origin::Admin).await;
-    assert!(why.contains("tmnode 0.2.0 новее 0.1.9"), "{why}");
+    assert!(why.contains("tmnode 0.6.0 новее 0.1.9"), "{why}");
     let why = refused(
         "id",
         MANAGED,
@@ -383,7 +383,7 @@ async fn allowed_orders_go_ahead() {
         "[updates]\nchannel = \"pinned\"\nversion = \"0.7.0\"\n",
     );
     let status = done(
-        s.updater("0.2.0", Origin::Admin)
+        s.updater("0.6.0", Origin::Admin)
             .execute(&order("p", Some("0.7.0")), &())
             .await,
     );
@@ -393,14 +393,14 @@ async fn allowed_orders_go_ahead() {
     let s = setup("down_ok", MANAGED, "");
     let mut down = order("d", Some("0.5.0"));
     down.allow_downgrade = true;
-    let status = done(s.updater("0.2.0", Origin::Admin).execute(&down, &()).await);
+    let status = done(s.updater("0.6.0", Origin::Admin).execute(&down, &()).await);
     assert_eq!(status.state, UpdateState::Succeeded, "{:?}", status.error);
     assert_eq!(s.host.ctr(NODE).unwrap().image, image("0.5.0"));
 
     // Текущая версия — эта часть уже выполнена: ничего не трогаем.
     let s = setup("same", MANAGED, "");
     let status = done(
-        s.updater("0.2.0", Origin::Admin)
+        s.updater("0.6.0", Origin::Admin)
             .execute(&order("s", Some("0.6.0")), &())
             .await,
     );
@@ -410,7 +410,7 @@ async fn allowed_orders_go_ahead() {
     // Своя нода без админки — через tmnode update.
     let s = setup("local_ok", "local", "");
     let status = done(
-        s.updater("0.2.0", Origin::Local)
+        s.updater("0.6.0", Origin::Local)
             .execute(&order("local-1", Some("0.7.0")), &())
             .await,
     );
@@ -418,14 +418,14 @@ async fn allowed_orders_go_ahead() {
     let saved: Saved = serde_json::from_str(&s.state_file()).unwrap();
     assert!(saved.local);
     // В админку задание из tmnode update не уходит.
-    assert!(s.updater("0.2.0", Origin::Admin).report().is_none());
+    assert!(s.updater("0.6.0", Origin::Admin).report().is_none());
 }
 
 #[tokio::test]
 async fn image_that_cannot_be_pulled_changes_nothing() {
     let s = setup("pull_fails", MANAGED, "");
     let status = done(
-        s.updater("0.2.0", Origin::Admin)
+        s.updater("0.6.0", Origin::Admin)
             .execute(&order("n", Some("0.9.0")), &())
             .await,
     );
@@ -440,15 +440,15 @@ async fn image_that_cannot_be_pulled_changes_nothing() {
 
 #[tokio::test]
 async fn checksums_must_match_both_the_release_and_the_order() {
-    let binary = b"new tmnode 0.3.0".to_vec();
+    let binary = b"new tmnode 0.7.0".to_vec();
 
     // SHA256SUMS релиза не совпадает с заданием.
     let s = setup("sums_vs_order", MANAGED, "");
     s.releases.publish("0.7.0", &binary);
     let status = done(
-        s.updater("0.2.0", Origin::Admin)
+        s.updater("0.6.0", Origin::Admin)
             .execute(
-                &with_tmnode(order("t", Some("0.7.0")), "0.3.0", &"ab".repeat(32)),
+                &with_tmnode(order("t", Some("0.7.0")), "0.7.0", &"ab".repeat(32)),
                 &(),
             )
             .await,
@@ -466,9 +466,9 @@ async fn checksums_must_match_both_the_release_and_the_order() {
     s.releases.publish("0.7.0", b"tampered");
     s.releases.publish_sums("0.7.0", &sha256(&binary));
     let status = done(
-        s.updater("0.2.0", Origin::Admin)
+        s.updater("0.6.0", Origin::Admin)
             .execute(
-                &with_tmnode(order("t", Some("0.7.0")), "0.3.0", &sha256(&binary)),
+                &with_tmnode(order("t", Some("0.7.0")), "0.7.0", &sha256(&binary)),
                 &(),
             )
             .await,
@@ -483,9 +483,9 @@ async fn checksums_must_match_both_the_release_and_the_order() {
     s.releases.publish("0.7.0", &binary);
     *s.host.new_binary_says.borrow_mut() = "tmnode 0.2.9\n".into();
     let status = done(
-        s.updater("0.2.0", Origin::Admin)
+        s.updater("0.6.0", Origin::Admin)
             .execute(
-                &with_tmnode(order("t", Some("0.7.0")), "0.3.0", &sha256(&binary)),
+                &with_tmnode(order("t", Some("0.7.0")), "0.7.0", &sha256(&binary)),
                 &(),
             )
             .await,
@@ -498,21 +498,21 @@ async fn checksums_must_match_both_the_release_and_the_order() {
             .file(&s.tmnode_path.with_file_name("tmnode.new"))
             .is_none()
     );
-    assert_eq!(status.tmnode.as_deref(), Some("0.2.0"));
+    assert_eq!(status.tmnode.as_deref(), Some("0.6.0"));
 }
 
 /// Прежний агент меняет бинарь и завершается; новый дочитывает задание.
 #[tokio::test]
 async fn tmnode_replaces_itself_and_the_new_agent_finishes_the_order() {
     let s = setup("self_update", MANAGED, "");
-    let binary = b"new tmnode 0.3.0".to_vec();
+    let binary = b"new tmnode 0.7.0".to_vec();
     s.releases.publish("0.7.0", &binary);
-    *s.host.new_binary_says.borrow_mut() = "tmnode 0.3.0\n".into();
-    let job = with_tmnode(order("01self", Some("0.7.0")), "0.3.0", &sha256(&binary));
+    *s.host.new_binary_says.borrow_mut() = "tmnode 0.7.0\n".into();
+    let job = with_tmnode(order("01self", Some("0.7.0")), "0.7.0", &sha256(&binary));
     let steps = Steps::default();
 
     let outcome = s
-        .updater("0.2.0", Origin::Admin)
+        .updater("0.6.0", Origin::Admin)
         .execute(&job, &steps)
         .await;
     let Outcome::Restart(status) = outcome else {
@@ -524,7 +524,7 @@ async fn tmnode_replaces_itself_and_the_new_agent_finishes_the_order() {
     );
     assert_eq!(
         (status.from_tmnode.as_deref(), status.tmnode.as_deref()),
-        (Some("0.2.0"), Some("0.3.0"))
+        (Some("0.6.0"), Some("0.7.0"))
     );
     assert_eq!(steps.names(), ["download_tmnode", "restart_agent"]);
     assert_eq!(
@@ -554,7 +554,7 @@ async fn tmnode_replaces_itself_and_the_new_agent_finishes_the_order() {
     // Новый агент после перезапуска службы.
     let steps = Steps::default();
     let status = done(
-        s.updater("0.3.0", Origin::Admin)
+        s.updater("0.7.0", Origin::Admin)
             .resume(&steps)
             .await
             .expect("задание дочитано"),
@@ -562,7 +562,7 @@ async fn tmnode_replaces_itself_and_the_new_agent_finishes_the_order() {
     assert_eq!(status.state, UpdateState::Succeeded, "{:?}", status.error);
     assert_eq!(
         (status.from_tmnode.as_deref(), status.tmnode.as_deref()),
-        (Some("0.2.0"), Some("0.3.0"))
+        (Some("0.6.0"), Some("0.7.0"))
     );
     assert_eq!(status.node_image, Some(image("0.7.0")));
     assert_eq!(steps.names(), ["pull_image", "recreate", "verify"]);
@@ -572,7 +572,7 @@ async fn tmnode_replaces_itself_and_the_new_agent_finishes_the_order() {
 
     // Дочитывать больше нечего, повтор задания — тот же итог.
     assert!(
-        s.updater("0.3.0", Origin::Admin)
+        s.updater("0.7.0", Origin::Admin)
             .resume(&())
             .await
             .is_none()
@@ -582,51 +582,77 @@ async fn tmnode_replaces_itself_and_the_new_agent_finishes_the_order() {
 #[tokio::test]
 async fn agent_that_did_not_change_after_restart_reports_failure() {
     let s = setup("self_update_lost", MANAGED, "");
-    let binary = b"new tmnode 0.3.0".to_vec();
+    let binary = b"new tmnode 0.7.0".to_vec();
     s.releases.publish("0.7.0", &binary);
-    *s.host.new_binary_says.borrow_mut() = "tmnode 0.3.0".into();
-    let job = with_tmnode(order("01lost", Some("0.7.0")), "0.3.0", &sha256(&binary));
-    let up = s.updater("0.2.0", Origin::Admin);
+    *s.host.new_binary_says.borrow_mut() = "tmnode 0.7.0".into();
+    let job = with_tmnode(order("01lost", Some("0.7.0")), "0.7.0", &sha256(&binary));
+    let up = s.updater("0.6.0", Origin::Admin);
     assert!(matches!(up.execute(&job, &()).await, Outcome::Restart(_)));
 
     // Служба поднялась прежним бинарём (скажем, его вернули руками).
     let status = done(up.resume(&()).await.unwrap());
     assert_eq!(status.state, UpdateState::Failed);
-    assert!(status.error.unwrap().contains("работает tmnode 0.2.0"));
+    assert!(status.error.unwrap().contains("работает tmnode 0.6.0"));
     assert_eq!(s.host.ctr(NODE).unwrap(), node_ctr("0.6.0"));
 }
 
 #[tokio::test]
-async fn only_tmnode_comes_from_the_release_the_node_runs() {
-    let s = setup("tmnode_only", MANAGED, "");
+async fn tmnode_release_is_the_tmnode_version_not_the_node_one() {
+    // Нода ставится из v0.7.0, tmnode — из своего релиза v0.8.0.
+    let s = setup("tmnode_release", MANAGED, "");
+    let binary = b"new tmnode 0.8.0".to_vec();
+    s.releases.publish("0.8.0", &binary);
+    s.releases.publish("0.7.0", b"tmnode 0.7.0 binary");
+    *s.host.new_binary_says.borrow_mut() = "tmnode 0.8.0".into();
+    let job = with_tmnode(order("01rel", Some("0.7.0")), "0.8.0", &sha256(&binary));
+    let outcome = s.updater("0.6.0", Origin::Admin).execute(&job, &()).await;
+    assert!(matches!(outcome, Outcome::Restart(_)), "{outcome:?}");
+    assert_eq!(
+        s.releases.fetched.borrow().as_slice(),
+        [
+            format!("{RELEASES}/v0.8.0/SHA256SUMS"),
+            format!("{RELEASES}/v0.8.0/tmnode-x86_64-linux")
+        ]
+    );
+    assert_eq!(s.host.file(&s.tmnode_path).unwrap(), binary);
+    let status = done(s.updater("0.8.0", Origin::Admin).resume(&()).await.unwrap());
+    assert_eq!(status.state, UpdateState::Succeeded, "{:?}", status.error);
+    assert_eq!(status.node_image, Some(image("0.7.0")));
+    assert_eq!(status.tmnode.as_deref(), Some("0.8.0"));
+}
+
+#[tokio::test]
+async fn only_tmnode_is_updated_even_on_a_stable_image() {
+    let s = setup("tmnode_only_stable", MANAGED, "");
+    let stable = "ghcr.io/darkildo/trustme_backend:stable".to_owned();
+    s.host.containers.borrow_mut().get_mut(NODE).unwrap().image = stable.clone();
     let binary = b"new tmnode".to_vec();
-    s.releases.publish("0.6.0", &binary);
-    *s.host.new_binary_says.borrow_mut() = "tmnode 0.3.0".into();
-    let job = with_tmnode(order("01tm", None), "0.3.0", &sha256(&binary));
-    let outcome = s.updater("0.2.0", Origin::Admin).execute(&job, &()).await;
+    s.releases.publish("0.7.0", &binary);
+    *s.host.new_binary_says.borrow_mut() = "tmnode 0.7.0".into();
+    let job = with_tmnode(order("01tm", None), "0.7.0", &sha256(&binary));
+
+    let outcome = s.updater("0.6.0", Origin::Admin).execute(&job, &()).await;
     assert!(matches!(outcome, Outcome::Restart(_)), "{outcome:?}");
     assert_eq!(
         s.releases.fetched.borrow()[0],
-        format!("{RELEASES}/v0.6.0/SHA256SUMS")
+        format!("{RELEASES}/v0.7.0/SHA256SUMS")
     );
-    let status = done(s.updater("0.3.0", Origin::Admin).resume(&()).await.unwrap());
-    assert_eq!(status.state, UpdateState::Succeeded);
-    assert_eq!(status.node_image, Some(image("0.6.0")));
-    assert_eq!(s.host.commands().len(), 1, "ноду не трогали");
-
-    // Образ ноды без версии: релиз не известен.
-    let s = setup("tmnode_only_stable", MANAGED, "");
-    s.host.containers.borrow_mut().get_mut(NODE).unwrap().image =
-        "ghcr.io/darkildo/trustme_backend:stable".into();
-    let status = done(s.updater("0.2.0", Origin::Admin).execute(&job, &()).await);
-    assert_eq!(status.state, UpdateState::Refused);
-    assert!(status.error.unwrap().contains("из какого релиза"));
+    let status = done(s.updater("0.7.0", Origin::Admin).resume(&()).await.unwrap());
+    assert_eq!(status.state, UpdateState::Succeeded, "{:?}", status.error);
+    assert_eq!(status.node_image, Some(stable.clone()));
+    assert_eq!(
+        (status.from_tmnode.as_deref(), status.tmnode.as_deref()),
+        (Some("0.6.0"), Some("0.7.0"))
+    );
+    // Ноду не трогали: только `tmnode.new version`.
+    assert_eq!(s.host.commands().len(), 1, "{:?}", s.host.commands());
+    assert_eq!(s.host.ctr(NODE).unwrap().image, stable);
 }
 
 #[tokio::test]
 async fn the_same_order_runs_once() {
     let s = setup("repeat", MANAGED, "");
-    let up = s.updater("0.2.0", Origin::Admin);
+    let up = s.updater("0.6.0", Origin::Admin);
     let job = order("01once", Some("0.7.0"));
     let first = done(up.execute(&job, &()).await);
     assert_eq!(first.state, UpdateState::Succeeded);
@@ -638,7 +664,7 @@ async fn the_same_order_runs_once() {
 
     // Отказ тоже итог: повтор не переспрашивает.
     let s = setup("repeat_refused", "local", "");
-    let up = s.updater("0.2.0", Origin::Admin);
+    let up = s.updater("0.6.0", Origin::Admin);
     let first = done(up.execute(&order("01no", Some("0.7.0")), &()).await);
     let again = done(up.execute(&order("01no", Some("0.7.0")), &()).await);
     assert_eq!(first, again);
@@ -658,8 +684,8 @@ fn crashed_on(s: &Setup, step: UpdateStep) {
             finished_at: None,
             from_node_image: Some(image("0.6.0")),
             node_image: Some(image("0.6.0")),
-            from_tmnode: Some("0.2.0".into()),
-            tmnode: Some("0.2.0".into()),
+            from_tmnode: Some("0.6.0".into()),
+            tmnode: Some("0.6.0".into()),
         },
         local: false,
         acknowledged: false,
@@ -695,7 +721,7 @@ async fn crash_in_the_middle_of_recreate_is_rolled_back() {
     let s = setup("crash_recreate", MANAGED, "");
     renamed_old(&s);
     crashed_on(&s, UpdateStep::Recreate);
-    let status = done(s.updater("0.2.0", Origin::Admin).resume(&()).await.unwrap());
+    let status = done(s.updater("0.6.0", Origin::Admin).resume(&()).await.unwrap());
     assert_eq!(status.state, UpdateState::RolledBack, "{:?}", status.error);
     assert!(status.error.unwrap().contains("recreate"));
     assert_eq!(status.node_image, Some(image("0.6.0")));
@@ -720,7 +746,7 @@ async fn crash_in_the_middle_of_recreate_is_rolled_back() {
     dead.running = false;
     s.host.containers.borrow_mut().insert(NODE.into(), dead);
     crashed_on(&s, UpdateStep::Recreate);
-    let status = done(s.updater("0.2.0", Origin::Admin).resume(&()).await.unwrap());
+    let status = done(s.updater("0.6.0", Origin::Admin).resume(&()).await.unwrap());
     assert_eq!(status.state, UpdateState::RolledBack);
     assert!(s.host.commands().contains(&format!("docker rm -f {NODE}")));
     assert_eq!(s.host.ctr(NODE).unwrap(), node_ctr("0.6.0"));
@@ -737,7 +763,7 @@ async fn crash_after_the_new_container_started_finishes_the_check() {
     crashed_on(&s, UpdateStep::Recreate);
     let steps = Steps::default();
     let status = done(
-        s.updater("0.2.0", Origin::Admin)
+        s.updater("0.6.0", Origin::Admin)
             .resume(&steps)
             .await
             .unwrap(),
@@ -758,7 +784,7 @@ async fn crash_after_the_new_container_started_finishes_the_check() {
         .borrow_mut()
         .insert(NODE.into(), node_ctr("0.7.0"));
     crashed_on(&s, UpdateStep::Verify);
-    let status = done(s.updater("0.2.0", Origin::Admin).resume(&()).await.unwrap());
+    let status = done(s.updater("0.6.0", Origin::Admin).resume(&()).await.unwrap());
     assert_eq!(status.state, UpdateState::Succeeded);
 
     // Упал до переименования: прежний контейнер остановлен — запустить.
@@ -770,7 +796,7 @@ async fn crash_after_the_new_container_started_finishes_the_check() {
         .unwrap()
         .running = false;
     crashed_on(&s, UpdateStep::Recreate);
-    let status = done(s.updater("0.2.0", Origin::Admin).resume(&()).await.unwrap());
+    let status = done(s.updater("0.6.0", Origin::Admin).resume(&()).await.unwrap());
     assert_eq!(status.state, UpdateState::Failed);
     assert!(status.error.unwrap().contains("прежний контейнер запущен"));
     assert!(s.host.ctr(NODE).unwrap().running);
@@ -783,14 +809,14 @@ async fn crash_after_the_new_container_started_finishes_the_check() {
         .borrow_mut()
         .insert(NODE.into(), node_ctr("0.7.0"));
     crashed_on(&s, UpdateStep::Rollback);
-    let status = done(s.updater("0.2.0", Origin::Admin).resume(&()).await.unwrap());
+    let status = done(s.updater("0.6.0", Origin::Admin).resume(&()).await.unwrap());
     assert_eq!(status.state, UpdateState::RolledBack);
     assert_eq!(s.host.ctr(NODE).unwrap(), node_ctr("0.6.0"));
 
     // Упал на скачивании: машина не менялась.
     let s = setup("crash_pull", MANAGED, "");
     crashed_on(&s, UpdateStep::PullImage);
-    let status = done(s.updater("0.2.0", Origin::Admin).resume(&()).await.unwrap());
+    let status = done(s.updater("0.6.0", Origin::Admin).resume(&()).await.unwrap());
     assert_eq!(status.state, UpdateState::Failed);
     assert!(s.host.commands().is_empty());
 }
@@ -801,7 +827,7 @@ async fn a_new_order_first_finishes_the_interrupted_one() {
     renamed_old(&s);
     crashed_on(&s, UpdateStep::Recreate);
     let status = done(
-        s.updater("0.2.0", Origin::Admin)
+        s.updater("0.6.0", Origin::Admin)
             .execute(&order("01next", Some("0.7.0")), &())
             .await,
     );
@@ -844,7 +870,7 @@ impl AdminApi for Panel {
 async fn agent_runs_the_order_and_reports_until_the_panel_stops() {
     let s = setup("agent_tick", MANAGED, "");
     let panel = Panel::sending(order("01agent", Some("0.7.0")));
-    let up = s.updater("0.2.0", Origin::Admin);
+    let up = s.updater("0.6.0", Origin::Admin);
 
     // Обычный heartbeat, затем — по одному перед каждым долгим шагом.
     assert_eq!(agent::tick(&panel, &up).await.unwrap(), Next::Wait(5));
@@ -896,19 +922,19 @@ async fn agent_runs_the_order_and_reports_until_the_panel_stops() {
 #[tokio::test]
 async fn agent_service_exits_after_replacing_itself_and_the_new_one_resumes() {
     let s = setup("agent_self", MANAGED, "");
-    let binary = b"new tmnode 0.3.0".to_vec();
+    let binary = b"new tmnode 0.7.0".to_vec();
     s.releases.publish("0.7.0", &binary);
-    *s.host.new_binary_says.borrow_mut() = "tmnode 0.3.0\n".into();
+    *s.host.new_binary_says.borrow_mut() = "tmnode 0.7.0\n".into();
     let panel = Panel::sending(with_tmnode(
         order("01svc", Some("0.7.0")),
-        "0.3.0",
+        "0.7.0",
         &sha256(&binary),
     ));
 
     // run_forever возвращается — main завершает процесс, systemd
     // (Restart=always) поднимает службу новым бинарём.
     let mut log = Vec::new();
-    agent::run_forever(&panel, &s.updater("0.2.0", Origin::Admin), |line| {
+    agent::run_forever(&panel, &s.updater("0.6.0", Origin::Admin), |line| {
         log.push(line.to_owned())
     })
     .await;
@@ -919,12 +945,12 @@ async fn agent_service_exits_after_replacing_itself_and_the_new_one_resumes() {
 
     // Новый агент при старте службы дочитывает задание.
     panel.beats.borrow_mut().clear();
-    let new = s.updater("0.3.0", Origin::Admin);
+    let new = s.updater("0.7.0", Origin::Admin);
     let status = done(agent::resume(&panel, &new).await.unwrap().unwrap());
     assert_eq!(status.state, UpdateState::Succeeded, "{:?}", status.error);
     {
         let beats = panel.beats.borrow();
-        assert!(beats.iter().all(|b| b.tmnode_version == "0.3.0"));
+        assert!(beats.iter().all(|b| b.tmnode_version == "0.7.0"));
         assert_eq!(beats.len(), 3, "pull_image, recreate, verify");
     }
     assert!(agent::resume(&panel, &new).await.unwrap().is_none());
@@ -936,13 +962,13 @@ fn update_flags() {
         "--node-version",
         "0.7.0",
         "--tmnode-version",
-        "0.3.0",
+        "0.7.0",
         "--allow-downgrade",
         "--json",
     ])
     .unwrap();
     assert_eq!(args.node_version.unwrap().to_string(), "0.7.0");
-    assert_eq!(args.tmnode_version.unwrap().to_string(), "0.3.0");
+    assert_eq!(args.tmnode_version.unwrap().to_string(), "0.7.0");
     assert!(args.allow_downgrade && args.json && !args.resume);
     assert!(ops::parse_update(&["--resume"]).unwrap().resume);
     for bad in [
@@ -950,12 +976,38 @@ fn update_flags() {
         &["--node-version"],
         &["--node-version", "0.7"],
         &["--node-version", "v0.7.0"],
-        &["--tmnode-version", "0.3.0;reboot"],
+        &["--tmnode-version", "0.7.0;reboot"],
         &["--resume", "--node-version", "0.7.0"],
         &["--bogus"],
     ] {
         assert!(ops::parse_update(bad).is_err(), "{bad:?}");
     }
+}
+
+#[tokio::test]
+async fn tmnode_version_alone_is_enough_for_tmnode_update() {
+    let s = setup("cli_tmnode_only", "local", "");
+    s.host.containers.borrow_mut().get_mut(NODE).unwrap().image =
+        "ghcr.io/darkildo/trustme_backend:stable".into();
+    let binary = b"new tmnode 0.7.0".to_vec();
+    s.releases.publish("0.7.0", &binary);
+    *s.host.new_binary_says.borrow_mut() = "tmnode 0.7.0\n".into();
+    let outcome = ops::update(
+        &s.updater("0.6.0", Origin::Local),
+        &ops::parse_update(&["--tmnode-version", "0.7.0"]).unwrap(),
+        &mut Vec::new(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(matches!(outcome, Outcome::Restart(_)), "{outcome:?}");
+    let saved: Saved = serde_json::from_str(&s.state_file()).unwrap();
+    assert_eq!(saved.order.node_version, None);
+    assert_eq!(saved.order.tmnode.unwrap().sha256, sha256(&binary));
+    assert_eq!(
+        s.releases.fetched.borrow()[0],
+        format!("{RELEASES}/v0.7.0/SHA256SUMS")
+    );
 }
 
 #[tokio::test]
@@ -967,7 +1019,7 @@ async fn tmnode_update_without_the_panel() {
     renamed_old(&s);
     crashed_on(&s, UpdateStep::Recreate);
     let err = ops::update(
-        &s.updater("0.2.0", Origin::Local),
+        &s.updater("0.6.0", Origin::Local),
         &args(&["--node-version", "0.7.0"]),
         &mut Vec::new(),
     )
@@ -978,13 +1030,13 @@ async fn tmnode_update_without_the_panel() {
 
     // Своя нода: SHA-256 бинаря — из SHA256SUMS релиза.
     let s = setup("cli_local", "local", "");
-    let binary = b"new tmnode 0.3.0".to_vec();
+    let binary = b"new tmnode 0.7.0".to_vec();
     s.releases.publish("0.7.0", &binary);
-    *s.host.new_binary_says.borrow_mut() = "tmnode 0.3.0\n".into();
+    *s.host.new_binary_says.borrow_mut() = "tmnode 0.7.0\n".into();
     let mut log = Vec::new();
     let outcome = ops::update(
-        &s.updater("0.2.0", Origin::Local),
-        &args(&["--node-version", "0.7.0", "--tmnode-version", "0.3.0"]),
+        &s.updater("0.6.0", Origin::Local),
+        &args(&["--node-version", "0.7.0", "--tmnode-version", "0.7.0"]),
         &mut log,
     )
     .await
@@ -1000,7 +1052,7 @@ async fn tmnode_update_without_the_panel() {
     // Новый бинарь: tmnode update --resume.
     let mut log = Vec::new();
     let outcome = ops::update(
-        &s.updater("0.3.0", Origin::Local),
+        &s.updater("0.7.0", Origin::Local),
         &args(&["--resume"]),
         &mut log,
     )
@@ -1020,14 +1072,14 @@ async fn tmnode_update_without_the_panel() {
     let text = String::from_utf8(text).unwrap();
     assert!(text.contains("готово"), "{text}");
     assert!(text.contains(&format!("{} → {}", image("0.6.0"), image("0.7.0"))));
-    assert!(text.contains("0.2.0 → 0.3.0"));
+    assert!(text.contains("0.6.0 → 0.7.0"));
     let mut json = Vec::new();
     ops::print_update(&mut json, &status, true);
     let json: serde_json::Value = serde_json::from_slice(&json).unwrap();
     assert_eq!(json["state"], "succeeded");
 
     // Дочитывать нечего; tmnode уже той версии.
-    let up = s.updater("0.3.0", Origin::Local);
+    let up = s.updater("0.7.0", Origin::Local);
     assert!(
         ops::update(&up, &args(&["--resume"]), &mut Vec::new())
             .await
@@ -1035,7 +1087,7 @@ async fn tmnode_update_without_the_panel() {
             .is_none()
     );
     assert!(
-        ops::update(&up, &args(&["--tmnode-version", "0.3.0"]), &mut Vec::new())
+        ops::update(&up, &args(&["--tmnode-version", "0.7.0"]), &mut Vec::new())
             .await
             .unwrap()
             .is_none()
