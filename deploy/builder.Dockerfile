@@ -4,7 +4,7 @@
 #
 # build-essential/cmake/perl нужны не Rust'у, а aws-lc-sys — C-бэкенду
 # rustls, который собирается из исходников.
-FROM rust:1.97-slim-bookworm
+FROM rust:1.99-slim-bookworm
 
 # Ретраи и принудительный IPv4: у хоста есть AAAA-запись без рабочего
 # маршрута, а зеркало Fastly изредка отваливается по IPv4. Разовая сборка

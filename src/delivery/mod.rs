@@ -166,9 +166,16 @@ fn is_limit_error(err: &jetstream::Error) -> bool {
 /// переполненном канале сессии), `Pull` (не ушёл pull-запрос),
 /// `NoResponders` (на pull-запрос не ответил ни один сервер JetStream),
 /// `Other` (неожиданный служебный ответ брокера).
+///
+/// `RequestLimitExceeded` (async-nats 0.51): брокер отверг pull по
+/// `409 Exceeded MaxRequest*`, и async-nats завершает подписку вместо
+/// бесконечного перезапроса — для пула это конец подписки, как
+/// `ConsumerDeleted`.
 fn pull_error_is_fatal(kind: MessagesErrorKind) -> bool {
     match kind {
-        MessagesErrorKind::ConsumerDeleted | MessagesErrorKind::PushBasedConsumer => true,
+        MessagesErrorKind::ConsumerDeleted
+        | MessagesErrorKind::PushBasedConsumer
+        | MessagesErrorKind::RequestLimitExceeded => true,
         MessagesErrorKind::MissingHeartbeat
         | MessagesErrorKind::Pull
         | MessagesErrorKind::NoResponders
@@ -2143,6 +2150,7 @@ mod tests {
     fn only_terminal_pull_errors_are_fatal() {
         assert!(pull_error_is_fatal(MessagesErrorKind::ConsumerDeleted));
         assert!(pull_error_is_fatal(MessagesErrorKind::PushBasedConsumer));
+        assert!(pull_error_is_fatal(MessagesErrorKind::RequestLimitExceeded));
         assert!(!pull_error_is_fatal(MessagesErrorKind::MissingHeartbeat));
         assert!(!pull_error_is_fatal(MessagesErrorKind::Pull));
         assert!(!pull_error_is_fatal(MessagesErrorKind::NoResponders));

@@ -12,7 +12,7 @@ set -euo pipefail
 # build-essential/cmake/perl нужны не Rust'у, а aws-lc-sys — C-бэкенду
 # rustls, который собирается из исходников.
 
-BUILDER_IMAGE=${BUILDER_IMAGE:-trust-message-builder:1.97-bookworm}
+BUILDER_IMAGE=${BUILDER_IMAGE:-trust-message-builder:1.99-bookworm}
 # Исходники — дерево, в котором лежит сам скрипт: run-deploy.sh кладёт его
 # в $DEPLOY_DIR/tcp_message_server, и захардкоженный путь собирал бы не то
 # дерево при нестандартном DEPLOY_DIR.
