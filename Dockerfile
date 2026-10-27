@@ -4,7 +4,7 @@
 # (deploy/builder.Dockerfile): образ собирается тем компилятором, которым
 # собран выкаченный бинарь, а не плавающим nightly. Версия меняется вместе
 # с builder.Dockerfile и тегом BUILDER_IMAGE в build-message-runtime.sh.
-FROM rust:1.97-slim-bookworm AS builder
+FROM rust:1.99-slim-bookworm AS builder
 
 # build-essential/cmake/perl нужны не Rust'у, а aws-lc-sys — C-бэкенду
 # rustls, который собирается из исходников. В slim-образе их нет.
